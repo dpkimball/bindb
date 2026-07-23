@@ -9,7 +9,7 @@ Last updated: 2026-07-23. Prefer this over stale issue bodies.
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model | Latency SLA @ 100k (OKR O3) |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation / SQL | Closed (narrow) | Rust DSL + `sql_aggregate()` (`COUNT`/`AVG`/`SUM`/`MIN`/`MAX`/`P50`/`P99`, `PATH_SEGMENT`) | Full SQL; DuckDB / out-of-process projection |
-| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Interim ~2 GB ceiling; `rss_xl_mb` in XL report; compact drops commit log from RAM/snap | Spike when `rss_xl_mb` stays above ~2 GB after compact (measured ~2.4 GB before commit-log drop) |
+| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Closed (deferred) | Interim ~2 GB ceiling; `rss_xl_mb` in XL report; compact drops commit log | Reopen mmap spike when a real Binder workspace approaches ~2 GB RSS (OKR O5) |
 | [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Closed | Snapshot fast open; XL get/open-after-compact PASS | Optional nightly XL job |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
 | [#9](https://github.com/dpkimball/bindb/issues/9) Checkpoint open | Closed | Snapshot fast path on `open()` | Variance / flake control (OKR O4) |
@@ -30,7 +30,7 @@ Rough **process RSS** model for a Binder life-scale store (order-of-magnitude):
 | Graph adjacency | proportional to edges | tens of MB |
 | Vector index (HNSW, if large) | model-dependent | separate |
 
-**Decision (2026-07-23):** prefer `compact()` (now drops in-memory commit log), bounded history, and projection offload before mmap. XL sample before commit-log drop measured **~2.4 GB RSS** at 1 M objects — enough to keep #6 open. Remeasure `rss_xl_mb` after compact; start mmap spike only if still ≥ ~2 GB for real Binder workspaces.
+**Decision (2026-07-23):** defer mmap. Prefer `compact()` (drops in-memory commit log), bounded history, and projection offload. Synthetic XL RSS ~2.2–2.4 GB is a stress signal, not a Binder life-scale proof. **Reopen #6** when a real Binder workspace approaches ~2 GB RSS.
 
 ---
 
@@ -49,6 +49,6 @@ Adds 1M-object rows (`get_xl_p99_us`, `open_xl_ms` after compact, `rss_xl_mb`). 
 | `get()` p99 @ 1M | 0.042 µs | PASS vs ≤10 µs |
 | `open()` after compact @ 1M | **1289 ms** | PASS vs ≤5000 ms |
 | `open()` M / L (snapshot path) | ~11 / ~120 ms | PASS vs 30 / 300 ms |
-| `rss_xl_mb` after compact open | **~2248 MB** | Above 2 GB interim; keeps #6 open |
+| `rss_xl_mb` after compact open | **~2248 MB** | Informational; #6 deferred pending real workspace |
 
 Ops XL open = after `compact()` / clean snapshot. `rss_xl_mb` is informational (does not fail overall report).
