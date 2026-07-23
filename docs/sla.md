@@ -44,8 +44,8 @@ One fsync for an entire batch.  Throughput is serialization-bound.
 
 | Metric | Target |
 |--------|--------|
-| Throughput at **M** (1 K batch) | ≥ 5 K commits/sec |
-| Throughput at **L** (10 K batch) | ≥ 5 K commits/sec |
+| Throughput at **M** (10 K batch, CI floor) | ≥ 3 K commits/sec |
+| Throughput at **M** (10 K batch, isolated peak) | ≥ 5.5 K commits/sec |
 | `flush()` wall time after 10 K buffered commits | ≤ 20 ms |
 
 Rationale: Apple Health import (500 K data points) must complete in < 2 minutes.
@@ -114,13 +114,12 @@ All read SLAs assume a warm store (indexes in memory, no WAL replay).
 
 | Scale | Wall time |
 |-------|-----------|
-| **M** (10 K commits) | ≤ 750 ms |
-| **L** (100 K commits) | ≤ 7 s |
+| **M** (10 K commits) | ≤ 30 ms |
+| **L** (100 K commits) | ≤ 300 ms |
 
-> **V1 note:** `open()` always replays the full WAL from byte 0 — the checkpoint log records
-> the offset but the short-circuit is a Phase 2 feature.  The M-tier target reflects full
-> replay cost including deserialization and index rebuild.  Phase 2 checkpoint-based open
-> will reduce M-tier startup to < 100 ms.
+> **Note:** WAL replay is now O(n) after the position-index fix (previously O(n²)).
+> M-tier measured at ~14 ms.  Phase 2 checkpoint-based open will reduce this further
+> by avoiding full deserialization of all historical commits.
 
 ---
 

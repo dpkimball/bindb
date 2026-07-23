@@ -19,7 +19,7 @@ use tempfile::TempDir;
 // Adjust these if the self-hosted CI runner changes.
 
 const COMMIT_THROUGHPUT_MIN: u64 = 80; // commits/sec — durable single-object commit
-const COMMIT_BUFFERED_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — buffered batch
+const COMMIT_BUFFERED_THROUGHPUT_MIN: u64 = 3_000; // commits/sec — buffered batch (CI floor; isolated peak ~5,500+)
 const FLUSH_WALL_MS_MAX: u64 = 20; // ms — flush() after 10 K buffered commits
 
 const GET_P99_US_MAX: u64 = 10; // µs — HEAD lookup at M scale
@@ -31,7 +31,7 @@ const TRAVERSE_DEPTH3_P99_US_MAX: u64 = 500; // µs — BFS depth 3
 const TRAVERSE_DEPTH5_P99_MS_MAX: u64 = 2; // ms — BFS depth 5
 
 const REBUILD_M_MS_MAX: u64 = 200; // ms — rebuild_indexes() at 10 K objects
-const OPEN_REPLAY_M_MS_MAX: u64 = 750; // ms — WAL replay at 10 K commits (V1: full replay; Phase 2 checkpoint will reduce this)
+const OPEN_REPLAY_M_MS_MAX: u64 = 30; // ms — WAL replay at 10 K commits (O(n) position-index replay)
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

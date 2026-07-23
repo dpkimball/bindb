@@ -43,6 +43,11 @@ pub struct BinderStore {
     namespace_index: Mutex<NamespaceObjectIndex>,
     namespace_registry: Mutex<NamespaceRegistry>,
     vector_index: Mutex<VectorIndex>,
+    /// Position index: ObjectId → index of its current (valid_to=None) entry in
+    /// `object_versions`.  Makes version retirement O(1) instead of O(n_total).
+    head_object_positions: Mutex<HashMap<ObjectId, usize>>,
+    /// Same for edges.
+    head_edge_positions: Mutex<HashMap<EdgeId, usize>>,
 }
 
 impl BinderStore {
@@ -63,7 +68,8 @@ impl BinderStore {
         let (wal, commits) = Wal::open_or_create(&wal_path)?;
 
         let head = commits.last().map(|c| c.commit_id);
-        let (object_versions, edge_versions) = build_version_stores(&commits);
+        let (object_versions, edge_versions, ov_positions, ev_positions) =
+            build_version_stores(&commits);
         let head_objects = HeadObjectIndex::rebuild(&object_versions);
         let head_edges = HeadEdgeIndex::rebuild(&edge_versions);
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
@@ -94,6 +100,8 @@ impl BinderStore {
             namespace_index: Mutex::new(namespace_index),
             namespace_registry: Mutex::new(NamespaceRegistry::new()),
             vector_index: Mutex::new(vector_index),
+            head_object_positions: Mutex::new(ov_positions),
+            head_edge_positions: Mutex::new(ev_positions),
         })
     }
 
@@ -245,6 +253,9 @@ impl BinderStore {
     /// Apply a committed `BinderCommit` to all in-memory indexes.
     /// Called by both `commit_with_namespace` (after WAL fsync) and
     /// `commit_buffered` (after WAL write without fsync).
+    ///
+    /// Version retirement is O(1) per changed object/edge via the position
+    /// indexes (`head_object_positions`, `head_edge_positions`) — no Vec scan.
     fn apply_commit_to_memory(&self, commit_id: CommitId, commit: BinderCommit) {
         let new_ovs = derive_object_versions_for_commit(&commit);
         let new_evs = derive_edge_versions_for_commit(&commit);
@@ -253,33 +264,37 @@ impl BinderStore {
             let mut ovs = self.object_versions.lock().unwrap();
             let mut hobj = self.head_objects.lock().unwrap();
             let mut nsidx = self.namespace_index.lock().unwrap();
+            let mut ov_pos = self.head_object_positions.lock().unwrap();
 
-            // Retire superseded versions and remove their namespace index entries.
-            let superseded: std::collections::HashSet<&ObjectId> =
-                new_ovs.iter().map(|v| &v.object_id).collect();
-            for v in ovs.iter_mut() {
-                if superseded.contains(&v.object_id) && v.valid_to.is_none() {
-                    v.valid_to = Some(commit_id);
+            // Retire superseded versions in O(1) via position index.
+            for v in &new_ovs {
+                if let Some(&old_idx) = ov_pos.get(&v.object_id) {
+                    ovs[old_idx].valid_to = Some(commit_id);
                     nsidx.remove(&v.object_id);
                 }
             }
 
-            for v in &new_ovs {
+            // Append new versions and update all indexes.
+            let base = ovs.len();
+            ovs.extend(new_ovs.iter().cloned());
+            for (i, v) in new_ovs.iter().enumerate() {
                 hobj.upsert(v.clone());
+                ov_pos.insert(v.object_id.clone(), base + i);
                 if !v.is_tombstone() {
                     nsidx.insert(&v.object_id);
                 } else {
                     nsidx.remove(&v.object_id);
                 }
             }
-            ovs.extend(new_ovs);
         }
         {
             let mut evs = self.edge_versions.lock().unwrap();
             let mut hedge = self.head_edges.lock().unwrap();
             let mut graph = self.graph.lock().unwrap();
             let mut nbrs = self.neighbours.lock().unwrap();
+            let mut ev_pos = self.head_edge_positions.lock().unwrap();
 
+            // Clean up graph/neighbour state for edges being superseded.
             for new_ev in &new_evs {
                 if let Some(old) = hedge.get(&new_ev.edge_id) {
                     graph.remove(old);
@@ -289,12 +304,17 @@ impl BinderStore {
                         }
                     }
                 }
+                // O(1) edge version retirement via position index.
+                if let Some(&old_idx) = ev_pos.get(&new_ev.edge_id) {
+                    evs[old_idx].valid_to = Some(commit_id);
+                }
             }
 
-            retire_superseded_edge_versions(&mut evs, &new_evs, commit_id);
-
-            for v in &new_evs {
+            let base = evs.len();
+            evs.extend(new_evs.iter().cloned());
+            for (i, v) in new_evs.iter().enumerate() {
                 hedge.upsert(v.clone());
+                ev_pos.insert(v.edge_id.clone(), base + i);
                 if !v.is_tombstone() {
                     graph.insert(v);
                     if let (Some(from), Some(to)) = (&v.from_object, &v.to_object) {
@@ -302,7 +322,6 @@ impl BinderStore {
                     }
                 }
             }
-            evs.extend(new_evs);
         }
 
         *self.head.lock().unwrap() = Some(commit_id);
@@ -489,18 +508,32 @@ impl BinderStore {
         let new_neighbours =
             GraphIndex::build_neighbour_map(evs.iter().filter(|v| !v.is_tombstone()));
 
+        // Rebuild position maps: last index in Vec where valid_to is None per id.
+        let new_ov_pos: HashMap<ObjectId, usize> = ovs
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.valid_to.is_none())
+            .map(|(i, v)| (v.object_id.clone(), i))
+            .collect();
+        let new_ev_pos: HashMap<EdgeId, usize> = evs
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.valid_to.is_none())
+            .map(|(i, v)| (v.edge_id.clone(), i))
+            .collect();
+
         drop(ovs);
         drop(evs);
 
-        let new_namespace_index = NamespaceObjectIndex::rebuild(
-            new_head_objects.all_live(),
-        );
+        let new_namespace_index = NamespaceObjectIndex::rebuild(new_head_objects.all_live());
 
         *self.head_objects.lock().unwrap() = new_head_objects;
         *self.head_edges.lock().unwrap() = new_head_edges;
         *self.graph.lock().unwrap() = new_graph;
         *self.neighbours.lock().unwrap() = new_neighbours;
         *self.namespace_index.lock().unwrap() = new_namespace_index;
+        *self.head_object_positions.lock().unwrap() = new_ov_pos;
+        *self.head_edge_positions.lock().unwrap() = new_ev_pos;
 
         Ok(())
     }
@@ -677,22 +710,49 @@ fn save_vector_projection(store_path: &Path, index: &VectorIndex) {
     }
 }
 
+/// Replay all commits into version Vecs and position indexes.
+/// O(n_commits) — uses position maps for O(1) retirement per object/edge.
 fn build_version_stores(
     commits: &[BinderCommit],
-) -> (Vec<BinderObjectVersion>, Vec<BinderEdgeVersion>) {
+) -> (
+    Vec<BinderObjectVersion>,
+    Vec<BinderEdgeVersion>,
+    HashMap<ObjectId, usize>,
+    HashMap<EdgeId, usize>,
+) {
     let mut ovs: Vec<BinderObjectVersion> = Vec::new();
     let mut evs: Vec<BinderEdgeVersion> = Vec::new();
+    let mut ov_pos: HashMap<ObjectId, usize> = HashMap::new();
+    let mut ev_pos: HashMap<EdgeId, usize> = HashMap::new();
 
     for commit in commits {
         let new_ovs = derive_object_versions_for_commit(commit);
         let new_evs = derive_edge_versions_for_commit(commit);
-        retire_superseded_object_versions(&mut ovs, &new_ovs, commit.commit_id);
-        retire_superseded_edge_versions(&mut evs, &new_evs, commit.commit_id);
-        ovs.extend(new_ovs);
-        evs.extend(new_evs);
+
+        for v in &new_ovs {
+            if let Some(&old_idx) = ov_pos.get(&v.object_id) {
+                ovs[old_idx].valid_to = Some(commit.commit_id);
+            }
+        }
+        let base = ovs.len();
+        ovs.extend(new_ovs.iter().cloned());
+        for (i, v) in new_ovs.iter().enumerate() {
+            ov_pos.insert(v.object_id.clone(), base + i);
+        }
+
+        for v in &new_evs {
+            if let Some(&old_idx) = ev_pos.get(&v.edge_id) {
+                evs[old_idx].valid_to = Some(commit.commit_id);
+            }
+        }
+        let base = evs.len();
+        evs.extend(new_evs.iter().cloned());
+        for (i, v) in new_evs.iter().enumerate() {
+            ev_pos.insert(v.edge_id.clone(), base + i);
+        }
     }
 
-    (ovs, evs)
+    (ovs, evs, ov_pos, ev_pos)
 }
 
 fn derive_object_versions_for_commit(commit: &BinderCommit) -> Vec<BinderObjectVersion> {
@@ -730,28 +790,3 @@ fn derive_edge_versions_for_commit(commit: &BinderCommit) -> Vec<BinderEdgeVersi
         .collect()
 }
 
-fn retire_superseded_object_versions(
-    existing: &mut [BinderObjectVersion],
-    new_versions: &[BinderObjectVersion],
-    retiring_commit_id: CommitId,
-) {
-    let superseded: HashSet<&ObjectId> = new_versions.iter().map(|v| &v.object_id).collect();
-    for v in existing.iter_mut() {
-        if superseded.contains(&v.object_id) && v.valid_to.is_none() {
-            v.valid_to = Some(retiring_commit_id);
-        }
-    }
-}
-
-fn retire_superseded_edge_versions(
-    existing: &mut [BinderEdgeVersion],
-    new_versions: &[BinderEdgeVersion],
-    retiring_commit_id: CommitId,
-) {
-    let superseded: HashSet<&EdgeId> = new_versions.iter().map(|v| &v.edge_id).collect();
-    for v in existing.iter_mut() {
-        if superseded.contains(&v.edge_id) && v.valid_to.is_none() {
-            v.valid_to = Some(retiring_commit_id);
-        }
-    }
-}
