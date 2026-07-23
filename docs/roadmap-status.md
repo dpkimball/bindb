@@ -47,7 +47,8 @@ Adds 1M-object rows (`get_xl_p99_us`, `open_xl_ms` after compact, `rss_xl_mb`). 
 | Metric | Measured | Notes |
 |--------|----------|-------|
 | `get()` p99 @ 1M | 0.042 µs | PASS vs ≤10 µs |
-| `open()` unrecompacted WAL @ 1M | ~6218 ms | Raw path; not the ops SLA |
-| `open()` M/L after snapshot work | ~11 ms / ~124 ms | PASS vs 30 / 300 ms |
+| `open()` after compact @ 1M | **1289 ms** | PASS vs ≤5000 ms |
+| `open()` M / L (snapshot path) | ~11 / ~120 ms | PASS vs 30 / 300 ms |
+| `rss_xl_mb` after compact open | **~2248 MB** | Above 2 GB interim; keeps #6 open |
 
-Ops XL open = after `compact()` / clean snapshot (see `perf_report` XL block).
+Ops XL open = after `compact()` / clean snapshot. `rss_xl_mb` is informational (does not fail overall report).
