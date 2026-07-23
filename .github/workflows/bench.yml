@@ -1,0 +1,63 @@
+name: Perf
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: bindb-perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── SLA gate ────────────────────────────────────────────────────────────────
+  # Fails the PR if any SLA threshold in tests/perf_sla.rs is violated.
+  # Runs in --release so timings match the calibrated constants.
+  sla:
+    name: SLA gate
+    runs-on: self-hosted
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SLA tests (--release, --ignored)
+        run: cargo test --release -- --ignored --test-threads=1
+
+  # ── trend benchmarks ────────────────────────────────────────────────────────
+  # Runs criterion and stores results for PR comment comparison.
+  # Does NOT fail the PR — provides visibility only.
+  # Baseline accumulates from pushes to master; PRs are compared against it.
+  benchmark:
+    name: Benchmark trends
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run criterion benchmarks
+        run: >
+          cargo bench --bench store_bench
+          -- --output-format bencher | tee bench_output.txt
+
+      - name: Store / compare benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: bindb benchmarks
+          tool: cargo
+          output-file-path: bench_output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Push new baseline only on pushes to master.
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          # Post a PR comment showing delta from master baseline.
+          comment-on-alert: true
+          # Flag (but don't fail) if a benchmark regresses more than 20 %.
+          alert-threshold: "120%"
+          fail-on-alert: false
+          # Store baseline data in the gh-pages branch.
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
