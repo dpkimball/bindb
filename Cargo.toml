@@ -1,0 +1,25 @@
+[package]
+name = "bindb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["DPK Platform Team"]
+license = "MIT"
+description = "Bindb — append-only WAL store for Binder domain objects, edges, and versions"
+repository = "https://github.com/dpkimball/bindb"
+readme = "README.md"
+
+[dependencies]
+ulid = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+bincode = "1"
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "store_bench"
+harness = false
