@@ -232,6 +232,8 @@ cargo bench --bench store_bench
 
 | Doc | Contents |
 |-----|----------|
+| [docs/comparison.md](docs/comparison.md) | bindb vs SQLite, MongoDB, Neo4j, Weaviate, ClickHouse, PostgreSQL |
+| [docs/sla.md](docs/sla.md) | Performance SLAs, scale tiers, CI enforcement |
 | [docs/storage.md](docs/storage.md) | WAL format, on-disk layout, checkpoint, recovery |
 | [docs/indexes.md](docs/indexes.md) | Head indexes, graph, namespace, vector, rebuild rules |
 | [docs/performance.md](docs/performance.md) | Throughput, durability modes, scale context |
