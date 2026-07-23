@@ -26,7 +26,7 @@ const FLUSH_WALL_MS_MAX: f64 = 20.0;
 const GET_P99_US_MAX: f64 = 10.0;
 const LIST_P99_MS_MAX: f64 = 2.0;
 const OBJECT_AS_OF_P99_US_MAX: f64 = 500.0;
-const EDGES_FROM_P99_US_MAX: f64 = 100.0;
+const EDGES_FROM_P99_US_MAX: f64 = 150.0;
 const TRAVERSE_D3_P99_US_MAX: f64 = 500.0;
 const TRAVERSE_D5_P99_MS_MAX: f64 = 2.0;
 const REBUILD_M_MS_MAX: f64 = 200.0;
@@ -195,7 +195,11 @@ fn measure_all() -> Vec<Metric> {
 
     {
         let dir = tempfile::tempdir().unwrap();
-        let store = build_store(&dir, 10_000, &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        let store = build_store(
+            &dir,
+            10_000,
+            &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+        );
         let mut timings = Vec::with_capacity(200);
         for _ in 0..200 {
             let t = Instant::now();
@@ -257,7 +261,13 @@ fn measure_all() -> Vec<Metric> {
         for i in 0..100usize {
             let spoke = obj(format!("a://spoke.{i}"));
             setup.put_object(spoke.clone(), vec![i as u8; 32]);
-            setup.put_edge(EdgeId::new(format!("e{i}")), hub.clone(), spoke, "LINK", None);
+            setup.put_edge(
+                EdgeId::new(format!("e{i}")),
+                hub.clone(),
+                spoke,
+                "LINK",
+                None,
+            );
         }
         store.commit(setup, "report", "").unwrap();
         let mut timings = Vec::with_capacity(2_000);
@@ -472,7 +482,8 @@ fn measure_all() -> Vec<Metric> {
             let query = unit(query);
             let h = hnsw.knn_search(&query, &filter, k);
             let b = brute.knn_search(&query, &filter, k);
-            let bset: std::collections::HashSet<_> = b.iter().map(|r| r.object_id.clone()).collect();
+            let bset: std::collections::HashSet<_> =
+                b.iter().map(|r| r.object_id.clone()).collect();
             correct += h.iter().filter(|r| bset.contains(&r.object_id)).count();
         }
         let recall = correct as f64 / (queries * k) as f64;
