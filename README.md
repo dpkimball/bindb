@@ -1,5 +1,9 @@
 # bindb
 
+<p align="center">
+  <img src="image.png" alt="bindb" width="260" />
+</p>
+
 **bindb** is a native embedded database designed for semantic, graph, temporal, and AI-native
 applications.
 
