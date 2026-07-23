@@ -48,6 +48,11 @@ pub struct BinderStore {
     head_object_positions: Mutex<HashMap<ObjectId, usize>>,
     /// Same for edges.
     head_edge_positions: Mutex<HashMap<EdgeId, usize>>,
+    /// Number of historical commits that have been compacted away (not present
+    /// in the WAL).  After compact(), new WAL frames start at offset 0 but
+    /// self.commits still holds all historical commits in memory.  This offset
+    /// lets close() compute the WAL-relative commit count for the snapshot.
+    wal_commit_offset: Mutex<u64>,
 }
 
 impl BinderStore {
@@ -73,20 +78,30 @@ impl BinderStore {
         let (object_versions, edge_versions, ov_positions, ev_positions) =
             if let Some(cp) = last_checkpoint {
                 if let Some(snap) = read_snapshot(&snapshot_path) {
-                    if snap.wal_offset == cp.wal_offset
-                        && snap.commit_count == cp.commit_count
-                        && (cp.commit_count as usize) <= commits.len()
-                    {
-                        // Fast path: snapshot covers the first `commit_count`
-                        // commits; apply any delta commits on top.
-                        let delta = &commits[cp.commit_count as usize..];
-                        build_version_stores_delta(
-                            delta,
-                            snap.object_versions,
-                            snap.edge_versions,
-                            snap.ov_positions,
-                            snap.ev_positions,
-                        )
+                    if snap.wal_offset == cp.wal_offset && snap.commit_count == cp.commit_count {
+                        // Snapshot is valid.  Determine which commits are the delta:
+                        //
+                        // Post-compaction (wal_offset == 0): the WAL was truncated by
+                        // compact(); all replayed commits are writes after the snapshot.
+                        //
+                        // Normal (wal_offset > 0): commits contains every historical
+                        // frame; the delta starts at index commit_count.
+                        let delta: Option<&[BinderCommit]> = if cp.wal_offset == 0 {
+                            Some(&commits)
+                        } else {
+                            commits.get(cp.commit_count as usize..)
+                        };
+                        if let Some(delta) = delta {
+                            build_version_stores_delta(
+                                delta,
+                                snap.object_versions,
+                                snap.edge_versions,
+                                snap.ov_positions,
+                                snap.ev_positions,
+                            )
+                        } else {
+                            build_version_stores(&commits)
+                        }
                     } else {
                         build_version_stores(&commits)
                     }
@@ -129,6 +144,7 @@ impl BinderStore {
             vector_index: Mutex::new(vector_index),
             head_object_positions: Mutex::new(ov_positions),
             head_edge_positions: Mutex::new(ev_positions),
+            wal_commit_offset: Mutex::new(0),
         })
     }
 
@@ -573,6 +589,69 @@ impl BinderStore {
         Ok(())
     }
 
+    /// Compact the store: write a snapshot of the current state and truncate
+    /// the WAL to zero bytes.
+    ///
+    /// After `compact()`, `open()` takes the snapshot fast path and only
+    /// replays WAL frames written after this call.  The WAL cannot grow
+    /// unboundedly when `compact()` is called periodically (e.g. on close,
+    /// after a bulk import, or when WAL size exceeds a threshold).
+    ///
+    /// Safe to call while the store is open.  Acquires the write lock so no
+    /// commits are interleaved during the snapshot + truncate sequence.
+    pub fn compact(&self) -> Result<(), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+
+        let _write_guard = self.write_lock.lock().unwrap();
+
+        // 1. Fsync any buffered WAL writes so the snapshot is consistent.
+        self.wal.lock().unwrap().fsync()?;
+
+        // 2. Snapshot current in-memory version stores.
+        //    commit_count=0 and wal_offset=0 because the WAL is about to be
+        //    truncated; from the perspective of a future open(), the snapshot
+        //    covers "0 WAL frames from offset 0" — all state comes from the
+        //    snapshot directly, and any WAL frames present are the delta.
+        let historical_count = self.commits.lock().unwrap().len() as u64;
+        let snapshot = {
+            let ovs = self.object_versions.lock().unwrap().clone();
+            let evs = self.edge_versions.lock().unwrap().clone();
+            let ov_pos = self.head_object_positions.lock().unwrap().clone();
+            let ev_pos = self.head_edge_positions.lock().unwrap().clone();
+            VersionSnapshot {
+                commit_count: 0,
+                wal_offset: 0,
+                object_versions: ovs,
+                edge_versions: evs,
+                ov_positions: ov_pos,
+                ev_positions: ev_pos,
+            }
+        };
+        write_snapshot(&self.store_path.join("store.snap"), &snapshot)?;
+
+        // 3. Truncate WAL — all frames are now captured in the snapshot.
+        self.wal.lock().unwrap().truncate_to_start()?;
+
+        // 4. Write checkpoint pointing at the new (empty) WAL start.
+        //    commit_count = 0 because the trimmed WAL has zero frames before
+        //    offset 0.  The snapshot holds all historical state.
+        self.checkpoint_log
+            .lock()
+            .unwrap()
+            .write(CheckpointRecord {
+                wal_offset: 0,
+                commit_count: 0,
+            })?;
+
+        // 5. Record how many commits existed at compaction time.  close() uses
+        //    this to compute the WAL-relative commit count for the next snapshot.
+        *self.wal_commit_offset.lock().unwrap() = historical_count;
+
+        Ok(())
+    }
+
     pub fn scan_commits(&self) -> Result<Vec<BinderCommit>, StoreError> {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
@@ -696,7 +775,14 @@ impl BinderStore {
 
         // Write checkpoint + version store snapshot so next open can skip
         // full WAL replay and load the pre-built stores directly.
-        let commit_count = self.commits.lock().unwrap().len() as u64;
+        //
+        // commit_count is WAL-relative: the number of commits present in the
+        // WAL file up to wal_offset.  After compact(), wal_commit_offset > 0
+        // because the WAL was trimmed; new commits begin at WAL offset 0 but
+        // self.commits still holds all historical commits in memory.
+        let total_commits = self.commits.lock().unwrap().len() as u64;
+        let wal_commit_offset = *self.wal_commit_offset.lock().unwrap();
+        let wal_relative_count = total_commits - wal_commit_offset;
         let wal_offset = wal.current_offset();
         drop(wal);
 
@@ -705,7 +791,7 @@ impl BinderStore {
             .unwrap()
             .write(CheckpointRecord {
                 wal_offset,
-                commit_count,
+                commit_count: wal_relative_count,
             })?;
 
         // Snapshot: serialize the version Vecs and position maps. On next
@@ -716,7 +802,7 @@ impl BinderStore {
             let ov_pos = self.head_object_positions.lock().unwrap().clone();
             let ev_pos = self.head_edge_positions.lock().unwrap().clone();
             VersionSnapshot {
-                commit_count,
+                commit_count: wal_relative_count,
                 wal_offset,
                 object_versions: ovs,
                 edge_versions: evs,

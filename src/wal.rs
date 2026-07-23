@@ -92,6 +92,16 @@ impl Wal {
         self.file.seek(SeekFrom::End(0)).unwrap_or(0)
     }
 
+    /// Truncate the WAL file to zero bytes, preserving the current
+    /// `next_entry_id` counter so future writes remain monotonically ordered.
+    /// Called by `BinderStore::compact()` after a snapshot has been confirmed.
+    pub fn truncate_to_start(&mut self) -> Result<(), StoreError> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
     /// Replay only the WAL frames at or after `start_offset`.
     /// Used by WAL compaction (issue #1): once frames before a checkpoint are
     /// trimmed, open() calls this to replay only the delta after the snapshot.

@@ -233,6 +233,70 @@ fn empty_transaction_is_rejected() {
     store.close().unwrap();
 }
 
+// ─── compact ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn compact_truncates_wal_and_store_remains_queryable() {
+    let dir = tmp();
+    let path = dir.path().to_path_buf();
+
+    // Write some commits, compact, verify WAL is empty but store still works.
+    let oid = ObjectId::new("a://obj.1");
+    {
+        let store = BinderStore::open(&path).unwrap();
+        for i in 0..10usize {
+            let mut tx = Transaction::new();
+            tx.put_object(ObjectId::new(format!("a://obj.{i}")), vec![i as u8; 32]);
+            store.commit_buffered(tx, "test", "").unwrap();
+        }
+        store.flush().unwrap();
+        store.compact().unwrap();
+
+        // After compact the store must still answer queries correctly.
+        assert!(store.get(&oid).unwrap().is_some());
+        assert_eq!(store.list("a://").unwrap().len(), 10);
+    }
+
+    // WAL file must be empty after compact.
+    let wal_size = fs::metadata(path.join("commits.wal")).unwrap().len();
+    assert_eq!(wal_size, 0, "WAL must be empty after compact()");
+
+    // Reopen and verify data is still accessible (loaded from snapshot).
+    let store2 = BinderStore::open(&path).unwrap();
+    assert!(store2.get(&oid).unwrap().is_some());
+    assert_eq!(store2.list("a://").unwrap().len(), 10);
+    store2.close().unwrap();
+}
+
+#[test]
+fn compact_then_new_commits_survive_reopen() {
+    let dir = tmp();
+    let path = dir.path().to_path_buf();
+
+    let new_oid = ObjectId::new("a://new");
+    {
+        let store = BinderStore::open(&path).unwrap();
+        let mut tx = Transaction::new();
+        tx.put_object(ObjectId::new("a://base"), vec![1u8; 32]);
+        store.commit(tx, "test", "").unwrap();
+
+        // Compact — WAL trimmed to 0.
+        store.compact().unwrap();
+
+        // Write a new commit after compact.
+        let mut tx2 = Transaction::new();
+        tx2.put_object(new_oid.clone(), vec![2u8; 32]);
+        store.commit(tx2, "test", "").unwrap();
+        store.close().unwrap();
+    }
+
+    // Reopen: snapshot covers the base commit; new_oid commit is in the WAL delta.
+    let store2 = BinderStore::open(&path).unwrap();
+    assert!(store2.get(&ObjectId::new("a://base")).unwrap().is_some());
+    assert!(store2.get(&new_oid).unwrap().is_some());
+    store2.close().unwrap();
+}
+
 // ─── edge round-trip ──────────────────────────────────────────────────────────
 
 #[test]
