@@ -30,7 +30,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: SLA tests (--release, --ignored)
-        run: cargo test --release -- --ignored --test-threads=1
+        # Scope to perf_sla only: `cargo test -- --ignored` also executes
+        # rustdoc ```ignore``` examples, which are documentation stubs.
+        run: cargo test --release --test perf_sla -- --ignored --test-threads=1
 
   # ── trend benchmarks ────────────────────────────────────────────────────────
   # Runs criterion and stores results for PR comment comparison.
@@ -45,6 +47,20 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'performance')
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure local gh-pages ref
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages:gh-pages 2>/dev/null \
+            || git fetch origin gh-pages \
+            || {
+              echo "gh-pages missing remotely; creating orphan local branch" >&2
+              git switch --orphan gh-pages
+              git commit --allow-empty -m "init gh-pages"
+              git switch -
+            }
 
       - name: Run criterion benchmarks
         run: >
