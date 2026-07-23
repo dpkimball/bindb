@@ -5,6 +5,7 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch: {}
 
 concurrency:
@@ -22,6 +23,9 @@ jobs:
     name: SLA gate
     runs-on: self-hosted
     timeout-minutes: 20
+    if: >
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'performance')
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +40,9 @@ jobs:
     name: Benchmark trends
     runs-on: self-hosted
     timeout-minutes: 60
+    if: >
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'performance')
     steps:
       - uses: actions/checkout@v4
 
