@@ -1,336 +1,221 @@
 # bindb
 
-**bindb** is the embedded database for the Binder platform — a WAL-first, append-only commit log
-for objects, edges, versions, namespaces, graph traversal, and vector search.  It is the single
-storage engine for both the desktop app and cloud deployments; MongoDB / Neo4j / Weaviate /
-ClickHouse are not required.
+**bindb** is a native embedded database designed for semantic, graph, temporal, and AI-native
+applications.
 
-Formerly the in-tree `binder-store` crate.  Host-only — plugins must not depend on bindb
-(see Binder `boundary-check`).
+Rather than combining separate databases for each concern — documents, graphs, vectors, analytics —
+bindb provides a unified storage engine with first-class support for:
+
+- **Objects** — versioned, typed documents
+- **Relationships** — directed graph edges between objects
+- **Time** — full version history and point-in-time queries
+- **Observations** — metric-typed time series with semantic provenance
+- **Vectors** — embedded chunk indexes for semantic search
+- **Provenance** — source attribution on every write
+
+All within a single transactional commit log.
 
 ---
 
-## Architecture
+## Why bindb exists
 
-### System context
+Traditional semantic application stacks combine multiple databases:
+
+| Database | Role |
+|----------|------|
+| MongoDB | Document storage |
+| Neo4j | Graph relationships |
+| Weaviate | Vector / embedding search |
+| ClickHouse | Time-series analytics |
+| MySQL | Structured records |
+
+Each solves a different problem. Each requires its own schema, client, query language,
+operational overhead, and consistency boundary.
+
+bindb replaces that architecture with one storage engine.
+
+---
+
+## High-level architecture
 
 ```mermaid
 graph TD
-    App["Binder App\n(binder-runtime)"]
-    DPK["dpk\nBusiness Logic Layer"]
-    BINDB["bindb\nEmbedded Database"]
-    DISK[("On-disk WAL\n+ checkpoint")]
+    APP["Applications\n(Binder · dpk · plugins)"]
 
-    App -->|"domain API calls"| DPK
-    DPK -->|"BinderStore::commit()\nget() / list()\ntraverse() / vector_search()"| BINDB
-    BINDB -->|"fsync writes\nreplay on open"| DISK
+    subgraph bindb
+        OE["Object Engine\nversioned documents"]
+        GE["Graph Engine\ndirected relationships"]
+        TE["Temporal Engine\nbitemporal + observations"]
+        VE["Vector Engine\nembedding search"]
+        QE["Query Engine\nget · list · traverse · semantic_query"]
+        WAL["WAL\ncommit log — source of truth"]
+    end
+
+    APP --> QE
+    QE --> OE & GE & TE & VE
+    OE & GE & TE & VE --> WAL
 ```
 
-bindb is a library crate — it has no network layer and no daemon.  It is opened directly from the
-process that owns the store directory.
+The WAL is the only canonical store. Every engine is a projection of the commit log —
+rebuildable, replaceable, never authoritative on their own.
 
 ---
 
-### Internal architecture
+## Core concepts
+
+### Object
+
+The fundamental unit of storage.  Every object has a URI-style `ObjectId`:
+
+```
+scheme://path
+  │         └── entity path within the namespace
+  └── namespace owner (e.g. "memory", "obs", "story", "health")
+```
+
+Examples: `memory://mem.01J3...`, `obs://health.sleep_duration_h:withings`, `story://st.01J3...`
+
+Objects are versioned.  Every write creates a new immutable version; old versions remain
+in the log and are queryable by commit timestamp.
+
+### Edge
+
+A directed relationship between two objects.  Edges are first-class versioned entities —
+they can be deleted (tombstoned), updated, and queried historically just like objects.
+
+### Observation
+
+A metric-typed data point attached to an object at a point in time.  Observations are
+stored as objects in the `obs://` namespace and associated with a `MetricDefinition` that
+declares the unit, type, and schema.
+
+```
+MetricDefinition  →  "health.sleep_duration_h" (unit: hours, type: interval)
+Observation       →  obs://health.sleep_duration_h:withings  (value, valid_from, valid_to)
+```
+
+### Commit
+
+An atomic group of object and edge changes.  Every commit carries:
+- A ULID `CommitId` (monotone, time-sortable)
+- `actor` — the namespace owner who wrote it
+- `timestamp_ms` — wall-clock time at commit
+- `parent_commit` — forms the linear commit chain
+- Provenance metadata on individual writes
+
+### Version
+
+Every object and edge change produces a `BinderObjectVersion` / `BinderEdgeVersion` with:
+
+- `valid_from` — CommitId when this version became current
+- `valid_to` — CommitId when this version was superseded (`None` = still current)
+- `payload` — serialized content (`None` = tombstone)
+
+---
+
+## Query surface
+
+Current:
+
+```rust
+store.get(&object_id)                         // O(1) HEAD lookup
+store.list("obs://")                          // O(k) namespace scan
+store.object_as_of(&oid, past_commit)         // bitemporal point-in-time
+store.object_history(&oid)                    // full version history
+store.traverse(&start, max_depth)             // BFS graph traversal
+store.edges_from(&oid)                        // outgoing edges
+store.edges_from_with_type(&oid, "RELATES_TO")
+store.vector_search(&embedding, &filter, 10)  // cosine similarity
+```
+
+Planned:
+
+```
+store.query(ObservationQuery)        // metric-filtered observation scan
+store.graph_query(GraphQuery)        // pattern-matched subgraph
+store.temporal_query(TemporalQuery)  // time-windowed version scan
+store.semantic_query(SemanticQuery)  // embedding + namespace + graph combined
+```
+
+---
+
+## Write API
+
+```rust
+// Single durable commit.
+let mut tx = Transaction::new();
+tx.put_object(ObjectId::new("memory://mem.abc"), bincode::serialize(&obj)?);
+tx.put_edge(EdgeId::new("e1"), from_id, to_id, "RELATES_TO", None);
+let commit_id = store.commit(tx, "memory-binder", "created memory")?;
+
+// Bulk ingestion — one fsync for N commits.
+for item in large_batch {
+    let mut tx = Transaction::new();
+    tx.put_object(item.object_id(), item.serialize());
+    store.commit_buffered(tx, "importer", "")?;
+}
+store.flush()?;
+```
+
+See [docs/performance.md](docs/performance.md) for throughput characteristics.
+
+---
+
+## Design goals
+
+**Unified** — one store, one consistency boundary, one query surface.  No cross-database
+join problem; no partial failure between systems.
+
+**Temporal by default** — every write is versioned.  Time travel and audit trails are
+structural, not bolt-on.
+
+**Provenance-aware** — every write can carry a source attribution (`Plugin`, `UserEdit`,
+`Import`, `System`).  The full lineage of every data point is recoverable.
+
+**WAL-first durability** — commits are durable before the call returns.  The in-memory
+state is always a consistent projection of the commit log.  See [docs/storage.md](docs/storage.md).
+
+**Rebuildable indexes** — every index is a non-canonical projection.  Any index can be
+dropped and rebuilt from the commit log without data loss.  See [docs/indexes.md](docs/indexes.md).
+
+**Embeddable** — no daemon, no network layer, no ops overhead.  Open a directory; get a
+database.
+
+---
+
+## Implementation architecture
+
+See [docs/storage.md](docs/storage.md) for WAL internals, on-disk layout, and recovery protocol.
 
 ```mermaid
 graph LR
     subgraph "BinderStore (engine.rs)"
-        TX["Transaction\nput_object · delete_object\nput_edge · delete_edge"]
+        TX["Transaction"]
+        WL["write_lock"]
+        WAL2["WAL · commits.wal"]
+        AIM["apply_commit_to_memory()"]
 
-        subgraph "Write path"
-            WL["write_lock\n(Mutex)"]
-            WAL["WAL\ncommits.wal\n(append-only)"]
-            AIM["apply_commit_to_memory()"]
-        end
-
-        subgraph "In-memory indexes (non-canonical)"
-            OV["object_versions\nVec — full history"]
-            EV["edge_versions\nVec — full history"]
-            HO["head_objects\nHashMap · O(1) get"]
-            HE["head_edges\nHashMap · O(1) get"]
-            GR["graph + neighbours\nBFS adjacency"]
-            NI["namespace_index\nscheme → HashSet&lt;ObjectId&gt;"]
-            VI["vector_index\nIn-memory cosine ANN"]
-        end
-
-        subgraph "Persistence"
-            CKP["checkpoint.log\nwal_offset + count"]
-            VCP["vector_projection.bin\ncheckpoint snapshot"]
+        subgraph "In-memory indexes"
+            HO["head_objects · O(1) get"]
+            HE["head_edges"]
+            GR["graph + neighbours · BFS"]
+            NI["namespace_index · O(k) list"]
+            VI["vector_index · cosine search"]
+            OV["object_versions · full history"]
+            EV["edge_versions · full history"]
         end
     end
 
-    TX --> WL --> WAL --> AIM
-    AIM --> OV & EV & HO & HE & GR & NI
-    WAL -.checkpoint.-> CKP
-    VI -.close().-> VCP
+    TX --> WL --> WAL2 --> AIM
+    AIM --> HO & HE & GR & NI & OV & EV
+    VI -.close().-> disk[("vector_projection.bin")]
 ```
-
----
-
-### Write path detail
-
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant BinderStore
-    participant WAL
-    participant Indexes
-
-    Caller->>BinderStore: commit(tx, actor, message)
-    BinderStore->>BinderStore: namespace_registry.check()
-    BinderStore->>BinderStore: acquire write_lock
-    BinderStore->>BinderStore: build BinderCommit (ULID CommitId)
-    BinderStore->>WAL: append(commit) — serialize + CRC32 + fsync
-    WAL-->>BinderStore: Ok
-    BinderStore->>Indexes: apply_commit_to_memory(commit_id, commit)
-    Note over Indexes: Updates OV, EV, HO, HE, GR, NI atomically
-    BinderStore-->>Caller: Ok(CommitId)
-```
-
-**Bulk ingestion** skips per-commit fsync:
-
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant BinderStore
-    participant WAL
-
-    loop N objects
-        Caller->>BinderStore: commit_buffered(tx, actor, message)
-        BinderStore->>WAL: append_no_sync(commit) — write only, no fsync
-        BinderStore->>BinderStore: apply_commit_to_memory (reads consistent)
-    end
-    Caller->>BinderStore: flush()
-    BinderStore->>WAL: fsync() — single fsync for all N commits
-```
-
----
-
-### Recovery path
-
-```mermaid
-flowchart TD
-    OPEN["BinderStore::open(path)"]
-    DIRTY{"'.dirty' marker\nexists?"}
-    REPLAY["WAL replay:\nread frames, verify CRC32,\ntruncate after last good frame"]
-    REBUILD["Rebuild all indexes\nfrom replayed commits"]
-    READY["Store ready"]
-
-    OPEN --> DIRTY
-    DIRTY -->|"yes (crash recovery)"| REPLAY
-    DIRTY -->|"no (clean open)"| REPLAY
-    REPLAY --> REBUILD --> READY
-```
-
-All indexes are non-canonical projections of the WAL.  If an index were lost, `rebuild_indexes()`
-or a fresh `open()` restores them from the commit log.
-
----
-
-## Data model
-
-### Core types
-
-| Type | Description |
-|------|-------------|
-| `ObjectId` | `String` — by convention `scheme://path`, e.g. `memory://mem.abc` |
-| `EdgeId` | `String` — identifies a directed relationship |
-| `CommitId` | ULID — monotonic, time-sortable, globally unique |
-| `ObjectVersionId` | ULID — identifies one point-in-time snapshot of an object |
-
-### Object versioning (bitemporal)
-
-```mermaid
-timeline
-    title Object "memory://abc" version history
-    Commit C1 : v1 created (valid_from=C1, valid_to=None)
-    Commit C2 : v1 retired (valid_to=C2), v2 created (valid_from=C2, valid_to=None)
-    Commit C3 : v2 tombstoned (valid_to=C3, payload=None)
-```
-
-Every write creates a new `BinderObjectVersion`.  The previous version's `valid_to` is set to the
-current commit.  Deletion creates a tombstone (payload = None).  The WAL only appends — old
-versions are never modified on disk.
-
-### Namespace scheme
-
-ObjectIds follow a URI convention so namespaces can be enumerated efficiently:
-
-```
-scheme://path
-  │         └── arbitrary object path within the namespace
-  └── registered namespace owner (e.g. "memory", "obs", "story", "health")
-```
-
-Examples:
-- `memory://mem.01J3...`
-- `obs://health.sleep_duration_h:withings`
-- `story://st.01J3...`
-
-`store.list("obs://")` returns all live objects in the `obs` namespace in **O(k)** time via the
-secondary `NamespaceObjectIndex`, where k = number of live objects in that namespace.
-
-### Provenance
-
-Every object or edge write may carry optional `Provenance`:
-
-```rust
-pub enum ProvenanceSource {
-    Plugin(String),   // plugin id
-    UserEdit,
-    Import(String),   // import job id
-    System,
-}
-```
-
----
-
-## API reference
-
-### Opening a store
-
-```rust
-let store = BinderStore::open(Path::new("/path/to/store"))?;
-```
-
-Creates the directory if absent.  Writes a `.dirty` marker immediately; removes it on `close()`.
-Safe to open from a single process at a time (file-system directory as lock).
-
-### Writing
-
-```rust
-// Single commit — durable after return.
-let mut tx = Transaction::new();
-tx.put_object(ObjectId::new("memory://mem.abc"), bincode::serialize(&my_obj)?);
-tx.put_edge(EdgeId::new("e1"), from_id, to_id, "RELATES_TO", None);
-let commit_id = store.commit(tx, "actor", "created memory")?;
-
-// Bulk ingestion — O(1) fsync for N commits.
-for obj in large_batch {
-    let mut tx = Transaction::new();
-    tx.put_object(obj.id(), obj.serialize());
-    store.commit_buffered(tx, "importer", "")?;
-}
-store.flush()?;   // single fsync
-```
-
-### Reading
-
-```rust
-// O(1) HEAD index lookup.
-let version: Option<BinderObjectVersion> = store.get(&object_id)?;
-
-// O(k) namespace scan via secondary index.
-let versions: Vec<BinderObjectVersion> = store.list("obs://")?;
-
-// Bitemporal point-in-time.
-let past = store.object_as_of(&object_id, past_commit_id)?;
-
-// Full version history.
-let history = store.object_history(&object_id)?;
-
-// Graph traversal (BFS).
-let reachable: Vec<ObjectId> = store.traverse(&start, max_depth)?;
-
-// Edge queries.
-let outgoing: Vec<BinderEdgeVersion> = store.edges_from(&object_id)?;
-let typed: Vec<BinderEdgeVersion> = store.edges_from_with_type(&oid, "RELATES_TO")?;
-
-// Vector search (cosine).
-let results: Vec<VectorSearchResult> =
-    store.vector_search(&embedding, &VectorFilter::default(), 10)?;
-```
-
-### Namespace registration
-
-```rust
-store.register_namespace("memory", "memory-binder")?;
-// Now only "memory-binder" actor may commit to the "memory://" namespace.
-```
-
-### Maintenance
-
-```rust
-store.rebuild_indexes()?;   // full reindex from version stores
-store.close()?;             // fsync + write checkpoint + remove .dirty marker
-```
-
----
-
-## On-disk layout
-
-```text
-{store_path}/
-├── commits.wal         ← append-only WAL (BNDR magic + entry_id + len + data + CRC32)
-├── checkpoint.log      ← 20-byte records: wal_offset + commit_count + CRC32
-├── vector_projection.bin ← persisted VectorIndex checkpoint (written on clean close)
-└── .dirty              ← marker: present → last close was not clean (crash recovery needed)
-```
-
-### WAL frame format
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ 4 bytes  │ MAGIC = "BNDR"                                       │
-│ 8 bytes  │ entry_id (u64 LE, monotone)                          │
-│ 8 bytes  │ data_len (u64 LE)                                     │
-│ N bytes  │ bincode-serialized WalEntryData { commit }            │
-│ 4 bytes  │ CRC32 of the N data bytes                             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-Replay stops at the first frame with a bad magic, bad CRC, or truncated read.  The file is
-truncated to the last good frame offset, so future appends never follow a corrupted entry.
-
----
-
-## Performance characteristics
-
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| `commit()` | O(1) write | One WAL append + fsync |
-| `commit_buffered()` | O(1) write | One WAL append, no fsync |
-| `flush()` | O(1) | Single fsync for all buffered commits |
-| `get()` | O(1) | HEAD index HashMap lookup |
-| `list(prefix)` | O(k) | k = live objects in namespace |
-| `object_history()` | O(n_versions) | Linear scan of version Vec |
-| `object_as_of()` | O(n_versions) | Bitemporal scan |
-| `edges_from()` | O(degree) | Graph index |
-| `traverse()` | O(V+E) within depth | BFS over neighbour map |
-| `vector_search()` | O(n_vectors) | In-memory cosine brute-force |
-| `rebuild_indexes()` | O(n_commits) | Full replay |
-
-**Durability modes:**
-
-| Mode | Per-commit cost | Durability |
-|------|----------------|------------|
-| `commit()` | fsync | Durable immediately after return |
-| `commit_buffered()` + `flush()` | 1 fsync per batch | Durable after `flush()` |
-
-At ~10K `commit_buffered()` calls followed by one `flush()`, throughput is limited only by memory
-write speed rather than disk seek latency.
-
----
-
-## Invariants
-
-See [`PRINCIPLES.md`](./PRINCIPLES.md).
-
-1. **WAL is canonical** — indexes and projections are derived, never authoritative
-2. **Commits are immutable** — once fsynced, a WAL frame is never rewritten
-3. **WAL-first writes** — memory state is updated only after a WAL write succeeds
-4. **Tombstones, not deletes** — deletion appends a `payload = None` version
-5. **Monotone entry ids** — WAL `entry_id` increments; used to detect out-of-order replay
-6. **Dirty marker protocol** — `.dirty` is written before any WAL append; removed only on
-   clean `close()`; presence at open triggers full replay + truncation
 
 ---
 
 ## Develop
 
 ```bash
-cd /path/to/bindb
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
@@ -339,13 +224,24 @@ cargo bench --bench store_bench
 
 ---
 
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/storage.md](docs/storage.md) | WAL format, on-disk layout, checkpoint, recovery |
+| [docs/indexes.md](docs/indexes.md) | Head indexes, graph, namespace, vector, rebuild rules |
+| [docs/performance.md](docs/performance.md) | Throughput, durability modes, scale context |
+| [PRINCIPLES.md](PRINCIPLES.md) | The ten implementation invariants |
+
+---
+
 ## Consumers
 
 | Crate | Role |
 |-------|------|
-| `dpk` / `dpk2` | Business Logic Layer — primary consumer; wraps BinderStore behind domain repositories |
+| `dpk` | Business Logic Layer — primary consumer; wraps BinderStore behind domain repositories |
 | `binder-runtime` | Host runtime — opens the store for the workspace lifetime |
 | `dpk-analytics` | Writes observations via `commit_buffered()` bulk path |
 
-Plugins (binder-sdk dependents) must **not** depend on bindb.  They interact with data only
-through their registered namespaces via the host runtime.
+Plugins (binder-sdk dependents) must not depend on bindb.  They interact through
+registered namespace actors via the host runtime.

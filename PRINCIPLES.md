@@ -1,4 +1,4 @@
-# Binder Store — Implementation Invariants
+# bindb — Implementation Invariants
 
 These invariants must hold at every point in the implementation. They are not aspirational.
 If an implementation choice would violate any invariant, the implementation is wrong.
