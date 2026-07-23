@@ -8,6 +8,7 @@
 /// Format: MAGIC(4) + version(1) + payload_len(8) + payload(N) + crc32(4)
 /// The CRC covers only the payload bytes.  The version byte allows future
 /// format changes without a separate magic number.
+use crate::commit::BinderCommit;
 use crate::edge::BinderEdgeVersion;
 use crate::error::StoreError;
 use crate::object::BinderObjectVersion;
@@ -29,6 +30,11 @@ pub struct VersionSnapshot {
     pub edge_versions: Vec<BinderEdgeVersion>,
     pub ov_positions: HashMap<ObjectId, usize>,
     pub ev_positions: HashMap<EdgeId, usize>,
+    /// Full commit log at snapshot time (empty after `compact()`).
+    /// Older snapshots omit this field; serde default keeps open() falling
+    /// back to full WAL replay when history is required for `scan_commits`.
+    #[serde(default)]
+    pub commits: Vec<BinderCommit>,
 }
 
 pub fn write_snapshot(path: &Path, snapshot: &VersionSnapshot) -> Result<(), StoreError> {

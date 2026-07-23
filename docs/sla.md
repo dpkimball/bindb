@@ -121,9 +121,10 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 | **M** (10 K commits) | ≤ 30 ms |
 | **L** (100 K commits) | ≤ 300 ms |
 
-> **Note:** WAL replay is now O(n) after the position-index fix (previously O(n²)).
-> M-tier measured at ~14 ms.  Phase 2 checkpoint-based open will reduce this further
-> by avoiding full deserialization of all historical commits.
+> **Note:** Clean `open()` after checkpoint/snapshot skips full WAL frame replay and
+> defers version-log index hydration until the first history/as_of/write. Raw
+> unrecompacted WAL open at XL remains slow; ops path is `compact()` then reopen
+> (see issue #7 / `PERF_REPORT_XL=1`).
 
 ---
 

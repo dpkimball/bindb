@@ -10,7 +10,7 @@ Last updated: 2026-07-23. Prefer this over stale issue bodies.
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation | Open | Rust DSL + restricted `sql_aggregate()` (`COUNT`/`AVG`/`SUM`/`MIN`/`MAX`, `PATH_SEGMENT`) | Full SQL; out-of-process / DuckDB projection |
 | [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | — | Decision + optional spike (OKR O5) |
-| [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open (reopened) | — | Measured 1M open/get via `PERF_REPORT_XL=1` |
+| [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open (reopened) | Snapshot fast open + deferred version-index hydrate; XL report uses compact | Attach fresh `PERF_REPORT_XL=1` numbers; unrecompacted WAL open still slow |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
 | [#9](https://github.com/dpkimball/bindb/issues/9) Checkpoint open | Closed | Snapshot fast path on `open()` | Variance / flake control (OKR O4) |
 
@@ -47,6 +47,6 @@ Adds 1M-object rows to `perf-report.md` / `.json`. Slow; not CI-gated by default
 | Metric | Measured | SLA | Result |
 |--------|----------|-----|--------|
 | `get()` p99 @ 1M objects | 0.042 µs | ≤ 10 µs | PASS |
-| `open()` worst-of-3 @ 1M commits | 6218 ms | ≤ 5000 ms | FAIL (−24%) |
+| `open()` unrecompacted WAL @ 1M | ~6218 ms | ≤ 5000 ms | FAIL (−24%) — raw WAL path |
 
-`get` at XL is fine. `open` still exceeds the provisional SLA; treat as evidence for #7 / compaction / snapshot path, not a ship gate yet.
+As of snapshot fast-path (commits in snap + `replay_from`) and deferred version-index hydrate: M/L `open()` pass local `perf_report` (~11 ms / ~124 ms). XL report measures **open after `compact()`** plus `rss_xl_mb` vs 2 GB (#6). Remeasure XL with `PERF_REPORT_XL=1`.

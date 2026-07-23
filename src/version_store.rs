@@ -117,6 +117,90 @@ impl VersionStore {
         self.file.flush()
     }
 
+    /// Rebuild in-memory indexes by scanning an existing `version_log.bin`
+    /// without rewriting it. Used on clean reopen when the file is already
+    /// consistent with the snapshot (avoids O(n) rewrite on every `open()`).
+    pub fn hydrate_index_from_file(&mut self) -> io::Result<()> {
+        self.object_index.clear();
+        self.edge_index.clear();
+        self.file.seek(SeekFrom::Start(0))?;
+        let file_len = self.file.metadata()?.len();
+        let mut pos = 0u64;
+
+        while pos + 8 <= file_len {
+            self.file.seek(SeekFrom::Start(pos))?;
+            let mut len_buf = [0u8; 8];
+            if self.file.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let len = u64::from_le_bytes(len_buf) as usize;
+            if pos + 8 + len as u64 > file_len {
+                break;
+            }
+            let mut buf = vec![0u8; len];
+            if self.file.read_exact(&mut buf).is_err() {
+                break;
+            }
+            let offset = pos;
+            pos += 8 + len as u64;
+
+            let record: VersionRecord = match bincode::deserialize(&buf) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            match record {
+                VersionRecord::Object(v) => {
+                    self.object_index
+                        .entry(v.object_id)
+                        .or_default()
+                        .push(IndexEntry {
+                            valid_from: v.valid_from,
+                            valid_to: v.valid_to,
+                            offset,
+                        });
+                }
+                VersionRecord::Edge(v) => {
+                    self.edge_index
+                        .entry(v.edge_id)
+                        .or_default()
+                        .push(IndexEntry {
+                            valid_from: v.valid_from,
+                            valid_to: v.valid_to,
+                            offset,
+                        });
+                }
+                VersionRecord::RetireObject { id, retired_at } => {
+                    if let Some(entries) = self.object_index.get_mut(&id) {
+                        if let Some(e) = entries.iter_mut().rfind(|e| e.valid_to.is_none()) {
+                            e.valid_to = Some(retired_at);
+                        }
+                    }
+                }
+                VersionRecord::RetireEdge { id, retired_at } => {
+                    if let Some(entries) = self.edge_index.get_mut(&id) {
+                        if let Some(e) = entries.iter_mut().rfind(|e| e.valid_to.is_none()) {
+                            e.valid_to = Some(retired_at);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.write_pos = pos;
+        self.file.seek(SeekFrom::Start(self.write_pos))?;
+        Ok(())
+    }
+
+    /// True when the in-memory index has no entries.
+    pub fn index_is_empty(&self) -> bool {
+        self.object_index.is_empty() && self.edge_index.is_empty()
+    }
+
+    /// True when the on-disk log has at least one frame.
+    pub fn has_data(&self) -> bool {
+        self.write_pos > 0 || self.file.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    }
+
     /// Append a new object version and record it in the in-memory index.
     pub fn append_object(&mut self, v: &BinderObjectVersion) -> io::Result<()> {
         let offset = self.append_record(&VersionRecord::Object(v.clone()))?;
