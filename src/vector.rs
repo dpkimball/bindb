@@ -1,3 +1,4 @@
+use crate::vector_hnsw::{dot, HnswGraph, EF_SEARCH, HNSW_THRESHOLD};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -45,9 +46,78 @@ pub struct ProjectionCheckpoint {
     pub indexed_count: u64,
 }
 
+// ── per-model HNSW subindex ───────────────────────────────────────────────────
+
+/// One HNSW graph per (model_id).  All chunks from the same model share a
+/// graph; different models have separate graphs because their vector spaces
+/// are incomparable.
+///
+/// Node IDs are stable indices into `flat_entries`.  Deleted chunks are
+/// soft-deleted in both `graph` and `chunk_to_node`.
+struct ModelIndex {
+    graph: HnswGraph,
+    /// Flat vector storage backing the HNSW graph.  Index = node_id.
+    flat_vectors: Vec<Vec<f32>>,
+    /// Flat entry storage for result reconstruction.  Index = node_id.
+    flat_entries: Vec<VectorEntry>,
+    /// chunk_id → node_id, for dedup on re-insert.
+    chunk_to_node: HashMap<String, usize>,
+    /// object_id → [node_ids], for tombstoning all chunks of an object.
+    object_to_nodes: HashMap<String, Vec<usize>>,
+}
+
+impl ModelIndex {
+    fn new() -> Self {
+        Self {
+            graph: HnswGraph::new(),
+            flat_vectors: Vec::new(),
+            flat_entries: Vec::new(),
+            chunk_to_node: HashMap::new(),
+            object_to_nodes: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, entry: VectorEntry) {
+        // If this chunk_id already exists, soft-delete the old node.
+        if let Some(&old_id) = self.chunk_to_node.get(&entry.chunk_id) {
+            self.graph.delete(old_id);
+        }
+        let node_id = self.flat_vectors.len();
+        self.flat_vectors.push(entry.vector.clone());
+        self.chunk_to_node.insert(entry.chunk_id.clone(), node_id);
+        self.object_to_nodes
+            .entry(entry.object_id.clone())
+            .or_default()
+            .push(node_id);
+        self.flat_entries.push(entry);
+        self.graph.insert(node_id, &self.flat_vectors);
+    }
+
+    fn tombstone_object(&mut self, object_id: &str) {
+        if let Some(node_ids) = self.object_to_nodes.remove(object_id) {
+            for id in node_ids {
+                self.graph.delete(id);
+            }
+        }
+    }
+
+    fn live_count(&self) -> usize {
+        self.graph.live_count()
+    }
+}
+
+// ── VectorIndex ───────────────────────────────────────────────────────────────
+
 /// In-memory vector index. Rebuildable projection — not backed by WAL.
+///
+/// Automatically switches between brute-force (< HNSW_THRESHOLD entries)
+/// and HNSW ANN (≥ HNSW_THRESHOLD) per model bucket.
 pub struct VectorIndex {
-    entries: HashMap<String, Vec<VectorEntry>>, // keyed by object_id
+    /// Existing per-object map: preserved for object-level API surface and
+    /// for the brute-force path.  object_id → chunks.
+    entries: HashMap<String, Vec<VectorEntry>>,
+    /// Per-model HNSW sub-indexes.
+    model_indexes: HashMap<String, ModelIndex>,
     checkpoint: ProjectionCheckpoint,
 }
 
@@ -55,21 +125,33 @@ impl VectorIndex {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            model_indexes: HashMap::new(),
             checkpoint: ProjectionCheckpoint::default(),
         }
     }
 
     pub fn insert(&mut self, entry: VectorEntry) {
+        // Update per-object map (for brute-force fallback + object API).
         let slots = self.entries.entry(entry.object_id.clone()).or_default();
         if let Some(pos) = slots.iter().position(|e| e.chunk_id == entry.chunk_id) {
-            slots[pos] = entry;
+            slots[pos] = entry.clone();
         } else {
-            slots.push(entry);
+            slots.push(entry.clone());
         }
+
+        // Update HNSW model sub-index.
+        let midx = self
+            .model_indexes
+            .entry(entry.model_id.clone())
+            .or_insert_with(ModelIndex::new);
+        midx.insert(entry);
     }
 
     pub fn tombstone_object(&mut self, object_id: &str) {
         self.entries.remove(object_id);
+        for midx in self.model_indexes.values_mut() {
+            midx.tombstone_object(object_id);
+        }
     }
 
     pub fn entries_for_object(&self, object_id: &str) -> Vec<VectorEntry> {
@@ -82,6 +164,7 @@ impl VectorIndex {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.model_indexes.clear();
         self.checkpoint.generation += 1;
     }
 
@@ -93,8 +176,116 @@ impl VectorIndex {
         self.checkpoint = checkpoint;
     }
 
-    /// Brute-force cosine similarity. Assumes unit-normalised vectors.
+    /// Nearest-neighbor search.
+    ///
+    /// Uses HNSW when the relevant model bucket has ≥ HNSW_THRESHOLD live
+    /// entries; falls back to brute-force cosine scan otherwise.
     pub fn knn_search(
+        &self,
+        query: &[f32],
+        filter: &VectorFilter,
+        limit: usize,
+    ) -> Vec<VectorSearchResult> {
+        // Choose the right model bucket when model_id is specified.
+        if let Some(mid) = &filter.model_id {
+            if let Some(midx) = self.model_indexes.get(mid) {
+                if midx.live_count() >= HNSW_THRESHOLD {
+                    return self.hnsw_search(midx, query, filter, limit);
+                }
+            }
+        } else {
+            // No model filter — check if every model bucket is large enough.
+            // If any bucket is large, use HNSW for that bucket; collect results
+            // across all buckets and merge.  Buckets below threshold use brute force.
+            let any_large = self
+                .model_indexes
+                .values()
+                .any(|m| m.live_count() >= HNSW_THRESHOLD);
+            if any_large {
+                return self.cross_model_search(query, filter, limit);
+            }
+        }
+        // Brute-force fallback.
+        self.brute_force_search(query, filter, limit)
+    }
+
+    // ── search implementations ────────────────────────────────────────────────
+
+    fn hnsw_search(
+        &self,
+        midx: &ModelIndex,
+        query: &[f32],
+        filter: &VectorFilter,
+        limit: usize,
+    ) -> Vec<VectorSearchResult> {
+        // Overfetch to account for post-filter losses (namespace, binder_id, app_id).
+        let ef = (EF_SEARCH.max(limit * 4)).min(midx.live_count());
+        let candidates = midx
+            .graph
+            .search(&midx.flat_vectors, query, ef, EF_SEARCH.max(limit * 4));
+
+        let mut results: Vec<VectorSearchResult> = candidates
+            .into_iter()
+            .filter_map(|(score, node_id)| {
+                let entry = midx.flat_entries.get(node_id)?;
+                if !passes_filter(entry, filter) {
+                    return None;
+                }
+                Some(VectorSearchResult {
+                    object_id: entry.object_id.clone(),
+                    object_version_id: entry.object_version_id.clone(),
+                    chunk_id: entry.chunk_id.clone(),
+                    similarity_score: score,
+                    matched_text: entry.source_text.clone(),
+                    model_id: entry.model_id.clone(),
+                })
+            })
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.similarity_score
+                .partial_cmp(&a.similarity_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.object_id.cmp(&b.object_id))
+        });
+        results.truncate(limit);
+        results
+    }
+
+    fn cross_model_search(
+        &self,
+        query: &[f32],
+        filter: &VectorFilter,
+        limit: usize,
+    ) -> Vec<VectorSearchResult> {
+        let mut all: Vec<VectorSearchResult> = Vec::new();
+        for (model_id, midx) in &self.model_indexes {
+            // Skip model buckets that don't match the filter (if any).
+            if filter.model_id.as_deref().is_some_and(|m| m != model_id) {
+                continue;
+            }
+            if midx.live_count() >= HNSW_THRESHOLD {
+                all.extend(self.hnsw_search(midx, query, filter, limit));
+            } else {
+                // Brute-force only within this model bucket.
+                let bucket_filter = VectorFilter {
+                    model_id: Some(model_id.clone()),
+                    ..filter.clone()
+                };
+                all.extend(self.brute_force_search(query, &bucket_filter, limit));
+            }
+        }
+        all.sort_by(|a, b| {
+            b.similarity_score
+                .partial_cmp(&a.similarity_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.object_id.cmp(&b.object_id))
+        });
+        all.truncate(limit);
+        all
+    }
+
+    fn brute_force_search(
         &self,
         query: &[f32],
         filter: &VectorFilter,
@@ -102,38 +293,10 @@ impl VectorIndex {
     ) -> Vec<VectorSearchResult> {
         let mut scored: Vec<(f32, &VectorEntry)> = self
             .all_entries()
-            .filter(|e| {
-                if let Some(mid) = &filter.model_id {
-                    if &e.model_id != mid {
-                        return false;
-                    }
-                }
-                if let Some(ns) = &filter.namespace {
-                    if object_id_namespace(&e.object_id).is_none_or(|n| n != ns) {
-                        return false;
-                    }
-                }
-                if let Some(ot) = &filter.object_type {
-                    if object_id_type(&e.object_id).is_none_or(|t| t != ot) {
-                        return false;
-                    }
-                }
-                if let Some(bid) = &filter.binder_id {
-                    if e.binder_id.as_deref() != Some(bid.as_str()) {
-                        return false;
-                    }
-                }
-                if let Some(aid) = &filter.app_id {
-                    if e.app_id.as_deref() != Some(aid.as_str()) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .map(|e| (cosine(query, &e.vector), e))
+            .filter(|e| passes_filter(e, filter))
+            .map(|e| (dot(query, &e.vector), e))
             .collect();
 
-        // Primary: descending score. Secondary: ascending object_id for deterministic ties.
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -193,6 +356,35 @@ pub(crate) fn deserialize_projection(
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
+fn passes_filter(entry: &VectorEntry, filter: &VectorFilter) -> bool {
+    if let Some(mid) = &filter.model_id {
+        if &entry.model_id != mid {
+            return false;
+        }
+    }
+    if let Some(ns) = &filter.namespace {
+        if object_id_namespace(&entry.object_id).is_none_or(|n| n != ns) {
+            return false;
+        }
+    }
+    if let Some(ot) = &filter.object_type {
+        if object_id_type(&entry.object_id).is_none_or(|t| t != ot) {
+            return false;
+        }
+    }
+    if let Some(bid) = &filter.binder_id {
+        if entry.binder_id.as_deref() != Some(bid.as_str()) {
+            return false;
+        }
+    }
+    if let Some(aid) = &filter.app_id {
+        if entry.app_id.as_deref() != Some(aid.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Extract namespace from an object_id of the form `namespace://type/id`.
 fn object_id_namespace(object_id: &str) -> Option<&str> {
     object_id.split_once("://").map(|(ns, _)| ns)
@@ -201,8 +393,4 @@ fn object_id_namespace(object_id: &str) -> Option<&str> {
 /// Extract object_type from an object_id of the form `namespace://type/id`.
 fn object_id_type(object_id: &str) -> Option<&str> {
     object_id.split_once("://")?.1.split('/').next()
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }

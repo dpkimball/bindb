@@ -1,14 +1,15 @@
+use crate::aggregation::{run_aggregation, AggregateResult, ObservationAggregation};
 use crate::checkpoint::{CheckpointLog, CheckpointRecord};
 use crate::commit::BinderCommit;
 use crate::edge::BinderEdgeVersion;
 use crate::error::StoreError;
+use crate::graph_query::{Direction, GraphQuery, GraphQueryMatch};
 use crate::index::graph::GraphIndex;
 use crate::index::head_edge::HeadEdgeIndex;
 use crate::index::head_object::HeadObjectIndex;
 use crate::index::namespace::NamespaceObjectIndex;
 use crate::namespace::NamespaceRegistry;
 use crate::object::BinderObjectVersion;
-use crate::query;
 use crate::snapshot::{read_snapshot, write_snapshot, VersionSnapshot};
 use crate::transaction::Transaction;
 use crate::types::{CommitId, EdgeId, ObjectId};
@@ -16,8 +17,9 @@ use crate::vector::{
     deserialize_projection, serialize_projection, ProjectionCheckpoint, VectorEntry, VectorFilter,
     VectorIndex, VectorSearchResult,
 };
+use crate::version_store::VersionStore;
 use crate::wal::Wal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -58,6 +60,10 @@ pub struct BinderStore {
     /// in the WAL; rebuilt by callers on open.  Supports case-insensitive
     /// substring search via `text_search()`.
     text_index: Mutex<HashMap<ObjectId, String>>,
+    /// Disk-backed version history store.  Keeps only a small index in RAM;
+    /// full version structs are read from `version_log.bin` on demand.
+    /// Powers `object_history()`, `object_as_of()`, `edge_history()`, `edge_as_of()`.
+    version_store: Mutex<VersionStore>,
 }
 
 impl BinderStore {
@@ -129,6 +135,13 @@ impl BinderStore {
         // Load vector projection from previous clean close, if present.
         let vector_index = load_vector_projection(store_path);
 
+        // Build the disk-backed version store from the in-memory version slices
+        // produced by WAL replay.  This file reduces per-query RAM usage for
+        // historical / bitemporal queries after startup.
+        let version_log_path = store_path.join("version_log.bin");
+        let mut version_store = VersionStore::open_or_create(&version_log_path)?;
+        version_store.rebuild_from_versions(&object_versions, &edge_versions)?;
+
         Ok(Self {
             store_path: store_path.to_path_buf(),
             dirty_marker,
@@ -151,6 +164,7 @@ impl BinderStore {
             head_edge_positions: Mutex::new(ev_positions),
             wal_commit_offset: Mutex::new(0),
             text_index: Mutex::new(HashMap::new()),
+            version_store: Mutex::new(version_store),
         })
     }
 
@@ -464,6 +478,26 @@ impl BinderStore {
             }
         }
 
+        // Mirror the commit into the disk-backed version store.
+        // Retirements must be written before new versions so the index's
+        // valid_to for the old version is set before the new one is appended.
+        {
+            let mut vs = self.version_store.lock().unwrap();
+            for v in &new_ovs {
+                // Retire the old version in the disk store if it existed.
+                let _ = vs.retire_object(&v.object_id, commit_id);
+            }
+            for v in &new_evs {
+                let _ = vs.retire_edge(&v.edge_id, commit_id);
+            }
+            for v in &new_ovs {
+                let _ = vs.append_object(v);
+            }
+            for v in &new_evs {
+                let _ = vs.append_edge(v);
+            }
+        }
+
         *self.head.lock().unwrap() = Some(commit_id);
         self.commits.lock().unwrap().push(commit);
     }
@@ -508,6 +542,8 @@ impl BinderStore {
     }
 
     /// Full version history of an object in ascending commit order.
+    /// Reads from the disk-backed `VersionStore` to avoid loading historical
+    /// payloads into RAM.
     pub fn object_history(
         &self,
         object_id: &ObjectId,
@@ -516,17 +552,15 @@ impl BinderStore {
             return Err(StoreError::Closed);
         }
         Ok(self
-            .object_versions
+            .version_store
             .lock()
             .unwrap()
-            .iter()
-            .filter(|v| &v.object_id == object_id)
-            .cloned()
-            .collect())
+            .object_history(object_id)?)
     }
 
     /// Version of an object at a specific past commit (historical query).
     /// Returns None if the object didn't exist at that commit or was tombstoned.
+    /// Reads from the disk-backed `VersionStore`.
     pub fn object_as_of(
         &self,
         object_id: &ObjectId,
@@ -535,29 +569,26 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let ovs = self.object_versions.lock().unwrap();
-        let result = query::object_as_of(&ovs, object_id, at_commit)
-            .filter(|v| !v.is_tombstone())
-            .cloned();
+        let result = self
+            .version_store
+            .lock()
+            .unwrap()
+            .object_as_of(object_id, at_commit)?
+            .filter(|v| !v.is_tombstone());
         Ok(result)
     }
 
     /// Full version history of an edge.
+    /// Reads from the disk-backed `VersionStore`.
     pub fn edge_history(&self, edge_id: &EdgeId) -> Result<Vec<BinderEdgeVersion>, StoreError> {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        Ok(self
-            .edge_versions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|v| &v.edge_id == edge_id)
-            .cloned()
-            .collect())
+        Ok(self.version_store.lock().unwrap().edge_history(edge_id)?)
     }
 
     /// Version of an edge at a specific past commit.
+    /// Reads from the disk-backed `VersionStore`.
     pub fn edge_as_of(
         &self,
         edge_id: &EdgeId,
@@ -566,8 +597,11 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let evs = self.edge_versions.lock().unwrap();
-        Ok(query::edge_as_of(&evs, edge_id, at_commit).cloned())
+        Ok(self
+            .version_store
+            .lock()
+            .unwrap()
+            .edge_as_of(edge_id, at_commit)?)
     }
 
     /// Live edges originating from an object (graph index lookup).
@@ -634,6 +668,186 @@ impl BinderStore {
         Ok(result)
     }
 
+    // ── graph query DSL ───────────────────────────────────────────────────────
+
+    /// Start a composable graph query from this store.
+    ///
+    /// ```ignore
+    /// let results = store
+    ///     .graph_query()
+    ///     .from(&person_id)
+    ///     .edge_types(["RELATES_TO"])
+    ///     .max_depth(3)
+    ///     .filter_node(|obj| obj.object_id.starts_with("memory://"))
+    ///     .execute()?;
+    /// ```
+    pub fn graph_query(&self) -> GraphQuery<'_> {
+        GraphQuery::new(self)
+    }
+
+    /// Execute a fully-configured `GraphQuery`.  Called by `GraphQuery::execute()`.
+    pub(crate) fn execute_graph_query(
+        &self,
+        q: GraphQuery<'_>,
+    ) -> Result<Vec<GraphQueryMatch>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let start = q.start.ok_or(StoreError::QueryMissingStart)?;
+
+        let graph = self.graph.lock().unwrap();
+        let head_edges = self.head_edges.lock().unwrap();
+        let head_objects = self.head_objects.lock().unwrap();
+
+        let mut visited: HashSet<ObjectId> = HashSet::new();
+        visited.insert(start.clone());
+
+        let mut queue: VecDeque<(ObjectId, usize)> = VecDeque::new();
+        queue.push_back((start, 0));
+
+        let mut results: Vec<GraphQueryMatch> = Vec::new();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= q.max_depth {
+                continue;
+            }
+
+            // Collect candidate edge IDs based on direction and allowed types.
+            let mut edge_ids: Vec<EdgeId> = Vec::new();
+            if matches!(q.direction, Direction::Outgoing | Direction::Both) {
+                if q.allowed_edge_types.is_empty() {
+                    edge_ids.extend(graph.edges_from(&current).cloned());
+                } else {
+                    for t in &q.allowed_edge_types {
+                        edge_ids.extend(graph.edges_from_with_type(&current, t));
+                    }
+                }
+            }
+            if matches!(q.direction, Direction::Incoming | Direction::Both) {
+                if q.allowed_edge_types.is_empty() {
+                    edge_ids.extend(graph.edges_to(&current).cloned());
+                } else {
+                    for t in &q.allowed_edge_types {
+                        // No `edges_to_with_type` yet — filter inline.
+                        edge_ids.extend(
+                            graph
+                                .edges_to(&current)
+                                .filter(|eid| {
+                                    head_edges
+                                        .get(eid)
+                                        .and_then(|e| e.relationship_type.as_deref())
+                                        == Some(t.as_str())
+                                })
+                                .cloned(),
+                        );
+                    }
+                }
+            }
+
+            for eid in &edge_ids {
+                let Some(edge) = head_edges.get(eid) else {
+                    continue;
+                };
+                if edge.is_tombstone() {
+                    continue;
+                }
+
+                // Apply optional edge predicate.
+                if let Some(ef) = &q.edge_filter {
+                    if !ef(edge) {
+                        continue;
+                    }
+                }
+
+                // Determine the "other" node depending on direction.
+                let neighbor = match q.direction {
+                    Direction::Outgoing => edge.to_object.as_ref(),
+                    Direction::Incoming => edge.from_object.as_ref(),
+                    Direction::Both => {
+                        // Pick the end that isn't current.
+                        if edge.from_object.as_ref() == Some(&current) {
+                            edge.to_object.as_ref()
+                        } else {
+                            edge.from_object.as_ref()
+                        }
+                    }
+                };
+
+                let Some(neighbor) = neighbor else {
+                    continue;
+                };
+                if visited.contains(neighbor) {
+                    continue;
+                }
+                visited.insert(neighbor.clone());
+
+                let Some(obj) = head_objects.get(neighbor) else {
+                    continue;
+                };
+                if obj.is_tombstone() {
+                    continue;
+                }
+
+                // Apply optional node predicate.
+                let passes = q.node_filter.as_ref().is_none_or(|f| f(obj));
+                if passes {
+                    results.push(GraphQueryMatch {
+                        object: obj.clone(),
+                        depth: depth + 1,
+                    });
+                }
+
+                // Always enqueue for further expansion regardless of filter.
+                queue.push_back((neighbor.clone(), depth + 1));
+            }
+        }
+
+        Ok(results)
+    }
+
+    // ── observation aggregation ───────────────────────────────────────────────
+
+    /// Start building an aggregation query over namespace observations.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let rows = store
+    ///     .aggregate_observations()
+    ///     .namespace("obs://health.sleep")
+    ///     .extract_f64(|b| bincode::deserialize::<f64>(b).ok())
+    ///     .aggregate(Aggregate::Avg)
+    ///     .execute()?;
+    /// ```
+    pub fn aggregate_observations(&self) -> ObservationAggregation<'_> {
+        ObservationAggregation::new(self)
+    }
+
+    /// Execute a fully-configured `ObservationAggregation`.
+    /// Called by `ObservationAggregation::execute()`.
+    pub(crate) fn execute_aggregation(
+        &self,
+        q: ObservationAggregation<'_>,
+    ) -> Result<Vec<AggregateResult>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let ns = q
+            .namespace
+            .as_deref()
+            .ok_or(StoreError::AggregationMissingNamespace)?;
+
+        // Pull live objects for the namespace (HEAD versions only).
+        let object_ids = self.namespace_index.lock().unwrap().matching(ns);
+        let head = self.head_objects.lock().unwrap();
+        let versions: Vec<_> = object_ids
+            .iter()
+            .filter_map(|oid| head.get(oid).filter(|v| !v.is_tombstone()).cloned())
+            .collect();
+        drop(head);
+
+        Ok(run_aggregation(versions, q))
+    }
+
     // ── maintenance ───────────────────────────────────────────────────────────
 
     /// Explicitly rebuild all indexes from the commit log.
@@ -665,6 +879,12 @@ impl BinderStore {
             .filter(|(_, v)| v.valid_to.is_none())
             .map(|(i, v)| (v.edge_id.clone(), i))
             .collect();
+
+        // Rebuild the disk-backed version store while ovs/evs are still locked.
+        self.version_store
+            .lock()
+            .unwrap()
+            .rebuild_from_versions(&ovs, &evs)?;
 
         drop(ovs);
         drop(evs);
@@ -965,6 +1185,9 @@ impl BinderStore {
 
         // Persist vector projection so it survives a clean restart.
         save_vector_projection(&self.store_path, &self.vector_index.lock().unwrap());
+
+        // Flush the disk-backed version store (non-fatal).
+        let _ = self.version_store.lock().unwrap().flush();
 
         if self.dirty_marker.exists() {
             fs::remove_file(&self.dirty_marker)?;
