@@ -1,8 +1,10 @@
+pub mod aggregation;
 mod checkpoint;
 mod commit;
 mod edge;
 mod engine;
 mod error;
+pub mod graph_query;
 mod index;
 mod namespace;
 mod object;
@@ -13,12 +15,15 @@ mod transaction;
 mod types;
 pub mod vector;
 mod vector_hnsw;
+mod version_store;
 mod wal;
 
+pub use aggregation::{Aggregate, AggregateResult, ObservationAggregation};
 pub use commit::BinderCommit;
 pub use edge::{BinderEdgeVersion, EdgeVersionId};
 pub use engine::BinderStore;
 pub use error::StoreError;
+pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;
 pub use object::{BinderObjectVersion, ObjectVersionId};
 pub use provenance::{Provenance, ProvenanceSource};

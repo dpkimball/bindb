@@ -26,4 +26,10 @@ pub enum StoreError {
         actor: String,
         owner: String,
     },
+
+    #[error("graph query has no start node — call .from() before .execute()")]
+    QueryMissingStart,
+
+    #[error("aggregation query has no namespace — call .namespace() before .execute()")]
+    AggregationMissingNamespace,
 }

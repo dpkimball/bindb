@@ -68,3 +68,6 @@ jobs:
           # Store baseline data in the gh-pages branch.
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: dev/bench
+          # gh-pages branch doesn't exist until master has pushed a baseline;
+          # skip the fetch so PR runs don't fail before the first baseline lands.
+          skip-fetch-gh-pages: true

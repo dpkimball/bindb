@@ -2,7 +2,10 @@
 ///
 /// Run: cargo bench --bench store_bench
 ///
-/// Results are stored by the `bench` CI job and compared across PRs.
+/// Each benchmark measures the steady-state latency of a single operation
+/// against a pre-built store of varying size.  Store setup happens OUTSIDE
+/// `b.iter()` so Criterion only times the operation itself.
+///
 /// For pass/fail SLA enforcement see tests/perf_sla.rs.
 use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -20,7 +23,8 @@ fn eid(s: impl Into<String>) -> EdgeId {
     EdgeId::new(s)
 }
 
-/// Build a store with `n` single-object commits spread evenly across `ns_count` namespaces.
+/// Build a store with `n` single-object commits across `ns_count` namespaces.
+/// All writes are buffered + flushed so setup is fast.
 fn build_store(dir: &TempDir, n: usize, ns_count: usize) -> BinderStore {
     let store = BinderStore::open(dir.path()).unwrap();
     for i in 0..n {
@@ -33,68 +37,44 @@ fn build_store(dir: &TempDir, n: usize, ns_count: usize) -> BinderStore {
     store
 }
 
-// ── durable commit throughput ────────────────────────────────────────────────
+// ── durable commit throughput ─────────────────────────────────────────────────
+// Measures a single durable commit() (WAL write + fsync) in steady state.
+// Store is pre-built with n objects so we see how WAL size affects commit time.
 
 fn bench_commit_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("commit_throughput");
+    group.throughput(Throughput::Elements(1));
 
-    for n in [100usize, 1_000, 10_000] {
-        group.throughput(Throughput::Elements(n as u64));
-
-        group.bench_with_input(BenchmarkId::new("single_object", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tmp();
-                let store = BinderStore::open(dir.path()).unwrap();
-                for i in 0..n {
-                    let mut tx = Transaction::new();
-                    tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
-                    store.commit(tx, "bench", "").unwrap();
-                }
-                store.close().unwrap();
-            });
-        });
-
-        group.bench_with_input(BenchmarkId::new("ten_objects", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tmp();
-                let store = BinderStore::open(dir.path()).unwrap();
-                for i in 0..n {
-                    let mut tx = Transaction::new();
-                    for j in 0..10usize {
-                        tx.put_object(obj(format!("a://o{i}_{j}")), vec![0u8; 64]);
-                    }
-                    store.commit(tx, "bench", "").unwrap();
-                }
-                store.close().unwrap();
-            });
-        });
-    }
-
-    group.finish();
-}
-
-// ── buffered commit throughput ───────────────────────────────────────────────
-
-fn bench_commit_buffered_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("commit_buffered_throughput");
-
-    for n in [1_000usize, 10_000, 100_000] {
-        group.throughput(Throughput::Elements(n as u64));
+    for existing_n in [0usize, 1_000, 10_000] {
+        let dir = tmp();
+        let store = build_store(&dir, existing_n, 1);
+        // Counter starts after the pre-built objects so keys don't collide.
+        let mut counter = existing_n;
 
         group.bench_with_input(
-            BenchmarkId::new("single_object_plus_flush", n),
-            &n,
-            |b, &n| {
+            BenchmarkId::new("single_object_durable", existing_n),
+            &existing_n,
+            |b, _| {
                 b.iter(|| {
-                    let dir = tmp();
-                    let store = BinderStore::open(dir.path()).unwrap();
-                    for i in 0..n {
-                        let mut tx = Transaction::new();
-                        tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
-                        store.commit_buffered(tx, "bench", "").unwrap();
+                    let mut tx = Transaction::new();
+                    tx.put_object(obj(format!("a://o{counter}")), vec![0u8; 64]);
+                    store.commit(tx, "bench", "").unwrap();
+                    counter += 1;
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("ten_objects_durable", existing_n),
+            &existing_n,
+            |b, _| {
+                b.iter(|| {
+                    let mut tx = Transaction::new();
+                    for j in 0..10usize {
+                        tx.put_object(obj(format!("a://o{counter}_{j}")), vec![0u8; 64]);
                     }
-                    store.flush().unwrap();
-                    store.close().unwrap();
+                    store.commit(tx, "bench", "").unwrap();
+                    counter += 1;
                 });
             },
         );
@@ -103,7 +83,43 @@ fn bench_commit_buffered_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// ── flush wall time ──────────────────────────────────────────────────────────
+// ── buffered commit + flush throughput ────────────────────────────────────────
+// Measures a fixed batch of buffered commits followed by a flush.
+// Each iteration commits BATCH_SIZE objects to an existing store then fsyncs.
+
+fn bench_commit_buffered_throughput(c: &mut Criterion) {
+    const BATCH_SIZE: usize = 500;
+    let mut group = c.benchmark_group("commit_buffered_throughput");
+    group.throughput(Throughput::Elements(BATCH_SIZE as u64));
+
+    for existing_n in [0usize, 10_000, 100_000] {
+        let dir = tmp();
+        let store = build_store(&dir, existing_n, 1);
+        let mut counter = existing_n;
+
+        group.bench_with_input(
+            BenchmarkId::new("batch_500_plus_flush", existing_n),
+            &existing_n,
+            |b, _| {
+                b.iter(|| {
+                    for _ in 0..BATCH_SIZE {
+                        let mut tx = Transaction::new();
+                        tx.put_object(obj(format!("a://o{counter}")), vec![0u8; 64]);
+                        store.commit_buffered(tx, "bench", "").unwrap();
+                        counter += 1;
+                    }
+                    store.flush().unwrap();
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ── flush wall time ───────────────────────────────────────────────────────────
+// Measures only the flush() call after accumulating n buffered commits.
+// Uses iter_custom so only the flush is timed (not the buffered writes).
 
 fn bench_flush(c: &mut Criterion) {
     let mut group = c.benchmark_group("flush");
@@ -117,15 +133,14 @@ fn bench_flush(c: &mut Criterion) {
             |b, &n| {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
+                    for iter in 0..iters {
                         let dir = tmp();
                         let store = BinderStore::open(dir.path()).unwrap();
                         for i in 0..n {
                             let mut tx = Transaction::new();
-                            tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
+                            tx.put_object(obj(format!("a://o{iter}_{i}")), vec![0u8; 64]);
                             store.commit_buffered(tx, "bench", "").unwrap();
                         }
-                        // Measure only the flush.
                         let t = std::time::Instant::now();
                         store.flush().unwrap();
                         total += t.elapsed();
@@ -139,17 +154,17 @@ fn bench_flush(c: &mut Criterion) {
     group.finish();
 }
 
-// ── get latency ──────────────────────────────────────────────────────────────
+// ── get latency ───────────────────────────────────────────────────────────────
 
 fn bench_get_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_latency");
+    group.throughput(Throughput::Elements(1));
 
     for n in [1_000usize, 10_000, 100_000] {
         let dir = tmp();
         let store = build_store(&dir, n, 1);
         let target = obj(format!("ns0://obj.{:08}", n / 2));
 
-        group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::new("head_get", n), &n, |b, _| {
             b.iter(|| {
                 let _ = store.get(&target).unwrap();
@@ -160,12 +175,11 @@ fn bench_get_latency(c: &mut Criterion) {
     group.finish();
 }
 
-// ── namespace list ───────────────────────────────────────────────────────────
+// ── namespace list ────────────────────────────────────────────────────────────
 
 fn bench_list_by_namespace(c: &mut Criterion) {
     let mut group = c.benchmark_group("list_by_namespace");
 
-    // (total_objects, ns_count) — each namespace contains total/ns_count objects.
     for (total, ns_count) in [(10_000, 10), (100_000, 10)] {
         let results_per_ns = total / ns_count;
         let dir = tmp();
@@ -187,10 +201,11 @@ fn bench_list_by_namespace(c: &mut Criterion) {
     group.finish();
 }
 
-// ── object_as_of (point-in-time) ─────────────────────────────────────────────
+// ── object_as_of (point-in-time) ──────────────────────────────────────────────
 
 fn bench_object_as_of(c: &mut Criterion) {
     let mut group = c.benchmark_group("object_as_of");
+    group.throughput(Throughput::Elements(1));
 
     for n_versions in [1_000usize, 10_000] {
         let dir = tmp();
@@ -209,7 +224,6 @@ fn bench_object_as_of(c: &mut Criterion) {
         store.flush().unwrap();
         let at = mid_commit.unwrap();
 
-        group.throughput(Throughput::Elements(1));
         group.bench_with_input(
             BenchmarkId::new("midpoint_lookup", n_versions),
             &n_versions,
@@ -224,7 +238,7 @@ fn bench_object_as_of(c: &mut Criterion) {
     group.finish();
 }
 
-// ── edges_from ───────────────────────────────────────────────────────────────
+// ── edges_from ────────────────────────────────────────────────────────────────
 
 fn bench_edges_from(c: &mut Criterion) {
     let mut group = c.benchmark_group("edges_from");
@@ -255,7 +269,7 @@ fn bench_edges_from(c: &mut Criterion) {
     group.finish();
 }
 
-// ── graph traversal ──────────────────────────────────────────────────────────
+// ── graph traversal ───────────────────────────────────────────────────────────
 
 fn bench_graph_traversal(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph_traversal");
@@ -302,7 +316,7 @@ fn bench_graph_traversal(c: &mut Criterion) {
     group.finish();
 }
 
-// ── index rebuild ────────────────────────────────────────────────────────────
+// ── index rebuild ─────────────────────────────────────────────────────────────
 
 fn bench_index_rebuild(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_rebuild");
@@ -327,7 +341,7 @@ fn bench_index_rebuild(c: &mut Criterion) {
 fn bench_cold_startup(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_startup");
 
-    for n in [1_000usize, 10_000, 50_000] {
+    for n in [1_000usize, 10_000] {
         let dir = tmp();
         {
             let store = build_store(&dir, n, 5);
@@ -351,7 +365,7 @@ fn bench_cold_startup(c: &mut Criterion) {
     group.finish();
 }
 
-// ── criterion wiring ─────────────────────────────────────────────────────────
+// ── criterion wiring ──────────────────────────────────────────────────────────
 
 criterion_group!(
     benches,

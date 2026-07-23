@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::edge::BinderEdgeVersion;
 use crate::object::BinderObjectVersion;
 use crate::types::{CommitId, EdgeId, ObjectId};
