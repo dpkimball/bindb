@@ -8,7 +8,7 @@ Last updated: 2026-07-23. Prefer this over stale issue bodies.
 | [#2](https://github.com/dpkimball/bindb/issues/2) Graph query | Open | Rust `graph_query()` builder | Query IR / Cypher-like language |
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model | Latency SLA @ 100k (OKR O3) |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
-| [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation | Open | Rust `aggregate_observations()` | SQL + out-of-process projection |
+| [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation | Open | Rust DSL + restricted `sql_aggregate()` (`COUNT`/`AVG`/`SUM`/`MIN`/`MAX`, `PATH_SEGMENT`) | Full SQL; out-of-process / DuckDB projection |
 | [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | — | Decision + optional spike (OKR O5) |
 | [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open (reopened) | — | Measured 1M open/get via `PERF_REPORT_XL=1` |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
@@ -41,3 +41,12 @@ PERF_REPORT_XL=1 PERF_REPORT_DIR=./out cargo run --example perf_report --release
 ```
 
 Adds 1M-object rows to `perf-report.md` / `.json`. Slow; not CI-gated by default.
+
+### Local XL sample (2026-07-23, Apple Silicon, release)
+
+| Metric | Measured | SLA | Result |
+|--------|----------|-----|--------|
+| `get()` p99 @ 1M objects | 0.042 µs | ≤ 10 µs | PASS |
+| `open()` worst-of-3 @ 1M commits | 6218 ms | ≤ 5000 ms | FAIL (−24%) |
+
+`get` at XL is fine. `open` still exceeds the provisional SLA; treat as evidence for #7 / compaction / snapshot path, not a ship gate yet.

@@ -11,6 +11,7 @@ mod object;
 mod provenance;
 mod query;
 mod snapshot;
+pub mod sql_agg;
 mod transaction;
 mod types;
 pub mod vector;
@@ -27,6 +28,7 @@ pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;
 pub use object::{BinderObjectVersion, ObjectVersionId};
 pub use provenance::{Provenance, ProvenanceSource};
+pub use sql_agg::{SqlAggError, SqlAggregateQuery, SqlGroupBy};
 pub use transaction::Transaction;
 pub use types::{CommitId, EdgeId, ObjectId};
 pub use vector::{

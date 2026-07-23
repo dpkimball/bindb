@@ -32,4 +32,7 @@ pub enum StoreError {
 
     #[error("aggregation query has no namespace — call .namespace() before .execute()")]
     AggregationMissingNamespace,
+
+    #[error("invalid argument: {message}")]
+    InvalidArgument { message: String },
 }
