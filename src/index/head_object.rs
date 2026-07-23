@@ -48,7 +48,9 @@ impl HeadObjectIndex {
     /// Rebuild the entire index from a sorted slice of all object versions.
     /// Versions must be in ascending commit order within each object_id.
     pub fn rebuild(versions: &[BinderObjectVersion]) -> Self {
-        let mut idx = Self::new();
+        let mut idx = Self {
+            map: HashMap::with_capacity(versions.len()),
+        };
         for v in versions {
             if v.valid_to.is_none() {
                 idx.upsert(v.clone());

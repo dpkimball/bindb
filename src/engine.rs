@@ -275,6 +275,8 @@ impl BinderStore {
 
             // Append new versions and update all indexes.
             let base = ovs.len();
+            ovs.reserve(new_ovs.len());
+            ov_pos.reserve(new_ovs.len());
             ovs.extend(new_ovs.iter().cloned());
             for (i, v) in new_ovs.iter().enumerate() {
                 hobj.upsert(v.clone());
@@ -310,6 +312,8 @@ impl BinderStore {
             }
 
             let base = evs.len();
+            evs.reserve(new_evs.len());
+            ev_pos.reserve(new_evs.len());
             evs.extend(new_evs.iter().cloned());
             for (i, v) in new_evs.iter().enumerate() {
                 hedge.upsert(v.clone());
@@ -719,10 +723,13 @@ fn build_version_stores(
     HashMap<ObjectId, usize>,
     HashMap<EdgeId, usize>,
 ) {
-    let mut ovs: Vec<BinderObjectVersion> = Vec::new();
-    let mut evs: Vec<BinderEdgeVersion> = Vec::new();
-    let mut ov_pos: HashMap<ObjectId, usize> = HashMap::new();
-    let mut ev_pos: HashMap<EdgeId, usize> = HashMap::new();
+    // Pre-size to commits.len() — each commit produces ≥1 version entry,
+    // so this avoids all reallocation in the common single-object-per-commit case.
+    let n = commits.len();
+    let mut ovs: Vec<BinderObjectVersion> = Vec::with_capacity(n);
+    let mut evs: Vec<BinderEdgeVersion> = Vec::with_capacity(n);
+    let mut ov_pos: HashMap<ObjectId, usize> = HashMap::with_capacity(n);
+    let mut ev_pos: HashMap<EdgeId, usize> = HashMap::with_capacity(n);
 
     for commit in commits {
         let new_ovs = derive_object_versions_for_commit(commit);
