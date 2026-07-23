@@ -9,6 +9,7 @@ use crate::index::namespace::NamespaceObjectIndex;
 use crate::namespace::NamespaceRegistry;
 use crate::object::BinderObjectVersion;
 use crate::query;
+use crate::snapshot::{read_snapshot, write_snapshot, VersionSnapshot};
 use crate::transaction::Transaction;
 use crate::types::{CommitId, EdgeId, ObjectId};
 use crate::vector::{
@@ -58,17 +59,45 @@ impl BinderStore {
 
         let wal_path = store_path.join("commits.wal");
         let checkpoint_path = store_path.join("checkpoint.log");
+        let snapshot_path = store_path.join("store.snap");
 
         let mut checkpoint_log = CheckpointLog::open_or_create(&checkpoint_path)?;
-        let _last_checkpoint = checkpoint_log.last()?;
+        let last_checkpoint = checkpoint_log.last()?;
 
-        // In V1 we always replay from the beginning. Checkpoint is written on
-        // close and read on open to bound replay cost in future phases.
+        // Always replay the full WAL so that `commits` is complete for
+        // `scan_commits()`.  If a valid snapshot exists, skip the expensive
+        // `build_version_stores` pass and load pre-built version stores from
+        // the snapshot instead, applying only the delta commits on top.
         let (wal, commits) = Wal::open_or_create(&wal_path)?;
 
-        let head = commits.last().map(|c| c.commit_id);
         let (object_versions, edge_versions, ov_positions, ev_positions) =
-            build_version_stores(&commits);
+            if let Some(cp) = last_checkpoint {
+                if let Some(snap) = read_snapshot(&snapshot_path) {
+                    if snap.wal_offset == cp.wal_offset
+                        && snap.commit_count == cp.commit_count
+                        && (cp.commit_count as usize) <= commits.len()
+                    {
+                        // Fast path: snapshot covers the first `commit_count`
+                        // commits; apply any delta commits on top.
+                        let delta = &commits[cp.commit_count as usize..];
+                        build_version_stores_delta(
+                            delta,
+                            snap.object_versions,
+                            snap.edge_versions,
+                            snap.ov_positions,
+                            snap.ev_positions,
+                        )
+                    } else {
+                        build_version_stores(&commits)
+                    }
+                } else {
+                    build_version_stores(&commits)
+                }
+            } else {
+                build_version_stores(&commits)
+            };
+
+        let head = commits.last().map(|c| c.commit_id);
         let head_objects = HeadObjectIndex::rebuild(&object_versions);
         let head_edges = HeadEdgeIndex::rebuild(&edge_versions);
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
@@ -662,7 +691,8 @@ impl BinderStore {
         let mut wal = self.wal.lock().unwrap();
         wal.fsync()?;
 
-        // Write a checkpoint so next open replays only new WAL entries.
+        // Write checkpoint + version store snapshot so next open can skip
+        // full WAL replay and load the pre-built stores directly.
         let commit_count = self.commits.lock().unwrap().len() as u64;
         let wal_offset = wal.current_offset();
         drop(wal);
@@ -674,6 +704,25 @@ impl BinderStore {
                 wal_offset,
                 commit_count,
             })?;
+
+        // Snapshot: serialize the version Vecs and position maps. On next
+        // open() this eliminates WAL deserialization for all historical commits.
+        let snapshot = {
+            let ovs = self.object_versions.lock().unwrap().clone();
+            let evs = self.edge_versions.lock().unwrap().clone();
+            let ov_pos = self.head_object_positions.lock().unwrap().clone();
+            let ev_pos = self.head_edge_positions.lock().unwrap().clone();
+            VersionSnapshot {
+                commit_count,
+                wal_offset,
+                object_versions: ovs,
+                edge_versions: evs,
+                ov_positions: ov_pos,
+                ev_positions: ev_pos,
+            }
+        };
+        // Non-fatal: if snapshot write fails, next open falls back to WAL replay.
+        let _ = write_snapshot(&self.store_path.join("store.snap"), &snapshot);
 
         // Persist vector projection so it survives a clean restart.
         save_vector_projection(&self.store_path, &self.vector_index.lock().unwrap());
@@ -690,6 +739,54 @@ impl BinderStore {
 
 use crate::edge::EdgeVersionId;
 use crate::object::ObjectVersionId;
+
+/// Snapshot-based open: start from the snapshot's version stores and apply
+/// only the delta commits (WAL frames written after the snapshot offset).
+fn build_version_stores_delta(
+    delta_commits: &[BinderCommit],
+    mut ovs: Vec<BinderObjectVersion>,
+    mut evs: Vec<BinderEdgeVersion>,
+    mut ov_pos: HashMap<ObjectId, usize>,
+    mut ev_pos: HashMap<EdgeId, usize>,
+) -> (
+    Vec<BinderObjectVersion>,
+    Vec<BinderEdgeVersion>,
+    HashMap<ObjectId, usize>,
+    HashMap<EdgeId, usize>,
+) {
+    for commit in delta_commits {
+        let new_ovs = derive_object_versions_for_commit(commit);
+        let new_evs = derive_edge_versions_for_commit(commit);
+
+        for v in &new_ovs {
+            if let Some(&old_idx) = ov_pos.get(&v.object_id) {
+                ovs[old_idx].valid_to = Some(commit.commit_id);
+            }
+        }
+        let base = ovs.len();
+        ovs.reserve(new_ovs.len());
+        ov_pos.reserve(new_ovs.len());
+        ovs.extend(new_ovs.iter().cloned());
+        for (i, v) in new_ovs.iter().enumerate() {
+            ov_pos.insert(v.object_id.clone(), base + i);
+        }
+
+        for v in &new_evs {
+            if let Some(&old_idx) = ev_pos.get(&v.edge_id) {
+                evs[old_idx].valid_to = Some(commit.commit_id);
+            }
+        }
+        let base = evs.len();
+        evs.reserve(new_evs.len());
+        ev_pos.reserve(new_evs.len());
+        evs.extend(new_evs.iter().cloned());
+        for (i, v) in new_evs.iter().enumerate() {
+            ev_pos.insert(v.edge_id.clone(), base + i);
+        }
+    }
+
+    (ovs, evs, ov_pos, ev_pos)
+}
 
 fn load_vector_projection(store_path: &Path) -> VectorIndex {
     let path = store_path.join("vectors.proj");

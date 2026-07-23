@@ -8,6 +8,7 @@ mod namespace;
 mod object;
 mod provenance;
 mod query;
+mod snapshot;
 mod transaction;
 mod types;
 pub mod vector;

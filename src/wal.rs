@@ -92,6 +92,89 @@ impl Wal {
         self.file.seek(SeekFrom::End(0)).unwrap_or(0)
     }
 
+    /// Replay only the WAL frames at or after `start_offset`.
+    /// Used by snapshot-based open: the snapshot covers everything before
+    /// `start_offset`; this method recovers any commits written afterwards.
+    ///
+    /// Does NOT truncate the file before `start_offset` — those bytes belong
+    /// to the snapshotted history and must remain intact for recovery.
+    /// Truncates any partial/corrupted frames found after `start_offset`.
+    pub fn replay_from(
+        &mut self,
+        start_offset: u64,
+    ) -> Result<(Vec<BinderCommit>, u64), StoreError> {
+        let file_len = self.file.metadata()?.len();
+        if start_offset >= file_len {
+            // Nothing to replay — WAL hasn't grown since the snapshot.
+            self.file.seek(SeekFrom::End(0))?;
+            return Ok((Vec::new(), start_offset));
+        }
+
+        self.file.seek(SeekFrom::Start(start_offset))?;
+        let mut reader = BufReader::new(&self.file);
+        let mut commits = Vec::new();
+        let mut delta_good: u64 = 0;
+        let mut next_entry_id: u64 = self.next_entry_id;
+
+        loop {
+            let mut magic = [0u8; 4];
+            match reader.read_exact(&mut magic) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            if &magic != MAGIC {
+                break;
+            }
+
+            let mut entry_id_bytes = [0u8; 8];
+            if reader.read_exact(&mut entry_id_bytes).is_err() {
+                break;
+            }
+            let entry_id = u64::from_le_bytes(entry_id_bytes);
+
+            let mut data_len_bytes = [0u8; 8];
+            if reader.read_exact(&mut data_len_bytes).is_err() {
+                break;
+            }
+            let data_len = u64::from_le_bytes(data_len_bytes) as usize;
+
+            let mut data = vec![0u8; data_len];
+            if reader.read_exact(&mut data).is_err() {
+                break;
+            }
+
+            let mut crc_bytes = [0u8; 4];
+            if reader.read_exact(&mut crc_bytes).is_err() {
+                break;
+            }
+            let stored_crc = u32::from_le_bytes(crc_bytes);
+
+            let mut hasher = Hasher::new();
+            hasher.update(&data);
+            if hasher.finalize() != stored_crc {
+                break;
+            }
+
+            let entry: WalEntryData = match bincode::deserialize(&data) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+
+            delta_good += 4 + 8 + 8 + data_len as u64 + 4;
+            next_entry_id = entry_id + 1;
+            commits.push(entry.commit);
+        }
+
+        // Truncate any partial frames after the last good delta frame.
+        let good_total = start_offset + delta_good;
+        self.file.set_len(good_total)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.next_entry_id = next_entry_id;
+
+        Ok((commits, good_total))
+    }
+
     /// Replay all valid WAL entries from the beginning. Stops at the first corrupted or
     /// incomplete entry and truncates the file there. Returns all recovered commits.
     fn replay(&mut self) -> Result<Vec<BinderCommit>, StoreError> {
