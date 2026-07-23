@@ -10,12 +10,12 @@ stored per-run and compared across PRs via Criterion benchmarks (`benches/store_
 
 All SLAs are defined at one or more scale tiers:
 
-| Tier | Objects in store | Edges | Versions per object |
-|------|-----------------|-------|---------------------|
-| **S** | 1 K | 1 K | 1 (append-only load) |
-| **M** | 10 K | 10 K | 1 |
-| **L** | 100 K | 50 K | 1 |
-| **XL** | 1 M | — | — | (aspirational; not yet in CI) |
+| Tier | Objects in store | Edges | CI enforcement |
+|------|-----------------|-------|----------------|
+| **S** | 1 K | 1 K | — |
+| **M** | 10 K | 10 K | Per-PR (`perf` job, `--test-threads=1`) |
+| **L** | 100 K | 50 K | Nightly / manual (`scale:L` tests) |
+| **XL** | 1 M | — | Aspirational — numbers tracked manually |
 
 Life-scale context: a single user accumulates ~500 K health observations per year,
 ~50 K memories over 10 years, and ~10 K–100 K financial records.

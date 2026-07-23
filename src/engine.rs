@@ -9,6 +9,7 @@ use crate::index::namespace::NamespaceObjectIndex;
 use crate::namespace::NamespaceRegistry;
 use crate::object::BinderObjectVersion;
 use crate::query;
+use crate::snapshot::{read_snapshot, write_snapshot, VersionSnapshot};
 use crate::transaction::Transaction;
 use crate::types::{CommitId, EdgeId, ObjectId};
 use crate::vector::{
@@ -17,7 +18,6 @@ use crate::vector::{
 };
 use crate::wal::Wal;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -48,6 +48,16 @@ pub struct BinderStore {
     head_object_positions: Mutex<HashMap<ObjectId, usize>>,
     /// Same for edges.
     head_edge_positions: Mutex<HashMap<EdgeId, usize>>,
+    /// Number of historical commits that have been compacted away (not present
+    /// in the WAL).  After compact(), new WAL frames start at offset 0 but
+    /// self.commits still holds all historical commits in memory.  This offset
+    /// lets close() compute the WAL-relative commit count for the snapshot.
+    wal_commit_offset: Mutex<u64>,
+    /// Non-canonical text projection: object_id → searchable text content.
+    /// Callers register content via `index_text()` after commits.  Not stored
+    /// in the WAL; rebuilt by callers on open.  Supports case-insensitive
+    /// substring search via `text_search()`.
+    text_index: Mutex<HashMap<ObjectId, String>>,
 }
 
 impl BinderStore {
@@ -59,25 +69,62 @@ impl BinderStore {
 
         let wal_path = store_path.join("commits.wal");
         let checkpoint_path = store_path.join("checkpoint.log");
+        let snapshot_path = store_path.join("store.snap");
 
         let mut checkpoint_log = CheckpointLog::open_or_create(&checkpoint_path)?;
-        let _last_checkpoint = checkpoint_log.last()?;
+        let last_checkpoint = checkpoint_log.last()?;
 
-        // In V1 we always replay from the beginning. Checkpoint is written on
-        // close and read on open to bound replay cost in future phases.
+        // Always replay the full WAL so that `commits` is complete for
+        // `scan_commits()`.  If a valid snapshot exists, skip the expensive
+        // `build_version_stores` pass and load pre-built version stores from
+        // the snapshot instead, applying only the delta commits on top.
         let (wal, commits) = Wal::open_or_create(&wal_path)?;
 
-        let head = commits.last().map(|c| c.commit_id);
         let (object_versions, edge_versions, ov_positions, ev_positions) =
-            build_version_stores(&commits);
+            if let Some(cp) = last_checkpoint {
+                if let Some(snap) = read_snapshot(&snapshot_path) {
+                    if snap.wal_offset == cp.wal_offset && snap.commit_count == cp.commit_count {
+                        // Snapshot is valid.  Determine which commits are the delta:
+                        //
+                        // Post-compaction (wal_offset == 0): the WAL was truncated by
+                        // compact(); all replayed commits are writes after the snapshot.
+                        //
+                        // Normal (wal_offset > 0): commits contains every historical
+                        // frame; the delta starts at index commit_count.
+                        let delta: Option<&[BinderCommit]> = if cp.wal_offset == 0 {
+                            Some(&commits)
+                        } else {
+                            commits.get(cp.commit_count as usize..)
+                        };
+                        if let Some(delta) = delta {
+                            build_version_stores_delta(
+                                delta,
+                                snap.object_versions,
+                                snap.edge_versions,
+                                snap.ov_positions,
+                                snap.ev_positions,
+                            )
+                        } else {
+                            build_version_stores(&commits)
+                        }
+                    } else {
+                        build_version_stores(&commits)
+                    }
+                } else {
+                    build_version_stores(&commits)
+                }
+            } else {
+                build_version_stores(&commits)
+            };
+
+        let head = commits.last().map(|c| c.commit_id);
         let head_objects = HeadObjectIndex::rebuild(&object_versions);
         let head_edges = HeadEdgeIndex::rebuild(&edge_versions);
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
         let neighbours =
             GraphIndex::build_neighbour_map(edge_versions.iter().filter(|v| !v.is_tombstone()));
-        let namespace_index = NamespaceObjectIndex::rebuild(
-            object_versions.iter().filter(|v| v.valid_to.is_none()),
-        );
+        let namespace_index =
+            NamespaceObjectIndex::rebuild(object_versions.iter().filter(|v| v.valid_to.is_none()));
 
         // Load vector projection from previous clean close, if present.
         let vector_index = load_vector_projection(store_path);
@@ -102,6 +149,8 @@ impl BinderStore {
             vector_index: Mutex::new(vector_index),
             head_object_positions: Mutex::new(ov_positions),
             head_edge_positions: Mutex::new(ev_positions),
+            wal_commit_offset: Mutex::new(0),
+            text_index: Mutex::new(HashMap::new()),
         })
     }
 
@@ -241,6 +290,93 @@ impl BinderStore {
         Ok(commit_id)
     }
 
+    /// Commit multiple transactions as a single durable batch.
+    ///
+    /// Equivalent to calling `commit_buffered()` N times then `flush()`, but
+    /// acquires the write lock and WAL file handle exactly once for the entire
+    /// batch.  This eliminates per-commit lock overhead and issues a single
+    /// fsync for all N frames.
+    ///
+    /// - Returns a `Vec<CommitId>` in the same order as the input.
+    /// - An empty `batch` is a no-op that returns `Ok(vec![])`.
+    /// - Any empty `Transaction` in the batch causes the entire call to fail
+    ///   with `StoreError::EmptyTransaction` before touching the WAL.
+    pub fn commit_many(
+        &self,
+        batch: Vec<(Transaction, String, String)>,
+    ) -> Result<Vec<CommitId>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (tx, _, _) in &batch {
+            if tx.is_empty() {
+                return Err(StoreError::EmptyTransaction);
+            }
+        }
+
+        let _write_guard = self.write_lock.lock().unwrap();
+
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let n = batch.len();
+        let mut commit_ids = Vec::with_capacity(n);
+        let mut prepared = Vec::with_capacity(n);
+        let mut parent = *self.head.lock().unwrap();
+
+        // Build all BinderCommit structs and write them to the WAL in one
+        // lock hold, then fsync once.
+        {
+            let mut wal = self.wal.lock().unwrap();
+            for (tx, actor, message) in batch {
+                let commit_id = CommitId::new();
+                let commit = BinderCommit {
+                    commit_id,
+                    parent_commit: parent,
+                    timestamp_ms,
+                    actor,
+                    message,
+                    object_changes: tx.object_changes,
+                    relationship_changes: tx.relationship_changes,
+                };
+                wal.append_no_sync(&commit)?;
+                parent = Some(commit_id);
+                commit_ids.push(commit_id);
+                prepared.push(commit);
+            }
+            wal.fsync()?;
+        }
+
+        // Pre-size shared Vecs once for the entire batch before the per-commit
+        // apply loop so the inner reserve() calls in apply_commit_to_memory
+        // are no-ops.
+        {
+            let total_objects: usize = prepared.iter().map(|c| c.object_changes.len()).sum();
+            let total_edges: usize = prepared.iter().map(|c| c.relationship_changes.len()).sum();
+            self.object_versions.lock().unwrap().reserve(total_objects);
+            self.edge_versions.lock().unwrap().reserve(total_edges);
+            self.head_object_positions
+                .lock()
+                .unwrap()
+                .reserve(total_objects);
+            self.head_edge_positions
+                .lock()
+                .unwrap()
+                .reserve(total_edges);
+        }
+
+        for (commit_id, commit) in commit_ids.iter().copied().zip(prepared) {
+            self.apply_commit_to_memory(commit_id, commit);
+        }
+
+        Ok(commit_ids)
+    }
+
     /// Fsync the WAL — makes all preceding `commit_buffered()` calls durable.
     /// No-op if there is nothing pending.  Always called by `close()`.
     pub fn flush(&self) -> Result<(), StoreError> {
@@ -276,6 +412,8 @@ impl BinderStore {
 
             // Append new versions and update all indexes.
             let base = ovs.len();
+            ovs.reserve(new_ovs.len());
+            ov_pos.reserve(new_ovs.len());
             ovs.extend(new_ovs.iter().cloned());
             for (i, v) in new_ovs.iter().enumerate() {
                 hobj.upsert(v.clone());
@@ -311,6 +449,8 @@ impl BinderStore {
             }
 
             let base = evs.len();
+            evs.reserve(new_evs.len());
+            ev_pos.reserve(new_evs.len());
             evs.extend(new_evs.iter().cloned());
             for (i, v) in new_evs.iter().enumerate() {
                 hedge.upsert(v.clone());
@@ -355,7 +495,11 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let object_ids = self.namespace_index.lock().unwrap().matching(namespace_prefix);
+        let object_ids = self
+            .namespace_index
+            .lock()
+            .unwrap()
+            .matching(namespace_prefix);
         let head = self.head_objects.lock().unwrap();
         Ok(object_ids
             .iter()
@@ -538,6 +682,69 @@ impl BinderStore {
         Ok(())
     }
 
+    /// Compact the store: write a snapshot of the current state and truncate
+    /// the WAL to zero bytes.
+    ///
+    /// After `compact()`, `open()` takes the snapshot fast path and only
+    /// replays WAL frames written after this call.  The WAL cannot grow
+    /// unboundedly when `compact()` is called periodically (e.g. on close,
+    /// after a bulk import, or when WAL size exceeds a threshold).
+    ///
+    /// Safe to call while the store is open.  Acquires the write lock so no
+    /// commits are interleaved during the snapshot + truncate sequence.
+    pub fn compact(&self) -> Result<(), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+
+        let _write_guard = self.write_lock.lock().unwrap();
+
+        // 1. Fsync any buffered WAL writes so the snapshot is consistent.
+        self.wal.lock().unwrap().fsync()?;
+
+        // 2. Snapshot current in-memory version stores.
+        //    commit_count=0 and wal_offset=0 because the WAL is about to be
+        //    truncated; from the perspective of a future open(), the snapshot
+        //    covers "0 WAL frames from offset 0" — all state comes from the
+        //    snapshot directly, and any WAL frames present are the delta.
+        let historical_count = self.commits.lock().unwrap().len() as u64;
+        let snapshot = {
+            let ovs = self.object_versions.lock().unwrap().clone();
+            let evs = self.edge_versions.lock().unwrap().clone();
+            let ov_pos = self.head_object_positions.lock().unwrap().clone();
+            let ev_pos = self.head_edge_positions.lock().unwrap().clone();
+            VersionSnapshot {
+                commit_count: 0,
+                wal_offset: 0,
+                object_versions: ovs,
+                edge_versions: evs,
+                ov_positions: ov_pos,
+                ev_positions: ev_pos,
+            }
+        };
+        write_snapshot(&self.store_path.join("store.snap"), &snapshot)?;
+
+        // 3. Truncate WAL — all frames are now captured in the snapshot.
+        self.wal.lock().unwrap().truncate_to_start()?;
+
+        // 4. Write checkpoint pointing at the new (empty) WAL start.
+        //    commit_count = 0 because the trimmed WAL has zero frames before
+        //    offset 0.  The snapshot holds all historical state.
+        self.checkpoint_log
+            .lock()
+            .unwrap()
+            .write(CheckpointRecord {
+                wal_offset: 0,
+                commit_count: 0,
+            })?;
+
+        // 5. Record how many commits existed at compaction time.  close() uses
+        //    this to compute the WAL-relative commit count for the next snapshot.
+        *self.wal_commit_offset.lock().unwrap() = historical_count;
+
+        Ok(())
+    }
+
     pub fn scan_commits(&self) -> Result<Vec<BinderCommit>, StoreError> {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
@@ -647,6 +854,63 @@ impl BinderStore {
         Ok(())
     }
 
+    // ── full-text search projection API ───────────────────────────────────────
+
+    /// Register searchable text for an object.  The text is stored in a
+    /// non-canonical in-memory projection — it is NOT written to the WAL and
+    /// is not rebuilt automatically on open.  Callers are responsible for
+    /// re-indexing after `BinderStore::open()`.
+    ///
+    /// Calling `index_text` with the same `object_id` replaces the previous
+    /// entry.  Passing an empty string is equivalent to calling
+    /// `clear_text_index`.
+    pub fn index_text(
+        &self,
+        object_id: &ObjectId,
+        text: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let text: String = text.into();
+        let mut idx = self.text_index.lock().unwrap();
+        if text.is_empty() {
+            idx.remove(object_id);
+        } else {
+            idx.insert(object_id.clone(), text);
+        }
+        Ok(())
+    }
+
+    /// Case-insensitive substring search over the text projection.
+    /// Returns the `ObjectId`s of all objects whose indexed text contains
+    /// `query` as a substring (Unicode-aware lowercase comparison).
+    ///
+    /// Complexity: O(n · m) where n = number of indexed objects and m = avg
+    /// text length.  Intended for small-to-medium datasets (<100 K entries).
+    pub fn text_search(&self, query: &str) -> Result<Vec<ObjectId>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let q = query.to_lowercase();
+        let idx = self.text_index.lock().unwrap();
+        Ok(idx
+            .iter()
+            .filter(|(_, text)| text.to_lowercase().contains(&q))
+            .map(|(oid, _)| oid.clone())
+            .collect())
+    }
+
+    /// Remove an object's entry from the text projection.  No-op if the
+    /// object was never indexed.
+    pub fn clear_text_index(&self, object_id: &ObjectId) -> Result<(), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        self.text_index.lock().unwrap().remove(object_id);
+        Ok(())
+    }
+
     pub fn close(self) -> Result<(), StoreError> {
         {
             let mut closed = self.closed.lock().unwrap();
@@ -659,8 +923,16 @@ impl BinderStore {
         let mut wal = self.wal.lock().unwrap();
         wal.fsync()?;
 
-        // Write a checkpoint so next open replays only new WAL entries.
-        let commit_count = self.commits.lock().unwrap().len() as u64;
+        // Write checkpoint + version store snapshot so next open can skip
+        // full WAL replay and load the pre-built stores directly.
+        //
+        // commit_count is WAL-relative: the number of commits present in the
+        // WAL file up to wal_offset.  After compact(), wal_commit_offset > 0
+        // because the WAL was trimmed; new commits begin at WAL offset 0 but
+        // self.commits still holds all historical commits in memory.
+        let total_commits = self.commits.lock().unwrap().len() as u64;
+        let wal_commit_offset = *self.wal_commit_offset.lock().unwrap();
+        let wal_relative_count = total_commits - wal_commit_offset;
         let wal_offset = wal.current_offset();
         drop(wal);
 
@@ -669,8 +941,27 @@ impl BinderStore {
             .unwrap()
             .write(CheckpointRecord {
                 wal_offset,
-                commit_count,
+                commit_count: wal_relative_count,
             })?;
+
+        // Snapshot: serialize the version Vecs and position maps. On next
+        // open() this eliminates WAL deserialization for all historical commits.
+        let snapshot = {
+            let ovs = self.object_versions.lock().unwrap().clone();
+            let evs = self.edge_versions.lock().unwrap().clone();
+            let ov_pos = self.head_object_positions.lock().unwrap().clone();
+            let ev_pos = self.head_edge_positions.lock().unwrap().clone();
+            VersionSnapshot {
+                commit_count: wal_relative_count,
+                wal_offset,
+                object_versions: ovs,
+                edge_versions: evs,
+                ov_positions: ov_pos,
+                ev_positions: ev_pos,
+            }
+        };
+        // Non-fatal: if snapshot write fails, next open falls back to WAL replay.
+        let _ = write_snapshot(&self.store_path.join("store.snap"), &snapshot);
 
         // Persist vector projection so it survives a clean restart.
         save_vector_projection(&self.store_path, &self.vector_index.lock().unwrap());
@@ -687,6 +978,56 @@ impl BinderStore {
 
 use crate::edge::EdgeVersionId;
 use crate::object::ObjectVersionId;
+
+type VersionStores = (
+    Vec<BinderObjectVersion>,
+    Vec<BinderEdgeVersion>,
+    HashMap<ObjectId, usize>,
+    HashMap<EdgeId, usize>,
+);
+
+/// Snapshot-based open: start from the snapshot's version stores and apply
+/// only the delta commits (WAL frames written after the snapshot offset).
+fn build_version_stores_delta(
+    delta_commits: &[BinderCommit],
+    mut ovs: Vec<BinderObjectVersion>,
+    mut evs: Vec<BinderEdgeVersion>,
+    mut ov_pos: HashMap<ObjectId, usize>,
+    mut ev_pos: HashMap<EdgeId, usize>,
+) -> VersionStores {
+    for commit in delta_commits {
+        let new_ovs = derive_object_versions_for_commit(commit);
+        let new_evs = derive_edge_versions_for_commit(commit);
+
+        for v in &new_ovs {
+            if let Some(&old_idx) = ov_pos.get(&v.object_id) {
+                ovs[old_idx].valid_to = Some(commit.commit_id);
+            }
+        }
+        let base = ovs.len();
+        ovs.reserve(new_ovs.len());
+        ov_pos.reserve(new_ovs.len());
+        ovs.extend(new_ovs.iter().cloned());
+        for (i, v) in new_ovs.iter().enumerate() {
+            ov_pos.insert(v.object_id.clone(), base + i);
+        }
+
+        for v in &new_evs {
+            if let Some(&old_idx) = ev_pos.get(&v.edge_id) {
+                evs[old_idx].valid_to = Some(commit.commit_id);
+            }
+        }
+        let base = evs.len();
+        evs.reserve(new_evs.len());
+        ev_pos.reserve(new_evs.len());
+        evs.extend(new_evs.iter().cloned());
+        for (i, v) in new_evs.iter().enumerate() {
+            ev_pos.insert(v.edge_id.clone(), base + i);
+        }
+    }
+
+    (ovs, evs, ov_pos, ev_pos)
+}
 
 fn load_vector_projection(store_path: &Path) -> VectorIndex {
     let path = store_path.join("vectors.proj");
@@ -712,18 +1053,14 @@ fn save_vector_projection(store_path: &Path, index: &VectorIndex) {
 
 /// Replay all commits into version Vecs and position indexes.
 /// O(n_commits) — uses position maps for O(1) retirement per object/edge.
-fn build_version_stores(
-    commits: &[BinderCommit],
-) -> (
-    Vec<BinderObjectVersion>,
-    Vec<BinderEdgeVersion>,
-    HashMap<ObjectId, usize>,
-    HashMap<EdgeId, usize>,
-) {
-    let mut ovs: Vec<BinderObjectVersion> = Vec::new();
-    let mut evs: Vec<BinderEdgeVersion> = Vec::new();
-    let mut ov_pos: HashMap<ObjectId, usize> = HashMap::new();
-    let mut ev_pos: HashMap<EdgeId, usize> = HashMap::new();
+fn build_version_stores(commits: &[BinderCommit]) -> VersionStores {
+    // Pre-size to commits.len() — each commit produces ≥1 version entry,
+    // so this avoids all reallocation in the common single-object-per-commit case.
+    let n = commits.len();
+    let mut ovs: Vec<BinderObjectVersion> = Vec::with_capacity(n);
+    let mut evs: Vec<BinderEdgeVersion> = Vec::with_capacity(n);
+    let mut ov_pos: HashMap<ObjectId, usize> = HashMap::with_capacity(n);
+    let mut ev_pos: HashMap<EdgeId, usize> = HashMap::with_capacity(n);
 
     for commit in commits {
         let new_ovs = derive_object_versions_for_commit(commit);
@@ -789,4 +1126,3 @@ fn derive_edge_versions_for_commit(commit: &BinderCommit) -> Vec<BinderEdgeVersi
         })
         .collect()
 }
-

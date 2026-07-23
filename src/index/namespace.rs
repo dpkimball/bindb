@@ -19,7 +19,9 @@ pub struct NamespaceObjectIndex {
 
 impl NamespaceObjectIndex {
     pub fn new() -> Self {
-        Self { index: HashMap::new() }
+        Self {
+            index: HashMap::new(),
+        }
     }
 
     /// Insert a live ObjectId into the index.

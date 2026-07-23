@@ -4,7 +4,9 @@
 ///
 /// Each test asserts that a specific operation meets the latency or throughput
 /// target defined in docs/sla.md.  Tests run at M-scale (10 K objects) by
-/// default.  Thresholds are calibrated for the project's self-hosted CI runner
+/// default; L-scale tests (100 K objects) are tagged with `scale:L` in their
+/// ignore string and are expected to run on a nightly/manual schedule.
+/// Thresholds are calibrated for the project's self-hosted CI runner
 /// (Apple M-series, NVMe SSD).  Adjust the constants below if the runner changes.
 ///
 /// Adding a new SLA test:
@@ -15,7 +17,7 @@ use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
 use std::time::Instant;
 use tempfile::TempDir;
 
-// ── threshold constants ───────────────────────────────────────────────────────
+// ── M-scale threshold constants (10 K objects) ───────────────────────────────
 // Adjust these if the self-hosted CI runner changes.
 
 const COMMIT_THROUGHPUT_MIN: u64 = 80; // commits/sec — durable single-object commit
@@ -33,6 +35,15 @@ const TRAVERSE_DEPTH5_P99_MS_MAX: u64 = 2; // ms — BFS depth 5
 const REBUILD_M_MS_MAX: u64 = 200; // ms — rebuild_indexes() at 10 K objects
 const OPEN_REPLAY_M_MS_MAX: u64 = 30; // ms — WAL replay at 10 K commits (O(n) position-index replay)
 
+// ── L-scale threshold constants (100 K objects) ──────────────────────────────
+// get() and edges_from() are O(1) HashMap lookups — same target as M.
+// list(), rebuild_indexes(), and open() scale linearly with n.
+
+const GET_L_P99_US_MAX: u64 = 10; // µs — HashMap lookup is O(1); same target as M
+const LIST_L_P99_MS_MAX: u64 = 20; // ms — namespace list returning 10 K of 100 K results
+const REBUILD_L_MS_MAX: u64 = 2_000; // ms — rebuild_indexes() at 100 K objects
+const OPEN_REPLAY_L_MS_MAX: u64 = 300; // ms — WAL replay at 100 K commits
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn obj(s: impl Into<String>) -> ObjectId {
@@ -44,7 +55,7 @@ fn eid(s: impl Into<String>) -> EdgeId {
 }
 
 /// p-th percentile (0–100) of a sorted timing slice (nanoseconds).
-fn percentile(timings: &mut Vec<u64>, p: f64) -> u64 {
+fn percentile(timings: &mut [u64], p: f64) -> u64 {
     timings.sort_unstable();
     let idx = ((timings.len() as f64 * p / 100.0) as usize).min(timings.len() - 1);
     timings[idx]
@@ -56,7 +67,10 @@ fn build_store_m(dir: &TempDir, n: usize, namespaces: &[&str]) -> BinderStore {
     for i in 0..n {
         let ns = namespaces[i % namespaces.len()];
         let mut tx = Transaction::new();
-        tx.put_object(obj(format!("{}://obj.{:06}", ns, i)), vec![i as u8 % 255; 64]);
+        tx.put_object(
+            obj(format!("{}://obj.{:06}", ns, i)),
+            vec![i as u8 % 255; 64],
+        );
         store.commit_buffered(tx, "test", "").unwrap();
     }
     store.flush().unwrap();
@@ -404,5 +418,132 @@ fn sla_open_wal_replay_lte_500ms_at_10k_commits() {
         "open() WAL replay worst-of-3 {} ms > SLA maximum {} ms",
         worst_ms,
         OPEN_REPLAY_M_MS_MAX
+    );
+}
+
+// ── L-scale SLAs (100 K objects) ─────────────────────────────────────────────
+// Run with: cargo test --release -- --ignored --test-threads=1 scale:L
+// Expected runtime per test: 30–120 seconds.  Run on a nightly/manual schedule.
+
+/// Build a store with `n` objects across `namespaces` — L-scale variant.
+/// Uses commit_buffered + flush to keep setup time reasonable.
+fn build_store_l(dir: &TempDir, n: usize, namespaces: &[&str]) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    for i in 0..n {
+        let ns = namespaces[i % namespaces.len()];
+        let mut tx = Transaction::new();
+        tx.put_object(
+            obj(format!("{}://obj.{:08}", ns, i)),
+            vec![i as u8 % 255; 64],
+        );
+        store.commit_buffered(tx, "test", "").unwrap();
+        // Flush every 10 K to keep WAL write pressure manageable.
+        if i > 0 && i % 10_000 == 0 {
+            store.flush().unwrap();
+        }
+    }
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf scale:L — cargo test --release -- --ignored --test-threads=1"]
+fn sla_l_get_p99_lte_10us_at_100k_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_store_l(&dir, 100_000, &["a"]);
+    let target = obj("a://obj.00050000");
+    let iterations = 5_000;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let _ = store.get(&target).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000; // ns → µs
+    assert!(
+        p99 <= GET_L_P99_US_MAX,
+        "get() p99 {} µs > L-scale SLA maximum {} µs (get must stay O(1) at 100K objects)",
+        p99,
+        GET_L_P99_US_MAX
+    );
+}
+
+#[test]
+#[ignore = "perf scale:L — cargo test --release -- --ignored --test-threads=1"]
+fn sla_l_list_p99_lte_20ms_returning_10k_of_100k() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 namespaces × 10 K objects each = 100 K total; list("ns0://") returns 10 K.
+    let namespaces: Vec<String> = (0..10).map(|i| format!("ns{}", i)).collect();
+    let ns_refs: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    let store = build_store_l(&dir, 100_000, &ns_refs);
+    let iterations = 100;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let results = store.list("ns0://").unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(results.len(), 10_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000; // ns → ms
+    assert!(
+        p99 <= LIST_L_P99_MS_MAX,
+        "list() p99 {} ms > L-scale SLA maximum {} ms (returning 10 K of 100 K objects)",
+        p99,
+        LIST_L_P99_MS_MAX
+    );
+}
+
+#[test]
+#[ignore = "perf scale:L — cargo test --release -- --ignored --test-threads=1"]
+fn sla_l_rebuild_indexes_lte_2s_at_100k_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_store_l(&dir, 100_000, &["a", "b", "c", "d", "e"]);
+
+    // Warm run, then measure 3 times and take the worst.
+    store.rebuild_indexes().unwrap();
+
+    let mut worst_ms = 0u64;
+    for _ in 0..3 {
+        let t = Instant::now();
+        store.rebuild_indexes().unwrap();
+        let ms = t.elapsed().as_millis() as u64;
+        worst_ms = worst_ms.max(ms);
+    }
+
+    assert!(
+        worst_ms <= REBUILD_L_MS_MAX,
+        "rebuild_indexes() worst-of-3 {} ms > L-scale SLA maximum {} ms (100 K objects)",
+        worst_ms,
+        REBUILD_L_MS_MAX
+    );
+}
+
+#[test]
+#[ignore = "perf scale:L — cargo test --release -- --ignored --test-threads=1"]
+fn sla_l_open_wal_replay_lte_300ms_at_100k_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = build_store_l(&dir, 100_000, &["a"]);
+        store.close().unwrap();
+    }
+
+    let mut worst_ms = 0u64;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let store = BinderStore::open(dir.path()).unwrap();
+        let ms = t.elapsed().as_millis() as u64;
+        worst_ms = worst_ms.max(ms);
+        store.close().unwrap();
+    }
+
+    assert!(
+        worst_ms <= OPEN_REPLAY_L_MS_MAX,
+        "open() WAL replay worst-of-3 {} ms > L-scale SLA maximum {} ms (100 K commits)",
+        worst_ms,
+        OPEN_REPLAY_L_MS_MAX
     );
 }
