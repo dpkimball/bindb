@@ -498,6 +498,53 @@ fn measure_all() -> Vec<Metric> {
         });
     }
 
+    // XL (1 M) — optional; issue #7. Slow; not CI-gated.
+    if env::var("PERF_REPORT_XL").ok().as_deref() == Some("1") {
+        eprintln!("PERF_REPORT_XL=1 — building 1 M object store (slow)…");
+        const XL_N: usize = 1_000_000;
+        // Soft targets for report pass/fail (not yet CI SLA constants).
+        const GET_XL_P99_US_MAX: f64 = 10.0;
+        const OPEN_XL_MS_MAX: f64 = 5_000.0;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = build_store(&dir, XL_N, &["a"]);
+            let target = obj("a://obj.000500000");
+            let mut timings = Vec::with_capacity(2_000);
+            for _ in 0..2_000 {
+                let t = Instant::now();
+                let _ = store.get(&target).unwrap();
+                timings.push(t.elapsed().as_nanos() as u64);
+            }
+            out.push(Metric {
+                id: "get_xl_p99_us",
+                name: "get() p99",
+                scale: "XL (1 M objects)",
+                value: percentile(&mut timings, 99.0) as f64 / 1_000.0,
+                unit: "µs",
+                bound: GET_XL_P99_US_MAX,
+                higher_is_better: false,
+            });
+            store.close().unwrap();
+        }
+        let mut worst = 0.0f64;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let store = BinderStore::open(dir.path()).unwrap();
+            worst = worst.max(t.elapsed().as_secs_f64() * 1000.0);
+            store.close().unwrap();
+        }
+        out.push(Metric {
+            id: "open_xl_ms",
+            name: "open() worst-of-3",
+            scale: "XL (1 M commits)",
+            value: worst,
+            unit: "ms",
+            bound: OPEN_XL_MS_MAX,
+            higher_is_better: false,
+        });
+    }
+
     out
 }
 

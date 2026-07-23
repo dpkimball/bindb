@@ -15,11 +15,13 @@ All SLAs are defined at one or more scale tiers:
 | **S** | 1 K | 1 K | — |
 | **M** | 10 K | 10 K | Per-PR (`perf` job, `--test-threads=1`) |
 | **L** | 100 K | 50 K | Nightly / manual (`scale:L` tests) |
-| **XL** | 1 M | — | Aspirational — numbers tracked manually |
+| **XL** | 1 M | — | Manual: `PERF_REPORT_XL=1` on `perf_report` ([#7](https://github.com/dpkimball/bindb/issues/7)); not CI-gated |
 
 Life-scale context: a single user accumulates ~500 K health observations per year,
 ~50 K memories over 10 years, and ~10 K–100 K financial records.
 The **L** tier represents a well-used store after 2–3 years.
+
+Interim RAM ceiling / mmap deferral: see [`roadmap-status.md`](roadmap-status.md) (issue #6).
 
 ---
 

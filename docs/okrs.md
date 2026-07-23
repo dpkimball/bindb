@@ -64,9 +64,9 @@ Open() is the noisy gate today.
 
 | KR | Target | How we know |
 |----|--------|-------------|
-| KR5.1 | Written decision on issue **#6** (mmap / larger-than-RAM): ship spike, defer, or won’t-do with rationale | Issue comment + label |
-| KR5.2 | If defer/won’t-do: documented max practical store size for Binder (objects + RAM) in `docs/sla.md` | Doc section merged |
-| KR5.3 | If ship: spike PR with 1 M object open/get numbers in `perf-report` (XL row, not necessarily gated) | Report contains XL metrics |
+| KR5.1 | Written decision on issue **#6** (mmap / larger-than-RAM): ship spike, defer, or won’t-do with rationale | Issue comment + [`roadmap-status.md`](roadmap-status.md) interim defer |
+| KR5.2 | If defer/won’t-do: documented max practical store size for Binder (objects + RAM) in docs | Section in `roadmap-status.md` (+ pointer from `sla.md`) |
+| KR5.3 | Optional XL rows in `perf-report` (`PERF_REPORT_XL=1`); issue #7 stays open until a measured 1 M run is attached | Report contains `get_xl_p99_us` / `open_xl_ms` |
 
 ---
 
