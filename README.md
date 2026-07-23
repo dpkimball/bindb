@@ -4,6 +4,11 @@
   <img src="image.png" alt="bindb" width="260" />
 </p>
 
+<p align="center">
+  <a href="https://github.com/dpkimball/bindb/actions/workflows/ci.yml"><img src="https://github.com/dpkimball/bindb/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/dpkimball/bindb/actions/workflows/bench.yml"><img src="https://github.com/dpkimball/bindb/actions/workflows/bench.yml/badge.svg" alt="Perf" /></a>
+</p>
+
 **bindb** is a native embedded database designed for semantic, graph, temporal, and AI-native
 applications.
 
