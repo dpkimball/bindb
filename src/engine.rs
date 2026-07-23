@@ -103,9 +103,8 @@ impl BinderStore {
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
         let neighbours =
             GraphIndex::build_neighbour_map(edge_versions.iter().filter(|v| !v.is_tombstone()));
-        let namespace_index = NamespaceObjectIndex::rebuild(
-            object_versions.iter().filter(|v| v.valid_to.is_none()),
-        );
+        let namespace_index =
+            NamespaceObjectIndex::rebuild(object_versions.iter().filter(|v| v.valid_to.is_none()));
 
         // Load vector projection from previous clean close, if present.
         let vector_index = load_vector_projection(store_path);
@@ -387,7 +386,11 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let object_ids = self.namespace_index.lock().unwrap().matching(namespace_prefix);
+        let object_ids = self
+            .namespace_index
+            .lock()
+            .unwrap()
+            .matching(namespace_prefix);
         let head = self.head_objects.lock().unwrap();
         Ok(object_ids
             .iter()
@@ -892,4 +895,3 @@ fn derive_edge_versions_for_commit(commit: &BinderCommit) -> Vec<BinderEdgeVersi
         })
         .collect()
 }
-

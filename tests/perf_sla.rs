@@ -67,7 +67,10 @@ fn build_store_m(dir: &TempDir, n: usize, namespaces: &[&str]) -> BinderStore {
     for i in 0..n {
         let ns = namespaces[i % namespaces.len()];
         let mut tx = Transaction::new();
-        tx.put_object(obj(format!("{}://obj.{:06}", ns, i)), vec![i as u8 % 255; 64]);
+        tx.put_object(
+            obj(format!("{}://obj.{:06}", ns, i)),
+            vec![i as u8 % 255; 64],
+        );
         store.commit_buffered(tx, "test", "").unwrap();
     }
     store.flush().unwrap();
@@ -429,7 +432,10 @@ fn build_store_l(dir: &TempDir, n: usize, namespaces: &[&str]) -> BinderStore {
     for i in 0..n {
         let ns = namespaces[i % namespaces.len()];
         let mut tx = Transaction::new();
-        tx.put_object(obj(format!("{}://obj.{:08}", ns, i)), vec![i as u8 % 255; 64]);
+        tx.put_object(
+            obj(format!("{}://obj.{:08}", ns, i)),
+            vec![i as u8 % 255; 64],
+        );
         store.commit_buffered(tx, "test", "").unwrap();
         // Flush every 10 K to keep WAL write pressure manageable.
         if i > 0 && i % 10_000 == 0 {

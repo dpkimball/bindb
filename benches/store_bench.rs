@@ -81,19 +81,23 @@ fn bench_commit_buffered_throughput(c: &mut Criterion) {
     for n in [1_000usize, 10_000, 100_000] {
         group.throughput(Throughput::Elements(n as u64));
 
-        group.bench_with_input(BenchmarkId::new("single_object_plus_flush", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tmp();
-                let store = BinderStore::open(dir.path()).unwrap();
-                for i in 0..n {
-                    let mut tx = Transaction::new();
-                    tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
-                    store.commit_buffered(tx, "bench", "").unwrap();
-                }
-                store.flush().unwrap();
-                store.close().unwrap();
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("single_object_plus_flush", n),
+            &n,
+            |b, &n| {
+                b.iter(|| {
+                    let dir = tmp();
+                    let store = BinderStore::open(dir.path()).unwrap();
+                    for i in 0..n {
+                        let mut tx = Transaction::new();
+                        tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
+                        store.commit_buffered(tx, "bench", "").unwrap();
+                    }
+                    store.flush().unwrap();
+                    store.close().unwrap();
+                });
+            },
+        );
     }
 
     group.finish();
@@ -169,10 +173,7 @@ fn bench_list_by_namespace(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(results_per_ns as u64));
         group.bench_with_input(
-            BenchmarkId::new(
-                format!("list_{results_per_ns}_of_{total}"),
-                total,
-            ),
+            BenchmarkId::new(format!("list_{results_per_ns}_of_{total}"), total),
             &total,
             |b, _| {
                 b.iter(|| {

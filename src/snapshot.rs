@@ -39,8 +39,7 @@ pub fn write_snapshot(path: &Path, snapshot: &VersionSnapshot) -> Result<(), Sto
     hasher.update(&payload);
     let crc = hasher.finalize();
 
-    let mut buf =
-        Vec::with_capacity(4 + 1 + 8 + payload.len() + 4);
+    let mut buf = Vec::with_capacity(4 + 1 + 8 + payload.len() + 4);
     buf.extend_from_slice(MAGIC);
     buf.push(VERSION);
     buf.extend_from_slice(&payload_len.to_le_bytes());
