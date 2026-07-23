@@ -13,7 +13,7 @@ fn eid(s: impl Into<String>) -> EdgeId {
     EdgeId::new(s)
 }
 
-fn percentile(v: &mut Vec<u64>, p: f64) -> u64 {
+fn percentile(v: &mut [u64], p: f64) -> u64 {
     v.sort_unstable();
     v[((v.len() as f64 * p / 100.0) as usize).min(v.len() - 1)]
 }

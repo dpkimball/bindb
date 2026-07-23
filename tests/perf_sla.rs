@@ -55,7 +55,7 @@ fn eid(s: impl Into<String>) -> EdgeId {
 }
 
 /// p-th percentile (0–100) of a sorted timing slice (nanoseconds).
-fn percentile(timings: &mut Vec<u64>, p: f64) -> u64 {
+fn percentile(timings: &mut [u64], p: f64) -> u64 {
     timings.sort_unstable();
     let idx = ((timings.len() as f64 * p / 100.0) as usize).min(timings.len() - 1);
     timings[idx]

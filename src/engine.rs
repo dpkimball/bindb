@@ -743,6 +743,13 @@ impl BinderStore {
 use crate::edge::EdgeVersionId;
 use crate::object::ObjectVersionId;
 
+type VersionStores = (
+    Vec<BinderObjectVersion>,
+    Vec<BinderEdgeVersion>,
+    HashMap<ObjectId, usize>,
+    HashMap<EdgeId, usize>,
+);
+
 /// Snapshot-based open: start from the snapshot's version stores and apply
 /// only the delta commits (WAL frames written after the snapshot offset).
 fn build_version_stores_delta(
@@ -751,12 +758,7 @@ fn build_version_stores_delta(
     mut evs: Vec<BinderEdgeVersion>,
     mut ov_pos: HashMap<ObjectId, usize>,
     mut ev_pos: HashMap<EdgeId, usize>,
-) -> (
-    Vec<BinderObjectVersion>,
-    Vec<BinderEdgeVersion>,
-    HashMap<ObjectId, usize>,
-    HashMap<EdgeId, usize>,
-) {
+) -> VersionStores {
     for commit in delta_commits {
         let new_ovs = derive_object_versions_for_commit(commit);
         let new_evs = derive_edge_versions_for_commit(commit);
@@ -815,14 +817,7 @@ fn save_vector_projection(store_path: &Path, index: &VectorIndex) {
 
 /// Replay all commits into version Vecs and position indexes.
 /// O(n_commits) — uses position maps for O(1) retirement per object/edge.
-fn build_version_stores(
-    commits: &[BinderCommit],
-) -> (
-    Vec<BinderObjectVersion>,
-    Vec<BinderEdgeVersion>,
-    HashMap<ObjectId, usize>,
-    HashMap<EdgeId, usize>,
-) {
+fn build_version_stores(commits: &[BinderCommit]) -> VersionStores {
     // Pre-size to commits.len() — each commit produces ≥1 version entry,
     // so this avoids all reallocation in the common single-object-per-commit case.
     let n = commits.len();

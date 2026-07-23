@@ -93,8 +93,11 @@ impl Wal {
     }
 
     /// Replay only the WAL frames at or after `start_offset`.
-    /// Used by snapshot-based open: the snapshot covers everything before
-    /// `start_offset`; this method recovers any commits written afterwards.
+    /// Used by WAL compaction (issue #1): once frames before a checkpoint are
+    /// trimmed, open() calls this to replay only the delta after the snapshot.
+    #[allow(dead_code)]
+    /// The snapshot covers everything before `start_offset`; this method
+    /// recovers any commits written afterwards.
     ///
     /// Does NOT truncate the file before `start_offset` — those bytes belong
     /// to the snapshotted history and must remain intact for recovery.
