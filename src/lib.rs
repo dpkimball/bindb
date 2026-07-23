@@ -12,6 +12,7 @@ mod snapshot;
 mod transaction;
 mod types;
 pub mod vector;
+mod vector_hnsw;
 mod wal;
 
 pub use commit::BinderCommit;
