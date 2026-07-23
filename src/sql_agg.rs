@@ -182,7 +182,7 @@ fn extract_value(payload: &[u8]) -> Option<f64> {
 
 fn path_segment(object_id: &str, index: usize) -> Option<String> {
     let parts: Vec<&str> = object_id
-        .split(|c| c == '/' || c == ':')
+        .split(['/', ':'])
         .filter(|p| !p.is_empty())
         .collect();
     parts.get(index).map(|s| (*s).to_string())

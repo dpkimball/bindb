@@ -5,7 +5,7 @@ Last updated: 2026-07-23. Prefer this over stale issue bodies.
 | Issue | State | Shipped on master | Remaining |
 |-------|-------|-------------------|-----------|
 | [#1](https://github.com/dpkimball/bindb/issues/1) WAL compaction | Closed | `compact()`, snapshot + WAL truncate | Ops policy for when to compact |
-| [#2](https://github.com/dpkimball/bindb/issues/2) Graph query | Open | Rust `graph_query()` builder | Query IR / Cypher-like language |
+| [#2](https://github.com/dpkimball/bindb/issues/2) Graph query | Open | Rust builder + restricted `graph_ir()` MATCH dialect | Full Cypher; min-hop filter; payload WHERE; path RETURN |
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model | Latency SLA @ 100k (OKR O3) |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation | Open | Rust DSL + restricted `sql_aggregate()` (`COUNT`/`AVG`/`SUM`/`MIN`/`MAX`, `PATH_SEGMENT`) | Full SQL; out-of-process / DuckDB projection |
