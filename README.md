@@ -240,10 +240,20 @@ cargo bench --bench store_bench
 | [docs/benchmark-comparison.md](docs/benchmark-comparison.md) | Measured performance vs SQLite, DuckDB, MongoDB, Neo4j, ClickHouse, PostgreSQL |
 | [docs/comparison.md](docs/comparison.md) | Feature comparison vs SQLite, DuckDB, MongoDB, Neo4j, Weaviate, ClickHouse, PostgreSQL |
 | [docs/sla.md](docs/sla.md) | Performance SLAs, scale tiers, CI enforcement |
+| [docs/okrs.md](docs/okrs.md) | Engineering OKRs (90-day, evidence via `perf_report`) |
 | [docs/storage.md](docs/storage.md) | WAL format, on-disk layout, checkpoint, recovery |
 | [docs/indexes.md](docs/indexes.md) | Head indexes, graph, namespace, vector, rebuild rules |
 | [docs/performance.md](docs/performance.md) | Throughput, durability modes, scale context |
 | [PRINCIPLES.md](PRINCIPLES.md) | The ten implementation invariants |
+
+### Performance report
+
+```bash
+PERF_REPORT_DIR=./out cargo run --example perf_report --release
+# → out/perf-report.md , out/perf-report.json
+```
+
+Perf CI (self-hosted, `performance` label on PRs) uploads the same files as artifacts.
 
 ---
 

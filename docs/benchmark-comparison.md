@@ -222,7 +222,14 @@ This runs automatically on crash recovery.
 | Bulk import | 15–500× slower than SQLite/DuckDB | Per-write version history + in-memory index maintenance | Expected — structural cost of full history |
 | Cold startup | Comparable to SQLite (~14 ms at 10 K) | O(n) replay after position-index fix | Fixed |
 | Analytical aggregations | Not supported | No query engine | Roadmap — SQL projection layer |
-| ANN vector search | Degrades past 100 K vectors | Brute-force cosine only | Roadmap — Phase 2 HNSW |
+| ANN vector search | Latency SLA not yet gated at 100 K | HNSW on master (≥1 K / model); recall@10 in `perf-report` | OKR O3 — add latency SLA |
+
+See also: [OKRs](okrs.md). Generate a report anytime with:
+
+```bash
+PERF_REPORT_DIR=./out cargo run --example perf_report --release
+# → out/perf-report.md , out/perf-report.json
+```
 
 ### Performance characteristic summary
 

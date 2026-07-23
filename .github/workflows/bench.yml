@@ -34,6 +34,29 @@ jobs:
         # rustdoc ```ignore``` examples, which are documentation stubs.
         run: cargo test --release --test perf_sla -- --ignored --test-threads=1
 
+      - name: Generate perf report (measured vs SLA)
+        env:
+          PERF_REPORT_DIR: perf-out
+          # Soft: always upload artifact even if a noisy metric (e.g. open()) fails locally.
+          # The SLA gate above remains the hard fail.
+          PERF_REPORT_SOFT: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p perf-out
+          cargo run --example perf_report --release
+          echo "----- perf-report.md -----"
+          cat perf-out/perf-report.md
+
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.run_id }}
+          path: |
+            perf-out/perf-report.md
+            perf-out/perf-report.json
+          if-no-files-found: warn
+
   # ── trend benchmarks ────────────────────────────────────────────────────────
   # Runs criterion and stores results for PR comment comparison.
   # Does NOT fail the PR — provides visibility only.
