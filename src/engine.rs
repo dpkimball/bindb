@@ -17,7 +17,6 @@ use crate::vector::{
 };
 use crate::wal::Wal;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
