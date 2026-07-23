@@ -110,6 +110,26 @@ fn ir_incoming() {
 }
 
 #[test]
+fn ir_exact_depth_excludes_shallower() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_social_graph(&store);
+
+    // m3 is 2 hops; m1/m2 are 1 hop via KNOWS|RELATES_TO.
+    let results = store
+        .graph_ir("MATCH (a)-[:KNOWS|RELATES_TO*2..2]->(b) WHERE id(a) = 'person://alice' RETURN b")
+        .unwrap();
+    let ids: Vec<_> = results
+        .iter()
+        .map(|m| m.object.object_id.0.as_str())
+        .collect();
+    assert!(ids.contains(&"memory://m3"));
+    assert!(!ids.contains(&"memory://m1"));
+    assert!(!ids.contains(&"memory://m2"));
+    store.close().unwrap();
+}
+
+#[test]
 fn ir_rejects_payload_predicate() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();

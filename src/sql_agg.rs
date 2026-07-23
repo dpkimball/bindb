@@ -11,6 +11,8 @@
 //! SELECT SUM(VALUE) FROM 'obs://ns' GROUP BY PATH_SEGMENT(1)
 //! SELECT MIN(VALUE) FROM 'obs://ns' GROUP BY PATH_SEGMENT(2)
 //! SELECT MAX(VALUE) FROM 'obs://ns'
+//! SELECT P50(VALUE) FROM 'obs://ns'
+//! SELECT P99(VALUE) FROM 'obs://ns'
 //! ```
 //!
 //! `VALUE` extraction order: little-endian `f64` (8 bytes), then `bincode` `f64`,
@@ -107,6 +109,8 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
         ("SUM(VALUE)", Aggregate::Sum, true),
         ("MIN(VALUE)", Aggregate::Min, true),
         ("MAX(VALUE)", Aggregate::Max, true),
+        ("P50(VALUE)", Aggregate::P50, true),
+        ("P99(VALUE)", Aggregate::P99, true),
     ];
     for (pat, agg, needs) in patterns {
         if u.starts_with(pat) {
@@ -114,7 +118,7 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
         }
     }
     Err(SqlAggError::Unsupported(
-        "aggregate must be COUNT(*), AVG(VALUE), SUM(VALUE), MIN(VALUE), or MAX(VALUE)".into(),
+        "aggregate must be COUNT(*), AVG/SUM/MIN/MAX/P50/P99(VALUE)".into(),
     ))
 }
 

@@ -992,7 +992,6 @@ impl BinderStore {
         //    truncated; from the perspective of a future open(), the snapshot
         //    covers "0 WAL frames from offset 0" — all state comes from the
         //    snapshot directly, and any WAL frames present are the delta.
-        let historical_count = self.commits.lock().unwrap().len() as u64;
         let snapshot = {
             let ovs = self.object_versions.lock().unwrap().clone();
             let evs = self.edge_versions.lock().unwrap().clone();
@@ -1026,9 +1025,10 @@ impl BinderStore {
                 commit_count: 0,
             })?;
 
-        // 5. Record how many commits existed at compaction time.  close() uses
-        //    this to compute the WAL-relative commit count for the next snapshot.
-        *self.wal_commit_offset.lock().unwrap() = historical_count;
+        // 5. Drop in-memory commit history — versions live in the snapshot.
+        //    scan_commits() after compact returns only post-compact frames.
+        self.commits.lock().unwrap().clear();
+        *self.wal_commit_offset.lock().unwrap() = 0;
 
         Ok(())
     }
@@ -1239,7 +1239,12 @@ impl BinderStore {
             let evs = self.edge_versions.lock().unwrap().clone();
             let ov_pos = self.head_object_positions.lock().unwrap().clone();
             let ev_pos = self.head_edge_positions.lock().unwrap().clone();
-            let commits = self.commits.lock().unwrap().clone();
+            // Persist only WAL-relative commits (post-compact history is empty).
+            let commits = {
+                let all = self.commits.lock().unwrap();
+                let start = (wal_commit_offset as usize).min(all.len());
+                all[start..].to_vec()
+            };
             VersionSnapshot {
                 commit_count: wal_relative_count,
                 wal_offset,

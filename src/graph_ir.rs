@@ -16,7 +16,8 @@
 //! ```
 //!
 //! Notes:
-//! - `*min..max` / `*n` set **max_depth** only (the builder has no min-depth filter).
+//! - `*min..max` / `*n` set max_depth and filter results to `depth >= min`
+//!   (`*n` means exactly n hops).
 //! - Node filters apply to **results**, not traversal (same as `filter_node`).
 //! - Undirected `-[]-` → [`Direction::Both`]; `<-[]-` → Incoming; `-[]->` → Outgoing.
 
@@ -50,6 +51,8 @@ pub enum NodeIdPred {
 pub struct GraphIrQuery {
     pub start: ObjectId,
     pub edge_types: Vec<String>,
+    /// Minimum hop depth included in results (1 = include immediate neighbours).
+    pub min_depth: usize,
     /// Max hops from start (builder max_depth).
     pub max_depth: usize,
     pub direction: Direction,
@@ -68,7 +71,8 @@ impl GraphIrQuery {
         }
         let after_match = skip_keyword(&raw, "MATCH");
 
-        let (direction, edge_types, max_depth, after_pattern) = parse_pattern(after_match)?;
+        let (direction, edge_types, min_depth, max_depth, after_pattern) =
+            parse_pattern(after_match)?;
         let after_pattern = after_pattern.trim_start();
 
         if !starts_with_keyword(after_pattern, "WHERE") {
@@ -87,6 +91,7 @@ impl GraphIrQuery {
         Ok(GraphIrQuery {
             start,
             edge_types,
+            min_depth,
             max_depth,
             direction,
             end_pred,
@@ -130,7 +135,7 @@ fn skip_keyword<'a>(s: &'a str, kw: &str) -> &'a str {
 }
 
 /// Parse `(a)-[:TYPES*hops]->(b)` / undirected / incoming variants.
-fn parse_pattern(s: &str) -> Result<(Direction, Vec<String>, usize, &str), GraphIrError> {
+fn parse_pattern(s: &str) -> Result<(Direction, Vec<String>, usize, usize, &str), GraphIrError> {
     let s = s.trim_start();
     // Require `(…)` start node binding (name ignored).
     if !s.starts_with('(') {
@@ -162,7 +167,7 @@ fn parse_pattern(s: &str) -> Result<(Direction, Vec<String>, usize, &str), Graph
     let rel_body = after_arrow[..end_bracket].trim();
     let after_rel = after_arrow[end_bracket + 1..].trim_start();
 
-    let (edge_types, max_depth) = parse_rel_body(rel_body)?;
+    let (edge_types, min_depth, max_depth) = parse_rel_body(rel_body)?;
 
     let (direction, after_dir) = match direction {
         Direction::Incoming => {
@@ -196,14 +201,14 @@ fn parse_pattern(s: &str) -> Result<(Direction, Vec<String>, usize, &str), Graph
         .find(')')
         .ok_or_else(|| GraphIrError::Unsupported("unclosed end node".into()))?;
     let rest = after_end_open[end_close + 1..].trim_start();
-    Ok((direction, edge_types, max_depth, rest))
+    Ok((direction, edge_types, min_depth, max_depth, rest))
 }
 
-fn parse_rel_body(body: &str) -> Result<(Vec<String>, usize), GraphIrError> {
+fn parse_rel_body(body: &str) -> Result<(Vec<String>, usize, usize), GraphIrError> {
     // Forms: "", "*2", "*1..3", ":KNOWS", ":KNOWS|TAGGED", ":KNOWS*1..3", ":A|B*2"
     let body = body.trim();
     if body.is_empty() {
-        return Ok((Vec::new(), 6));
+        return Ok((Vec::new(), 1, 6));
     }
 
     let (types_part, hops_part) = if let Some(star) = body.find('*') {
@@ -235,28 +240,27 @@ fn parse_rel_body(body: &str) -> Result<(Vec<String>, usize), GraphIrError> {
         }
     }
 
-    let max_depth = match hops_part {
-        None => 6,
+    let (min_depth, max_depth) = match hops_part {
+        None => (1, 6),
         Some(h) => parse_hops(h.trim())?,
     };
-    Ok((edge_types, max_depth))
+    Ok((edge_types, min_depth, max_depth))
 }
 
-fn parse_hops(h: &str) -> Result<usize, GraphIrError> {
+fn parse_hops(h: &str) -> Result<(usize, usize), GraphIrError> {
     if let Some((a, b)) = h.split_once("..") {
-        let _min: usize = a.trim().parse().map_err(|_| GraphIrError::BadHops)?;
+        let min: usize = a.trim().parse().map_err(|_| GraphIrError::BadHops)?;
         let max: usize = b.trim().parse().map_err(|_| GraphIrError::BadHops)?;
-        if max == 0 {
+        if min == 0 || max == 0 || min > max {
             return Err(GraphIrError::BadHops);
         }
-        // Min is accepted for Cypher familiarity but not enforced by the builder.
-        Ok(max)
+        Ok((min, max))
     } else {
         let n: usize = h.parse().map_err(|_| GraphIrError::BadHops)?;
         if n == 0 {
             return Err(GraphIrError::BadHops);
         }
-        Ok(n)
+        Ok((n, n))
     }
 }
 
@@ -365,7 +369,11 @@ impl BinderStore {
             }
         };
 
-        builder.execute()
+        let mut matches = builder.execute()?;
+        if q.min_depth > 1 {
+            matches.retain(|m| m.depth >= q.min_depth);
+        }
+        Ok(matches)
     }
 }
 
@@ -381,6 +389,7 @@ mod tests {
         .unwrap();
         assert_eq!(q.start.0, "person://alice");
         assert_eq!(q.edge_types, vec!["KNOWS", "RELATES_TO"]);
+        assert_eq!(q.min_depth, 1);
         assert_eq!(q.max_depth, 3);
         assert_eq!(q.direction, Direction::Outgoing);
         assert_eq!(q.end_pred, NodeIdPred::StartsWith("memory://".into()));
@@ -391,6 +400,7 @@ mod tests {
         let q = GraphIrQuery::parse("MATCH (a)-[:KNOWS]-(b) WHERE id(a) = 'memory://m1' RETURN b")
             .unwrap();
         assert_eq!(q.direction, Direction::Both);
+        assert_eq!(q.min_depth, 1);
         assert_eq!(q.max_depth, 6);
     }
 
@@ -401,6 +411,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(q.direction, Direction::Incoming);
+        assert_eq!(q.min_depth, 1);
+        assert_eq!(q.max_depth, 2);
+    }
+
+    #[test]
+    fn parses_exact_hops() {
+        let q = GraphIrQuery::parse("MATCH (a)-[*2]->(b) WHERE id(a) = 'x' RETURN b").unwrap();
+        assert_eq!(q.min_depth, 2);
         assert_eq!(q.max_depth, 2);
     }
 
