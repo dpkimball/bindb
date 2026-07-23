@@ -255,3 +255,121 @@ fn store_reopens_correctly_after_clean_close_with_checkpoint() {
     assert_eq!(v.commit_id, commit_id);
     store2.close().unwrap();
 }
+
+// ─── full-text search projection ─────────────────────────────────────────────
+
+#[test]
+fn text_search_finds_indexed_object() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let oid = obj("doc://a");
+    store
+        .index_text(&oid, "Rust is a systems programming language")
+        .unwrap();
+
+    let results = store.text_search("systems").unwrap();
+    assert!(
+        results.contains(&oid),
+        "indexed object must appear in results"
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn text_search_is_case_insensitive() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let oid = obj("doc://b");
+    store.index_text(&oid, "Hello World").unwrap();
+
+    assert!(!store.text_search("hello world").unwrap().is_empty());
+    assert!(!store.text_search("HELLO").unwrap().is_empty());
+    assert!(!store.text_search("WoRlD").unwrap().is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn text_search_returns_empty_when_no_match() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    store
+        .index_text(&obj("doc://c"), "The quick brown fox")
+        .unwrap();
+
+    let results = store.text_search("elephant").unwrap();
+    assert!(results.is_empty(), "non-matching query must return empty");
+    store.close().unwrap();
+}
+
+#[test]
+fn text_search_returns_multiple_matches() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let a = obj("doc://d1");
+    let b = obj("doc://d2");
+    let c = obj("doc://d3");
+    store.index_text(&a, "apple pie recipe").unwrap();
+    store.index_text(&b, "baked apple crumble").unwrap();
+    store.index_text(&c, "banana smoothie").unwrap();
+
+    let results = store.text_search("apple").unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.contains(&a));
+    assert!(results.contains(&b));
+    assert!(!results.contains(&c));
+    store.close().unwrap();
+}
+
+#[test]
+fn index_text_replaces_previous_entry() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let oid = obj("doc://e");
+    store.index_text(&oid, "original text").unwrap();
+    store.index_text(&oid, "replacement content").unwrap();
+
+    assert!(store.text_search("original").unwrap().is_empty());
+    assert_eq!(store.text_search("replacement").unwrap(), vec![oid]);
+    store.close().unwrap();
+}
+
+#[test]
+fn clear_text_index_removes_entry() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let oid = obj("doc://f");
+    store.index_text(&oid, "to be removed").unwrap();
+    store.clear_text_index(&oid).unwrap();
+
+    assert!(store.text_search("removed").unwrap().is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn index_text_empty_string_clears_entry() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let oid = obj("doc://g");
+    store.index_text(&oid, "some content").unwrap();
+    store.index_text(&oid, "").unwrap(); // empty string should clear
+
+    assert!(store.text_search("content").unwrap().is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn text_search_on_empty_index_returns_empty() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let results = store.text_search("anything").unwrap();
+    assert!(results.is_empty());
+    store.close().unwrap();
+}

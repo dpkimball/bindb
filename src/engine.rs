@@ -53,6 +53,11 @@ pub struct BinderStore {
     /// self.commits still holds all historical commits in memory.  This offset
     /// lets close() compute the WAL-relative commit count for the snapshot.
     wal_commit_offset: Mutex<u64>,
+    /// Non-canonical text projection: object_id → searchable text content.
+    /// Callers register content via `index_text()` after commits.  Not stored
+    /// in the WAL; rebuilt by callers on open.  Supports case-insensitive
+    /// substring search via `text_search()`.
+    text_index: Mutex<HashMap<ObjectId, String>>,
 }
 
 impl BinderStore {
@@ -145,6 +150,7 @@ impl BinderStore {
             head_object_positions: Mutex::new(ov_positions),
             head_edge_positions: Mutex::new(ev_positions),
             wal_commit_offset: Mutex::new(0),
+            text_index: Mutex::new(HashMap::new()),
         })
     }
 
@@ -758,6 +764,63 @@ impl BinderStore {
             .lock()
             .unwrap()
             .update_checkpoint(checkpoint);
+        Ok(())
+    }
+
+    // ── full-text search projection API ───────────────────────────────────────
+
+    /// Register searchable text for an object.  The text is stored in a
+    /// non-canonical in-memory projection — it is NOT written to the WAL and
+    /// is not rebuilt automatically on open.  Callers are responsible for
+    /// re-indexing after `BinderStore::open()`.
+    ///
+    /// Calling `index_text` with the same `object_id` replaces the previous
+    /// entry.  Passing an empty string is equivalent to calling
+    /// `clear_text_index`.
+    pub fn index_text(
+        &self,
+        object_id: &ObjectId,
+        text: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let text: String = text.into();
+        let mut idx = self.text_index.lock().unwrap();
+        if text.is_empty() {
+            idx.remove(object_id);
+        } else {
+            idx.insert(object_id.clone(), text);
+        }
+        Ok(())
+    }
+
+    /// Case-insensitive substring search over the text projection.
+    /// Returns the `ObjectId`s of all objects whose indexed text contains
+    /// `query` as a substring (Unicode-aware lowercase comparison).
+    ///
+    /// Complexity: O(n · m) where n = number of indexed objects and m = avg
+    /// text length.  Intended for small-to-medium datasets (<100 K entries).
+    pub fn text_search(&self, query: &str) -> Result<Vec<ObjectId>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let q = query.to_lowercase();
+        let idx = self.text_index.lock().unwrap();
+        Ok(idx
+            .iter()
+            .filter(|(_, text)| text.to_lowercase().contains(&q))
+            .map(|(oid, _)| oid.clone())
+            .collect())
+    }
+
+    /// Remove an object's entry from the text projection.  No-op if the
+    /// object was never indexed.
+    pub fn clear_text_index(&self, object_id: &ObjectId) -> Result<(), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        self.text_index.lock().unwrap().remove(object_id);
         Ok(())
     }
 
