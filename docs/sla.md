@@ -15,11 +15,13 @@ All SLAs are defined at one or more scale tiers:
 | **S** | 1 K | 1 K | — |
 | **M** | 10 K | 10 K | Per-PR (`perf` job, `--test-threads=1`) |
 | **L** | 100 K | 50 K | Nightly / manual (`scale:L` tests) |
-| **XL** | 1 M | — | Aspirational — numbers tracked manually |
+| **XL** | 1 M | — | Manual: `PERF_REPORT_XL=1` on `perf_report` ([#7](https://github.com/dpkimball/bindb/issues/7)); not CI-gated |
 
 Life-scale context: a single user accumulates ~500 K health observations per year,
 ~50 K memories over 10 years, and ~10 K–100 K financial records.
 The **L** tier represents a well-used store after 2–3 years.
+
+Interim RAM ceiling / mmap deferral: see [`roadmap-status.md`](roadmap-status.md) (issue #6).
 
 ---
 
@@ -119,9 +121,10 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 | **M** (10 K commits) | ≤ 30 ms |
 | **L** (100 K commits) | ≤ 300 ms |
 
-> **Note:** WAL replay is now O(n) after the position-index fix (previously O(n²)).
-> M-tier measured at ~14 ms.  Phase 2 checkpoint-based open will reduce this further
-> by avoiding full deserialization of all historical commits.
+> **Note:** Clean `open()` after checkpoint/snapshot skips full WAL frame replay and
+> defers version-log index hydration until the first history/as_of/write. Raw
+> unrecompacted WAL open at XL remains slow; ops path is `compact()` then reopen
+> (see issue #7 / `PERF_REPORT_XL=1`).
 
 ---
 

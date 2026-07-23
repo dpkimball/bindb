@@ -241,6 +241,7 @@ cargo bench --bench store_bench
 | [docs/comparison.md](docs/comparison.md) | Feature comparison vs SQLite, DuckDB, MongoDB, Neo4j, Weaviate, ClickHouse, PostgreSQL |
 | [docs/sla.md](docs/sla.md) | Performance SLAs, scale tiers, CI enforcement |
 | [docs/okrs.md](docs/okrs.md) | Engineering OKRs (90-day, evidence via `perf_report`) |
+| [docs/roadmap-status.md](docs/roadmap-status.md) | Issue shipped-vs-remaining + interim scale ceiling |
 | [docs/storage.md](docs/storage.md) | WAL format, on-disk layout, checkpoint, recovery |
 | [docs/indexes.md](docs/indexes.md) | Head indexes, graph, namespace, vector, rebuild rules |
 | [docs/performance.md](docs/performance.md) | Throughput, durability modes, scale context |
@@ -251,6 +252,9 @@ cargo bench --bench store_bench
 ```bash
 PERF_REPORT_DIR=./out cargo run --example perf_report --release
 # → out/perf-report.md , out/perf-report.json
+
+# Optional XL (1M objects) — slow, not CI-gated (issue #7):
+PERF_REPORT_XL=1 PERF_REPORT_DIR=./out cargo run --example perf_report --release
 ```
 
 Perf CI (self-hosted, `performance` label on PRs) uploads the same files as artifacts.

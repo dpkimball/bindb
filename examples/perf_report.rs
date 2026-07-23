@@ -498,7 +498,104 @@ fn measure_all() -> Vec<Metric> {
         });
     }
 
+    // XL (1 M) — optional; issue #7. Slow; not CI-gated.
+    if env::var("PERF_REPORT_XL").ok().as_deref() == Some("1") {
+        eprintln!("PERF_REPORT_XL=1 — building 1 M object store (slow)…");
+        const XL_N: usize = 1_000_000;
+        // Soft targets for report pass/fail (not yet CI SLA constants).
+        const GET_XL_P99_US_MAX: f64 = 10.0;
+        // Ops path: open after compact() / clean snapshot (not raw 1M WAL replay).
+        const OPEN_XL_MS_MAX: f64 = 5_000.0;
+        // Interim #6 observation (does not gate overall_pass).
+        const RSS_XL_MB_MAX: f64 = 2048.0;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = build_store(&dir, XL_N, &["a"]);
+            let target = obj("a://obj.000500000");
+            let mut timings = Vec::with_capacity(2_000);
+            for _ in 0..2_000 {
+                let t = Instant::now();
+                let _ = store.get(&target).unwrap();
+                timings.push(t.elapsed().as_nanos() as u64);
+            }
+            out.push(Metric {
+                id: "get_xl_p99_us",
+                name: "get() p99",
+                scale: "XL (1 M objects)",
+                value: percentile(&mut timings, 99.0) as f64 / 1_000.0,
+                unit: "µs",
+                bound: GET_XL_P99_US_MAX,
+                higher_is_better: false,
+            });
+            // Compact so reopen measures snapshot fast path (issue #1 / #7).
+            store.compact().unwrap();
+            store.close().unwrap();
+        }
+        let mut worst = 0.0f64;
+        let mut rss_mb = 0.0f64;
+        for i in 0..3 {
+            let t = Instant::now();
+            let store = BinderStore::open(dir.path()).unwrap();
+            worst = worst.max(t.elapsed().as_secs_f64() * 1000.0);
+            if i == 0 {
+                if let Some(mb) = process_rss_mb() {
+                    rss_mb = mb;
+                }
+            }
+            store.close().unwrap();
+        }
+        out.push(Metric {
+            id: "open_xl_ms",
+            name: "open() after compact() worst-of-3",
+            scale: "XL (1 M objects, snapshot)",
+            value: worst,
+            unit: "ms",
+            bound: OPEN_XL_MS_MAX,
+            higher_is_better: false,
+        });
+        if rss_mb > 0.0 {
+            out.push(Metric {
+                id: "rss_xl_mb",
+                name: "process RSS after XL open",
+                scale: "XL (1 M objects)",
+                value: rss_mb,
+                unit: "MB",
+                bound: RSS_XL_MB_MAX,
+                higher_is_better: false,
+            });
+        }
+    }
+
     out
+}
+
+fn process_rss_mb() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: f64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb / 1024.0);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        let kb: f64 = s.trim().parse().ok()?;
+        Some(kb / 1024.0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn write_json(path: &Path, metrics: &[Metric], git_sha: &str, passed: bool) {
@@ -605,7 +702,10 @@ fn main() {
 
     eprintln!("bindb perf_report: measuring…");
     let metrics = measure_all();
-    let passed = metrics.iter().all(|m| m.pass());
+    let passed = metrics
+        .iter()
+        .filter(|m| m.id != "rss_xl_mb") // informational for #6; does not gate overall
+        .all(|m| m.pass());
 
     let json_path = out_dir.join("perf-report.json");
     let md_path = out_dir.join("perf-report.md");

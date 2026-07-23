@@ -22,6 +22,17 @@ pub(crate) struct Wal {
 
 impl Wal {
     pub fn open_or_create(path: &Path) -> Result<(Self, Vec<BinderCommit>), StoreError> {
+        let mut wal = Self::open_file(path)?;
+        let commits = wal.replay()?;
+        Ok((wal, commits))
+    }
+
+    /// Open the WAL file without replaying frames (snapshot fast path).
+    pub fn open_without_replay(path: &Path) -> Result<Self, StoreError> {
+        Self::open_file(path)
+    }
+
+    fn open_file(path: &Path) -> Result<Self, StoreError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -29,14 +40,15 @@ impl Wal {
             .truncate(false)
             .open(path)?;
 
-        let mut wal = Self {
+        Ok(Self {
             path: path.to_path_buf(),
             file,
             next_entry_id: 0,
-        };
+        })
+    }
 
-        let commits = wal.replay()?;
-        Ok((wal, commits))
+    pub fn set_next_entry_id(&mut self, id: u64) {
+        self.next_entry_id = id;
     }
 
     pub fn append(&mut self, commit: &BinderCommit) -> Result<(), StoreError> {
@@ -103,9 +115,9 @@ impl Wal {
     }
 
     /// Replay only the WAL frames at or after `start_offset`.
-    /// Used by WAL compaction (issue #1): once frames before a checkpoint are
-    /// trimmed, open() calls this to replay only the delta after the snapshot.
-    #[allow(dead_code)]
+    /// Used by snapshot fast-path open: once a checkpoint covers history,
+    /// open() calls this to replay only the delta after the snapshot.
+    ///
     /// The snapshot covers everything before `start_offset`; this method
     /// recovers any commits written afterwards.
     ///

@@ -71,6 +71,7 @@ impl BinderStore {
         fs::create_dir_all(store_path)?;
 
         let dirty_marker = store_path.join(".dirty");
+        let was_clean = !dirty_marker.exists();
         fs::write(&dirty_marker, b"")?;
 
         let wal_path = store_path.join("commits.wal");
@@ -80,50 +81,91 @@ impl BinderStore {
         let mut checkpoint_log = CheckpointLog::open_or_create(&checkpoint_path)?;
         let last_checkpoint = checkpoint_log.last()?;
 
-        // Always replay the full WAL so that `commits` is complete for
-        // `scan_commits()`.  If a valid snapshot exists, skip the expensive
-        // `build_version_stores` pass and load pre-built version stores from
-        // the snapshot instead, applying only the delta commits on top.
-        let (wal, commits) = Wal::open_or_create(&wal_path)?;
-
-        let (object_versions, edge_versions, ov_positions, ev_positions) =
+        // Snapshot fast path: load version stores (+ commit log) from snap,
+        // replay only WAL frames after wal_offset. Falls back to full WAL
+        // replay when the snapshot is missing, mismatched, or too old to
+        // carry `commits` (needed for scan_commits completeness).
+        //
+        // `hydrate_ok`: clean reopen with no WAL delta — version_log.bin can
+        // be indexed in place instead of rewritten.
+        let mut hydrate_ok = false;
+        let (wal, commits, object_versions, edge_versions, ov_positions, ev_positions) =
             if let Some(cp) = last_checkpoint {
                 if let Some(snap) = read_snapshot(&snapshot_path) {
                     if snap.wal_offset == cp.wal_offset && snap.commit_count == cp.commit_count {
-                        // Snapshot is valid.  Determine which commits are the delta:
-                        //
-                        // Post-compaction (wal_offset == 0): the WAL was truncated by
-                        // compact(); all replayed commits are writes after the snapshot.
-                        //
-                        // Normal (wal_offset > 0): commits contains every historical
-                        // frame; the delta starts at index commit_count.
-                        let delta: Option<&[BinderCommit]> = if cp.wal_offset == 0 {
-                            Some(&commits)
+                        let can_skip_full_wal = snap.commit_count == 0 || !snap.commits.is_empty();
+                        if can_skip_full_wal {
+                            let mut wal = Wal::open_without_replay(&wal_path)?;
+                            let (delta, _) = wal.replay_from(cp.wal_offset)?;
+                            // Entry ids continue after historical frames still on disk
+                            // (or after compacted empty WAL + delta).
+                            wal.set_next_entry_id(cp.commit_count + delta.len() as u64);
+                            hydrate_ok = was_clean && delta.is_empty();
+
+                            let (ovs, evs, ov_pos, ev_pos) =
+                                if cp.wal_offset == 0 && snap.commit_count == 0 {
+                                    // Post-compact: snapshot holds all versions; WAL is delta only.
+                                    build_version_stores_delta(
+                                        &delta,
+                                        snap.object_versions,
+                                        snap.edge_versions,
+                                        snap.ov_positions,
+                                        snap.ev_positions,
+                                    )
+                                } else if delta.is_empty() {
+                                    (
+                                        snap.object_versions,
+                                        snap.edge_versions,
+                                        snap.ov_positions,
+                                        snap.ev_positions,
+                                    )
+                                } else {
+                                    build_version_stores_delta(
+                                        &delta,
+                                        snap.object_versions,
+                                        snap.edge_versions,
+                                        snap.ov_positions,
+                                        snap.ev_positions,
+                                    )
+                                };
+
+                            let mut commits = snap.commits;
+                            commits.extend(delta);
+                            (wal, commits, ovs, evs, ov_pos, ev_pos)
                         } else {
-                            commits.get(cp.commit_count as usize..)
-                        };
-                        if let Some(delta) = delta {
-                            build_version_stores_delta(
+                            // Legacy snapshot without commits: full WAL replay,
+                            // but still skip rebuild when delta applies.
+                            let (wal, commits) = Wal::open_or_create(&wal_path)?;
+                            let delta = commits.get(cp.commit_count as usize..).unwrap_or(&[]);
+                            let (ovs, evs, ov_pos, ev_pos) = build_version_stores_delta(
                                 delta,
                                 snap.object_versions,
                                 snap.edge_versions,
                                 snap.ov_positions,
                                 snap.ev_positions,
-                            )
-                        } else {
-                            build_version_stores(&commits)
+                            );
+                            (wal, commits, ovs, evs, ov_pos, ev_pos)
                         }
                     } else {
-                        build_version_stores(&commits)
+                        let (wal, commits) = Wal::open_or_create(&wal_path)?;
+                        let (ovs, evs, ov_pos, ev_pos) = build_version_stores(&commits);
+                        (wal, commits, ovs, evs, ov_pos, ev_pos)
                     }
                 } else {
-                    build_version_stores(&commits)
+                    let (wal, commits) = Wal::open_or_create(&wal_path)?;
+                    let (ovs, evs, ov_pos, ev_pos) = build_version_stores(&commits);
+                    (wal, commits, ovs, evs, ov_pos, ev_pos)
                 }
             } else {
-                build_version_stores(&commits)
+                let (wal, commits) = Wal::open_or_create(&wal_path)?;
+                let (ovs, evs, ov_pos, ev_pos) = build_version_stores(&commits);
+                (wal, commits, ovs, evs, ov_pos, ev_pos)
             };
 
-        let head = commits.last().map(|c| c.commit_id);
+        let head = commits
+            .last()
+            .map(|c| c.commit_id)
+            .or_else(|| head_from_versions(&object_versions, &edge_versions));
         let head_objects = HeadObjectIndex::rebuild(&object_versions);
         let head_edges = HeadEdgeIndex::rebuild(&edge_versions);
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
@@ -135,12 +177,14 @@ impl BinderStore {
         // Load vector projection from previous clean close, if present.
         let vector_index = load_vector_projection(store_path);
 
-        // Build the disk-backed version store from the in-memory version slices
-        // produced by WAL replay.  This file reduces per-query RAM usage for
-        // historical / bitemporal queries after startup.
+        // Disk-backed version history: on clean snapshot reopen, defer index
+        // hydration until the first history/as_of/write (keeps open() fast).
+        // Crash recovery and WAL-delta opens still rebuild eagerly.
         let version_log_path = store_path.join("version_log.bin");
         let mut version_store = VersionStore::open_or_create(&version_log_path)?;
-        version_store.rebuild_from_versions(&object_versions, &edge_versions)?;
+        if !hydrate_ok {
+            version_store.rebuild_from_versions(&object_versions, &edge_versions)?;
+        }
 
         Ok(Self {
             store_path: store_path.to_path_buf(),
@@ -482,6 +526,7 @@ impl BinderStore {
         // Retirements must be written before new versions so the index's
         // valid_to for the old version is set before the new one is appended.
         {
+            let _ = self.ensure_version_store_ready();
             let mut vs = self.version_store.lock().unwrap();
             for v in &new_ovs {
                 // Retire the old version in the disk store if it existed.
@@ -541,6 +586,22 @@ impl BinderStore {
             .collect())
     }
 
+    /// Ensure the disk-backed version index is loaded. Clean snapshot reopens
+    /// defer this until the first history/as_of query or write.
+    fn ensure_version_store_ready(&self) -> Result<(), StoreError> {
+        let mut vs = self.version_store.lock().unwrap();
+        if !vs.index_is_empty() {
+            return Ok(());
+        }
+        if vs.has_data() {
+            // Hydrate from the existing log only. Never rebuild-from-memory here:
+            // commit paths append after ensure, and a memory rebuild would
+            // duplicate the versions about to be appended.
+            vs.hydrate_index_from_file()?;
+        }
+        Ok(())
+    }
+
     /// Full version history of an object in ascending commit order.
     /// Reads from the disk-backed `VersionStore` to avoid loading historical
     /// payloads into RAM.
@@ -551,6 +612,7 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
+        self.ensure_version_store_ready()?;
         Ok(self
             .version_store
             .lock()
@@ -569,6 +631,7 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
+        self.ensure_version_store_ready()?;
         let result = self
             .version_store
             .lock()
@@ -584,6 +647,7 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
+        self.ensure_version_store_ready()?;
         Ok(self.version_store.lock().unwrap().edge_history(edge_id)?)
     }
 
@@ -597,6 +661,7 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
+        self.ensure_version_store_ready()?;
         Ok(self
             .version_store
             .lock()
@@ -927,7 +992,6 @@ impl BinderStore {
         //    truncated; from the perspective of a future open(), the snapshot
         //    covers "0 WAL frames from offset 0" — all state comes from the
         //    snapshot directly, and any WAL frames present are the delta.
-        let historical_count = self.commits.lock().unwrap().len() as u64;
         let snapshot = {
             let ovs = self.object_versions.lock().unwrap().clone();
             let evs = self.edge_versions.lock().unwrap().clone();
@@ -940,6 +1004,9 @@ impl BinderStore {
                 edge_versions: evs,
                 ov_positions: ov_pos,
                 ev_positions: ev_pos,
+                // Compacted snapshots omit commit history; scan_commits after
+                // reopen returns only post-compact WAL frames.
+                commits: Vec::new(),
             }
         };
         write_snapshot(&self.store_path.join("store.snap"), &snapshot)?;
@@ -958,9 +1025,10 @@ impl BinderStore {
                 commit_count: 0,
             })?;
 
-        // 5. Record how many commits existed at compaction time.  close() uses
-        //    this to compute the WAL-relative commit count for the next snapshot.
-        *self.wal_commit_offset.lock().unwrap() = historical_count;
+        // 5. Drop in-memory commit history — versions live in the snapshot.
+        //    scan_commits() after compact returns only post-compact frames.
+        self.commits.lock().unwrap().clear();
+        *self.wal_commit_offset.lock().unwrap() = 0;
 
         Ok(())
     }
@@ -1164,13 +1232,19 @@ impl BinderStore {
                 commit_count: wal_relative_count,
             })?;
 
-        // Snapshot: serialize the version Vecs and position maps. On next
-        // open() this eliminates WAL deserialization for all historical commits.
+        // Snapshot: serialize the version Vecs, position maps, and commit log.
+        // On next open() this skips per-frame WAL deserialization for history.
         let snapshot = {
             let ovs = self.object_versions.lock().unwrap().clone();
             let evs = self.edge_versions.lock().unwrap().clone();
             let ov_pos = self.head_object_positions.lock().unwrap().clone();
             let ev_pos = self.head_edge_positions.lock().unwrap().clone();
+            // Persist only WAL-relative commits (post-compact history is empty).
+            let commits = {
+                let all = self.commits.lock().unwrap();
+                let start = (wal_commit_offset as usize).min(all.len());
+                all[start..].to_vec()
+            };
             VersionSnapshot {
                 commit_count: wal_relative_count,
                 wal_offset,
@@ -1178,6 +1252,7 @@ impl BinderStore {
                 edge_versions: evs,
                 ov_positions: ov_pos,
                 ev_positions: ev_pos,
+                commits,
             }
         };
         // Non-fatal: if snapshot write fails, next open falls back to WAL replay.
@@ -1208,6 +1283,13 @@ type VersionStores = (
     HashMap<ObjectId, usize>,
     HashMap<EdgeId, usize>,
 );
+
+fn head_from_versions(ovs: &[BinderObjectVersion], evs: &[BinderEdgeVersion]) -> Option<CommitId> {
+    ovs.iter()
+        .map(|v| v.commit_id)
+        .chain(evs.iter().map(|v| v.commit_id))
+        .max()
+}
 
 /// Snapshot-based open: start from the snapshot's version stores and apply
 /// only the delta commits (WAL frames written after the snapshot offset).

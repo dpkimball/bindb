@@ -16,9 +16,9 @@
 | `edges_from(oid)` | O(degree) | `graph` adjacency |
 | `edges_from_with_type(oid, t)` | O(degree) | `graph` adjacency + filter |
 | `traverse(start, depth)` | O(V + E within depth) | `neighbours` BFS |
-| `vector_search(q, f, n)` | O(n_vectors) | `vector_index` cosine scan |
+| `vector_search(q, f, n)` | O(log n) approx with HNSW when live count ≥ 1 000 / model; else O(n) brute cosine | `vector_index` |
 | `rebuild_indexes()` | O(n_commits) | Full version store replay |
-| `open()` — WAL replay | O(n_commits) | WAL sequential read |
+| `open()` — clean reopen | O(delta) with snapshot fast path; else O(n_commits) WAL replay | `store.snap` + WAL |
 
 ---
 
