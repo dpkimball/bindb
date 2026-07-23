@@ -332,3 +332,138 @@ fn edge_change_survives_crash_recovery() {
     );
     store2.close().unwrap();
 }
+
+// ─── commit_many ──────────────────────────────────────────────────────────────
+
+#[test]
+fn commit_many_returns_correct_count() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let batch: Vec<(Transaction, String, String)> = (0..10)
+        .map(|i| {
+            let mut tx = Transaction::new();
+            tx.put_object(ObjectId::new(format!("a://obj{i}")), vec![i as u8]);
+            (tx, "actor".into(), format!("msg {i}"))
+        })
+        .collect();
+
+    let ids = store.commit_many(batch).unwrap();
+    assert_eq!(ids.len(), 10);
+    store.close().unwrap();
+}
+
+#[test]
+fn commit_many_all_survive_crash_recovery() {
+    let dir = tmp();
+    let path = dir.path().to_path_buf();
+
+    let ids = {
+        let store = BinderStore::open(&path).unwrap();
+        let batch: Vec<(Transaction, String, String)> = (0..5)
+            .map(|i| {
+                let mut tx = Transaction::new();
+                tx.put_object(ObjectId::new(format!("a://n{i}")), vec![i as u8]);
+                (tx, "actor".into(), format!("msg {i}"))
+            })
+            .collect();
+        let ids = store.commit_many(batch).unwrap();
+        drop(store); // crash
+        ids
+    };
+
+    let store2 = BinderStore::open(&path).unwrap();
+    let commits = store2.scan_commits().unwrap();
+    assert_eq!(commits.len(), 5, "all batch commits must survive crash");
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(&commits[i].commit_id, id);
+    }
+    assert_eq!(store2.head().unwrap(), Some(*ids.last().unwrap()));
+    store2.close().unwrap();
+}
+
+#[test]
+fn commit_many_empty_batch_is_noop() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let ids = store.commit_many(vec![]).unwrap();
+    assert!(ids.is_empty());
+    assert!(store.scan_commits().unwrap().is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn commit_many_rejects_empty_transaction_in_batch() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut good = Transaction::new();
+    good.put_object(ObjectId::new("a://x"), b"v".to_vec());
+    let empty = Transaction::new();
+
+    let result = store.commit_many(vec![
+        (good, "actor".into(), "good".into()),
+        (empty, "actor".into(), "empty".into()),
+    ]);
+    assert!(
+        matches!(result, Err(StoreError::EmptyTransaction)),
+        "batch with an empty tx must be rejected wholesale"
+    );
+    assert!(
+        store.scan_commits().unwrap().is_empty(),
+        "no commits must be written when validation fails"
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn commit_many_objects_visible_after_batch() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let batch: Vec<(Transaction, String, String)> = (0..5)
+        .map(|i| {
+            let mut tx = Transaction::new();
+            tx.put_object(ObjectId::new(format!("a://k{i}")), vec![i as u8 * 2]);
+            (tx, "actor".into(), format!("k{i}"))
+        })
+        .collect();
+
+    store.commit_many(batch).unwrap();
+
+    for i in 0..5usize {
+        let oid = ObjectId::new(format!("a://k{i}"));
+        let v = store.get(&oid).unwrap();
+        assert!(
+            v.is_some(),
+            "object a://k{i} must be visible after commit_many"
+        );
+        assert_eq!(
+            v.unwrap().payload.as_deref(),
+            Some([i as u8 * 2].as_slice())
+        );
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn commit_many_parent_chain_is_correct() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let batch: Vec<(Transaction, String, String)> = (0..3)
+        .map(|i| {
+            let mut tx = Transaction::new();
+            tx.put_object(ObjectId::new(format!("a://p{i}")), vec![i as u8]);
+            (tx, "actor".into(), format!("p{i}"))
+        })
+        .collect();
+
+    let ids = store.commit_many(batch).unwrap();
+    let commits = store.scan_commits().unwrap();
+
+    assert_eq!(commits[0].parent_commit, None);
+    assert_eq!(commits[1].parent_commit, Some(ids[0]));
+    assert_eq!(commits[2].parent_commit, Some(ids[1]));
+    store.close().unwrap();
+}

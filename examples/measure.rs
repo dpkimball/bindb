@@ -58,6 +58,26 @@ fn main() {
         );
     }
 
+    // ── 2b. commit_many batch API ────────────────────────────────────
+    for &n in &[1_000usize, 10_000, 50_000] {
+        let dir = tempdir().unwrap();
+        let store = BinderStore::open(dir.path()).unwrap();
+        let batch: Vec<(bindb::Transaction, String, String)> = (0..n)
+            .map(|i| {
+                let mut tx = bindb::Transaction::new();
+                tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
+                (tx, "m".to_string(), String::new())
+            })
+            .collect();
+        let t = Instant::now();
+        store.commit_many(batch).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "commit_many     ({n:>6} batch):   {:>8.0} writes/sec   (single-lock + 1 fsync)",
+            n as f64 / secs
+        );
+    }
+
     // ── 3. get() latency ─────────────────────────────────────────────
     {
         let dir = tempdir().unwrap();

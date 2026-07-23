@@ -290,6 +290,93 @@ impl BinderStore {
         Ok(commit_id)
     }
 
+    /// Commit multiple transactions as a single durable batch.
+    ///
+    /// Equivalent to calling `commit_buffered()` N times then `flush()`, but
+    /// acquires the write lock and WAL file handle exactly once for the entire
+    /// batch.  This eliminates per-commit lock overhead and issues a single
+    /// fsync for all N frames.
+    ///
+    /// - Returns a `Vec<CommitId>` in the same order as the input.
+    /// - An empty `batch` is a no-op that returns `Ok(vec![])`.
+    /// - Any empty `Transaction` in the batch causes the entire call to fail
+    ///   with `StoreError::EmptyTransaction` before touching the WAL.
+    pub fn commit_many(
+        &self,
+        batch: Vec<(Transaction, String, String)>,
+    ) -> Result<Vec<CommitId>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (tx, _, _) in &batch {
+            if tx.is_empty() {
+                return Err(StoreError::EmptyTransaction);
+            }
+        }
+
+        let _write_guard = self.write_lock.lock().unwrap();
+
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let n = batch.len();
+        let mut commit_ids = Vec::with_capacity(n);
+        let mut prepared = Vec::with_capacity(n);
+        let mut parent = *self.head.lock().unwrap();
+
+        // Build all BinderCommit structs and write them to the WAL in one
+        // lock hold, then fsync once.
+        {
+            let mut wal = self.wal.lock().unwrap();
+            for (tx, actor, message) in batch {
+                let commit_id = CommitId::new();
+                let commit = BinderCommit {
+                    commit_id,
+                    parent_commit: parent,
+                    timestamp_ms,
+                    actor,
+                    message,
+                    object_changes: tx.object_changes,
+                    relationship_changes: tx.relationship_changes,
+                };
+                wal.append_no_sync(&commit)?;
+                parent = Some(commit_id);
+                commit_ids.push(commit_id);
+                prepared.push(commit);
+            }
+            wal.fsync()?;
+        }
+
+        // Pre-size shared Vecs once for the entire batch before the per-commit
+        // apply loop so the inner reserve() calls in apply_commit_to_memory
+        // are no-ops.
+        {
+            let total_objects: usize = prepared.iter().map(|c| c.object_changes.len()).sum();
+            let total_edges: usize = prepared.iter().map(|c| c.relationship_changes.len()).sum();
+            self.object_versions.lock().unwrap().reserve(total_objects);
+            self.edge_versions.lock().unwrap().reserve(total_edges);
+            self.head_object_positions
+                .lock()
+                .unwrap()
+                .reserve(total_objects);
+            self.head_edge_positions
+                .lock()
+                .unwrap()
+                .reserve(total_edges);
+        }
+
+        for (commit_id, commit) in commit_ids.iter().copied().zip(prepared) {
+            self.apply_commit_to_memory(commit_id, commit);
+        }
+
+        Ok(commit_ids)
+    }
+
     /// Fsync the WAL — makes all preceding `commit_buffered()` calls durable.
     /// No-op if there is nothing pending.  Always called by `close()`.
     pub fn flush(&self) -> Result<(), StoreError> {
