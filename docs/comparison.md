@@ -42,25 +42,26 @@ bindb replaces this architecture with one embedded engine.
 
 ## Feature comparison matrix
 
-| Capability | bindb | SQLite | MongoDB | Neo4j | Weaviate | ClickHouse | PostgreSQL |
-|-----------|:-----:|:------:|:-------:|:-----:|:--------:|:----------:|:----------:|
-| **Embedded — no daemon** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Single-directory deploy** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Document / object storage** | ✅ | ⚠️ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| **Graph relationships** | ✅ | ❌ | ❌ | ✅ | ⚠️ | ❌ | ❌ |
-| **Vector / semantic search** | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ⚠️ |
-| **Time-series / observations** | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ⚠️ |
-| **Full version history** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Point-in-time queries** | ✅ | ❌ | ❌ | ❌ | ❌ | ⚠️ | ❌ |
-| **Provenance on every write** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **WAL-first durability** | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
-| **ACID transactions** | ⚠️ | ✅ | ✅ | ✅ | ❌ | ⚠️ | ✅ |
-| **SQL query language** | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| **Full-text search** | ❌ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
-| **Schema enforcement** | ❌ | ⚠️ | ❌ | ⚠️ | ✅ | ✅ | ✅ |
-| **Horizontal scaling** | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Multi-process / concurrent writers** | ❌ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Zero operational overhead** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Capability | bindb | SQLite | DuckDB | MongoDB | Neo4j | Weaviate | ClickHouse | PostgreSQL |
+|-----------|:-----:|:------:|:------:|:-------:|:-----:|:--------:|:----------:|:----------:|
+| **Embedded — no daemon** | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Single-directory deploy** | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Document / object storage** | ✅ | ⚠️ | ⚠️ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
+| **Graph relationships** | ✅ | ❌ | ❌ | ❌ | ✅ | ⚠️ | ❌ | ❌ |
+| **Vector / semantic search** | ✅ | ❌ | ⚠️ | ❌ | ❌ | ✅ | ❌ | ⚠️ |
+| **Time-series / observations** | ✅ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ⚠️ |
+| **Analytical aggregations** | ❌ | ⚠️ | ✅ | ⚠️ | ❌ | ❌ | ✅ | ✅ |
+| **Full version history** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Point-in-time queries** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ | ❌ |
+| **Provenance on every write** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **WAL-first durability** | ✅ | ✅ | ⚠️ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
+| **ACID transactions** | ⚠️ | ✅ | ✅ | ✅ | ✅ | ❌ | ⚠️ | ✅ |
+| **SQL query language** | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **Full-text search** | ❌ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
+| **Schema enforcement** | ❌ | ⚠️ | ✅ | ❌ | ⚠️ | ✅ | ✅ | ✅ |
+| **Horizontal scaling** | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Multi-process / concurrent writers** | ❌ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Zero operational overhead** | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 **Key:** ✅ First-class support · ⚠️ Partial or via extension · ❌ Not supported
 
@@ -90,6 +91,71 @@ or the team has existing SQL expertise.
 **Choose bindb when:** the data is semantic and graph-connected, version history and
 provenance matter, or the application needs to query across objects, relationships,
 embeddings, and observations without application-layer joins.
+
+---
+
+## vs DuckDB
+
+DuckDB is the embedded database most similar to bindb in deployment model — no daemon,
+single directory, library API, zero ops.  Where SQLite is "the embedded OLTP database",
+DuckDB is "the embedded OLAP database."  It is an exceptional choice for analytical
+workloads and increasingly popular as a local-first data science tool.
+
+| Dimension | bindb | DuckDB |
+|-----------|-------|--------|
+| Deployment | Embedded library | Embedded library |
+| Primary orientation | OLTP — many small writes, semantic reads | OLAP — large scans, aggregations |
+| Storage model | Append-only WAL (row-oriented) | Columnar (PAX layout) |
+| Write throughput | ~120 durable commits/sec; ~5 K+ buffered/sec | Excellent for bulk inserts; slow for single-row OLTP |
+| Analytical read throughput | Not applicable (in-memory row indexes) | Sub-second over millions of rows via vectorized execution |
+| Query language | Rust API | SQL (highly compatible with PostgreSQL dialect) |
+| Graph relationships | First-class BFS traversal | Not available |
+| Vector / semantic search | Cosine similarity built-in | Array distance functions (not ANN) |
+| Time-series / observations | Typed observation model | Via SQL window functions |
+| Full version history | Every write versioned automatically | Not available |
+| Point-in-time queries | `object_as_of(id, commit)` | Not available |
+| Provenance | Built-in per-write field | Manual columns |
+| Schema | Schema-free (raw bytes) | Strongly typed columns |
+| External data sources | No | Reads Parquet, CSV, JSON, Arrow, S3 directly |
+| Python / data science integration | No | Excellent (native pandas/polars integration) |
+| Multi-process writes | Single process | Single writer (multiple readers) |
+| Horizontal scaling | No | MotherDuck (cloud extension) |
+
+**The OLTP / OLAP divide:**  DuckDB is deliberately not optimized for high-frequency small
+writes.  Its columnar storage shines when scanning millions of rows with filters and
+aggregations — the opposite of bindb's workload of thousands of individual object commits
+per session.  Attempting to use DuckDB as an OLTP store (one `INSERT` per user action)
+produces poor performance; attempting to use bindb for ad-hoc analytical SQL is not
+possible today.
+
+**The analytical gap:**  DuckDB's SQL engine can answer questions like "what is the
+average sleep duration per month for the last 2 years, grouped by weekday" in milliseconds
+over millions of rows.  bindb has no aggregation layer — this query requires reading all
+observations into application memory and computing the result in Rust.  A SQL projection
+layer over bindb's WAL is on the long-term roadmap.
+
+**Complementary, not competing:**  bindb and DuckDB serve different phases of a data
+pipeline.  bindb is the live operational store — every user action commits to it with full
+provenance and version history.  DuckDB is a natural fit as an analytical projection layer
+— periodically export bindb's observation history to Parquet, query it with DuckDB SQL
+for dashboards and reports.
+
+```
+bindb (live store)  →  export observations as Parquet  →  DuckDB (analytics)
+       │                                                          │
+  semantic queries                                        SQL aggregations
+  graph traversal                                         window functions
+  version history                                         external data joins
+```
+
+**Choose DuckDB when:** the workload is primarily analytical (aggregations, window
+functions, large scans), SQL is required, external data sources (Parquet, CSV, S3) need
+to be joined with application data, or data science tooling (pandas, polars) is the
+primary consumer.
+
+**Choose bindb when:** the workload is OLTP (many small writes per session), version
+history and provenance are required, graph relationships are central, or the data is
+semantic and multi-modal (objects + edges + observations + vectors).
 
 ---
 
@@ -302,14 +368,19 @@ are not yet supported.  Memory-mapped index structures are a future consideratio
 ## Decision guide
 
 ```
-Need SQL + relational schema + multi-process?         → PostgreSQL or SQLite
-Need petabyte analytics + columnar aggregations?      → ClickHouse
-Need complex Cypher graph patterns at enterprise scale? → Neo4j
-Need ANN vector search at > 100 K vectors?            → Weaviate
+Need SQL + relational schema + multi-process?              → PostgreSQL or SQLite
+Need embedded SQL analytics + aggregations + Parquet/S3?   → DuckDB
+Need petabyte analytics + columnar SQL at daemon scale?    → ClickHouse
+Need complex Cypher graph patterns at enterprise scale?    → Neo4j
+Need ANN vector search at > 100 K vectors?                 → Weaviate
 
 Need unified objects + graph + vectors + observations
   in a single embedded store, with full version history
-  and provenance, for a desktop or single-tenant app?  → bindb
+  and provenance, for a desktop or single-tenant app?      → bindb
+
+Running live operational writes in bindb AND need
+  analytical SQL over the historical record?               → bindb + DuckDB
+                                                             (export WAL → Parquet → query)
 ```
 
 bindb is the right choice when the application's **primary complexity is in the data
