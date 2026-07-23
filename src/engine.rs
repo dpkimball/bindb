@@ -5,6 +5,7 @@ use crate::error::StoreError;
 use crate::index::graph::GraphIndex;
 use crate::index::head_edge::HeadEdgeIndex;
 use crate::index::head_object::HeadObjectIndex;
+use crate::index::namespace::NamespaceObjectIndex;
 use crate::namespace::NamespaceRegistry;
 use crate::object::BinderObjectVersion;
 use crate::query;
@@ -37,6 +38,9 @@ pub struct BinderStore {
     head_edges: Mutex<HeadEdgeIndex>,
     graph: Mutex<GraphIndex>,
     neighbours: Mutex<HashMap<ObjectId, Vec<ObjectId>>>,
+    /// Secondary index: namespace scheme → live ObjectIds.  Turns list() from
+    /// O(n_all_versions_ever) into O(k_live_in_namespace).  Non-canonical.
+    namespace_index: Mutex<NamespaceObjectIndex>,
     namespace_registry: Mutex<NamespaceRegistry>,
     vector_index: Mutex<VectorIndex>,
 }
@@ -65,6 +69,9 @@ impl BinderStore {
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
         let neighbours =
             GraphIndex::build_neighbour_map(edge_versions.iter().filter(|v| !v.is_tombstone()));
+        let namespace_index = NamespaceObjectIndex::rebuild(
+            object_versions.iter().filter(|v| v.valid_to.is_none()),
+        );
 
         // Load vector projection from previous clean close, if present.
         let vector_index = load_vector_projection(store_path);
@@ -84,6 +91,7 @@ impl BinderStore {
             head_edges: Mutex::new(head_edges),
             graph: Mutex::new(graph),
             neighbours: Mutex::new(neighbours),
+            namespace_index: Mutex::new(namespace_index),
             namespace_registry: Mutex::new(NamespaceRegistry::new()),
             vector_index: Mutex::new(vector_index),
         })
@@ -173,17 +181,96 @@ impl BinderStore {
         // WAL-first: fsync before updating in-memory state (I-3).
         self.wal.lock().unwrap().append(&commit)?;
 
-        // Derive version records.
+        self.apply_commit_to_memory(commit_id, commit);
+        Ok(commit_id)
+    }
+
+    /// Like `commit` but skips the per-commit fsync.  In-memory state is
+    /// updated immediately so reads are consistent, but the data is not durable
+    /// until `flush()` is called.  Use for bulk ingestion where throughput
+    /// matters more than per-write crash safety.
+    ///
+    /// Always call `flush()` (or `close()`) before the process exits.
+    pub fn commit_buffered(
+        &self,
+        tx: Transaction,
+        actor: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<CommitId, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        if tx.is_empty() {
+            return Err(StoreError::EmptyTransaction);
+        }
+
+        let actor: String = actor.into();
+        let message: String = message.into();
+        let _write_guard = self.write_lock.lock().unwrap();
+
+        let parent_commit = *self.head.lock().unwrap();
+        let commit_id = CommitId::new();
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let commit = BinderCommit {
+            commit_id,
+            parent_commit,
+            timestamp_ms,
+            actor,
+            message,
+            object_changes: tx.object_changes,
+            relationship_changes: tx.relationship_changes,
+        };
+
+        // Write WAL frame without fsync — data loss window until flush() is called.
+        self.wal.lock().unwrap().append_no_sync(&commit)?;
+
+        self.apply_commit_to_memory(commit_id, commit);
+
+        Ok(commit_id)
+    }
+
+    /// Fsync the WAL — makes all preceding `commit_buffered()` calls durable.
+    /// No-op if there is nothing pending.  Always called by `close()`.
+    pub fn flush(&self) -> Result<(), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        self.wal.lock().unwrap().fsync()
+    }
+
+    /// Apply a committed `BinderCommit` to all in-memory indexes.
+    /// Called by both `commit_with_namespace` (after WAL fsync) and
+    /// `commit_buffered` (after WAL write without fsync).
+    fn apply_commit_to_memory(&self, commit_id: CommitId, commit: BinderCommit) {
         let new_ovs = derive_object_versions_for_commit(&commit);
         let new_evs = derive_edge_versions_for_commit(&commit);
 
-        // Update version stores and HEAD indexes atomically (under write_lock).
         {
             let mut ovs = self.object_versions.lock().unwrap();
             let mut hobj = self.head_objects.lock().unwrap();
-            retire_superseded_object_versions(&mut ovs, &new_ovs, commit_id);
+            let mut nsidx = self.namespace_index.lock().unwrap();
+
+            // Retire superseded versions and remove their namespace index entries.
+            let superseded: std::collections::HashSet<&ObjectId> =
+                new_ovs.iter().map(|v| &v.object_id).collect();
+            for v in ovs.iter_mut() {
+                if superseded.contains(&v.object_id) && v.valid_to.is_none() {
+                    v.valid_to = Some(commit_id);
+                    nsidx.remove(&v.object_id);
+                }
+            }
+
             for v in &new_ovs {
                 hobj.upsert(v.clone());
+                if !v.is_tombstone() {
+                    nsidx.insert(&v.object_id);
+                } else {
+                    nsidx.remove(&v.object_id);
+                }
             }
             ovs.extend(new_ovs);
         }
@@ -193,11 +280,9 @@ impl BinderStore {
             let mut graph = self.graph.lock().unwrap();
             let mut nbrs = self.neighbours.lock().unwrap();
 
-            // Remove old edge HEAD entries from graph index before retiring.
             for new_ev in &new_evs {
                 if let Some(old) = hedge.get(&new_ev.edge_id) {
                     graph.remove(old);
-                    // Remove from neighbour map.
                     if let (Some(from), Some(to)) = (&old.from_object, &old.to_object) {
                         if let Some(tos) = nbrs.get_mut(from) {
                             tos.retain(|t| t != to);
@@ -222,8 +307,6 @@ impl BinderStore {
 
         *self.head.lock().unwrap() = Some(commit_id);
         self.commits.lock().unwrap().push(commit);
-
-        Ok(commit_id)
     }
 
     // ── query API ─────────────────────────────────────────────────────────────
@@ -246,14 +329,18 @@ impl BinderStore {
 
     /// All live (non-tombstone) current object versions whose object_id starts
     /// with `namespace_prefix`.
+    ///
+    /// Uses the namespace secondary index for O(k) performance where k is the
+    /// number of live objects in the namespace, rather than scanning all versions.
     pub fn list(&self, namespace_prefix: &str) -> Result<Vec<BinderObjectVersion>, StoreError> {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let ovs = self.object_versions.lock().unwrap();
-        Ok(query::list_live_by_namespace(&ovs, namespace_prefix)
-            .into_iter()
-            .cloned()
+        let object_ids = self.namespace_index.lock().unwrap().matching(namespace_prefix);
+        let head = self.head_objects.lock().unwrap();
+        Ok(object_ids
+            .iter()
+            .filter_map(|oid| head.get(oid).filter(|v| !v.is_tombstone()).cloned())
             .collect())
     }
 
@@ -405,10 +492,15 @@ impl BinderStore {
         drop(ovs);
         drop(evs);
 
+        let new_namespace_index = NamespaceObjectIndex::rebuild(
+            new_head_objects.all_live(),
+        );
+
         *self.head_objects.lock().unwrap() = new_head_objects;
         *self.head_edges.lock().unwrap() = new_head_edges;
         *self.graph.lock().unwrap() = new_graph;
         *self.neighbours.lock().unwrap() = new_neighbours;
+        *self.namespace_index.lock().unwrap() = new_namespace_index;
 
         Ok(())
     }

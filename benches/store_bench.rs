@@ -68,6 +68,35 @@ fn bench_commit_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+// ── buffered commit throughput ───────────────────────────────────────────────
+
+fn bench_commit_buffered_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("commit_buffered_throughput");
+
+    for n in [100usize, 1_000, 10_000] {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(
+            BenchmarkId::new("single_object_per_commit_buffered", n),
+            &n,
+            |b, &n| {
+                b.iter(|| {
+                    let dir = tmp();
+                    let store = BinderStore::open(dir.path()).unwrap();
+                    for i in 0..n {
+                        let mut tx = Transaction::new();
+                        tx.put_object(obj(format!("o{i}")), vec![0u8; 64]);
+                        store.commit_buffered(tx, "bench", "").unwrap();
+                    }
+                    store.flush().unwrap();
+                    store.close().unwrap();
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 // ── get latency ──────────────────────────────────────────────────────────────
 
 fn bench_get_latency(c: &mut Criterion) {
@@ -211,6 +240,7 @@ fn bench_cold_startup(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_commit_throughput,
+    bench_commit_buffered_throughput,
     bench_get_latency,
     bench_graph_traversal,
     bench_index_rebuild,

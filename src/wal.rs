@@ -40,6 +40,24 @@ impl Wal {
     }
 
     pub fn append(&mut self, commit: &BinderCommit) -> Result<(), StoreError> {
+        self.write_frame(commit)?;
+        self.fsync()?;
+        Ok(())
+    }
+
+    /// Write the WAL frame without fsyncing. Callers must call `fsync()` before
+    /// the data is durable. Used by `commit_buffered()` to coalesce fsyncs across
+    /// many commits — trading per-commit durability for throughput.
+    ///
+    /// # Safety
+    /// If the process crashes before `fsync()` is called, all commits written
+    /// with `append_no_sync()` since the last fsync are lost. The dirty marker
+    /// ensures WAL replay will discard partial frames on recovery.
+    pub fn append_no_sync(&mut self, commit: &BinderCommit) -> Result<(), StoreError> {
+        self.write_frame(commit)
+    }
+
+    fn write_frame(&mut self, commit: &BinderCommit) -> Result<(), StoreError> {
         let data = WalEntryData {
             commit: commit.clone(),
         };
@@ -58,7 +76,6 @@ impl Wal {
         self.file.write_all(&data_len.to_le_bytes())?;
         self.file.write_all(&encoded)?;
         self.file.write_all(&crc.to_le_bytes())?;
-        self.fsync()?;
 
         self.next_entry_id += 1;
         Ok(())
