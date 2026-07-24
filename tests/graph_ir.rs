@@ -1,4 +1,4 @@
-use bindb::{BinderStore, EdgeId, GraphIrQuery, ObjectId, Transaction};
+use bindb::{BinderStore, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError, ObjectId, Transaction};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -281,6 +281,140 @@ fn ir_return_path_and_field_combined() {
             .collect::<Vec<_>>(),
         vec!["p://root", "p://leaf"]
     );
+
+    store.close().unwrap();
+}
+
+// ── write IR tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn write_ir_create_node_and_read_back() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let cid = store
+        .graph_ir_write(r#"CREATE NODE id="note://foo" payload={"text":"hello"}"#)
+        .unwrap();
+    assert!(cid.is_some());
+
+    let obj = store.get(&ObjectId::new("note://foo")).unwrap();
+    assert!(obj.is_some());
+    let payload: serde_json::Value =
+        serde_json::from_slice(obj.unwrap().payload.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["text"], "hello");
+
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_merge_node_skips_existing() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    // First write creates the node.
+    store
+        .graph_ir_write(r#"CREATE NODE id="note://bar" payload={"v":1}"#)
+        .unwrap();
+
+    // MERGE should not overwrite an existing node — returns None (no commit).
+    let cid = store
+        .graph_ir_write(r#"MERGE NODE id="note://bar" payload={"v":2}"#)
+        .unwrap();
+    assert!(cid.is_none());
+
+    // Value should still be 1.
+    let obj = store.get(&ObjectId::new("note://bar")).unwrap().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_slice(obj.payload.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["v"], 1);
+
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_create_edge_and_traverse() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    store
+        .graph_ir_write(
+            r#"
+CREATE NODE id="note://a" payload={"label":"alpha"}
+CREATE NODE id="note://b" payload={"label":"beta"}
+CREATE EDGE id="e_ab" from="note://a" to="note://b" label="LINKS_TO"
+"#,
+        )
+        .unwrap();
+
+    let edges = store.edges_from(&ObjectId::new("note://a")).unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].to_object.as_ref().unwrap().0, "note://b");
+    assert_eq!(edges[0].relationship_type.as_deref(), Some("LINKS_TO"));
+
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_merge_edge_skips_existing() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    store
+        .graph_ir_write(
+            r#"
+CREATE NODE id="p://x" payload={}
+CREATE NODE id="p://y" payload={}
+CREATE EDGE id="e_xy" from="p://x" to="p://y" label="KNOWS"
+"#,
+        )
+        .unwrap();
+
+    // MERGE EDGE for existing id should return None.
+    let cid = store
+        .graph_ir_write(
+            r#"MERGE EDGE id="e_xy" from="p://x" to="p://y" label="KNOWS""#,
+        )
+        .unwrap();
+    assert!(cid.is_none());
+
+    // Still only one edge.
+    let edges = store.edges_from(&ObjectId::new("p://x")).unwrap();
+    assert_eq!(edges.len(), 1);
+
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_parse_error_unknown_verb() {
+    let err = GraphIrWrite::parse("UPSERT NODE id=\"x\" payload={}").unwrap_err();
+    assert!(matches!(err, GraphIrWriteError::UnknownVerb { line: 1 }));
+}
+
+#[test]
+fn write_ir_parse_error_missing_field() {
+    let err = GraphIrWrite::parse("CREATE NODE payload={}").unwrap_err();
+    assert!(matches!(err, GraphIrWriteError::MissingField { field: "id", line: 1 }));
+}
+
+#[test]
+fn write_ir_comments_and_blank_lines_ignored() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    store
+        .graph_ir_write(
+            r#"
+// create two nodes
+CREATE NODE id="n://1" payload={"x":1}
+
+# another comment
+CREATE NODE id="n://2" payload={"x":2}
+"#,
+        )
+        .unwrap();
+
+    assert!(store.get(&ObjectId::new("n://1")).unwrap().is_some());
+    assert!(store.get(&ObjectId::new("n://2")).unwrap().is_some());
 
     store.close().unwrap();
 }
