@@ -41,7 +41,7 @@
 
 use crate::engine::BinderStore;
 use crate::error::StoreError;
-use crate::graph_query::{Direction, GraphQueryMatch};
+use crate::graph_query::{Direction, GraphQuery, GraphQueryMatch};
 use crate::types::ObjectId;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -97,11 +97,15 @@ pub struct PayloadPred {
 ///
 /// `fields` contains only the keys requested in `RETURN b.field1, b.field2`.
 /// Missing or non-JSON payloads produce no entries for that key.
+///
+/// `path` is the sequence of node IDs from the start node to `object_id`
+/// (inclusive of both endpoints) when `RETURN path` was requested; otherwise empty.
 #[derive(Debug, Clone)]
 pub struct GraphIrRow {
     pub object_id: ObjectId,
     pub depth: usize,
     pub fields: HashMap<String, serde_json::Value>,
+    pub path: Vec<ObjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +123,9 @@ pub struct GraphIrQuery {
     /// Fields to project from each matched node's JSON payload (`RETURN b.f1, b.f2`).
     /// Empty = plain node return via `graph_ir` / `graph_ir_parsed`.
     pub return_fields: Vec<String>,
+    /// When true, `graph_ir_projected` populates `GraphIrRow::path` with the
+    /// sequence of node IDs from the start node to each matched node.
+    pub return_path: bool,
 }
 
 impl GraphIrQuery {
@@ -162,7 +169,7 @@ impl GraphIrQuery {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
         let after_return = skip_keyword(after_preds2, "RETURN");
-        let return_fields = parse_return_fields(after_return);
+        let (return_fields, return_path) = parse_return_spec(after_return);
 
         Ok(GraphIrQuery {
             start,
@@ -173,6 +180,7 @@ impl GraphIrQuery {
             end_pred,
             payload_pred,
             return_fields,
+            return_path,
         })
     }
 }
@@ -521,29 +529,85 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
     }
 }
 
-/// Parse `RETURN b` → `[]` (plain node return) or
-/// `RETURN b.f1, b.f2` → `["f1", "f2"]`.
-fn parse_return_fields(s: &str) -> Vec<String> {
+/// Reconstruct the shortest-path sequence from `start` to `node` using the
+/// parent map produced by BFS. Both endpoints are included.
+fn reconstruct_path(
+    start: &ObjectId,
+    node: &ObjectId,
+    parent_map: &HashMap<ObjectId, ObjectId>,
+) -> Vec<ObjectId> {
+    let mut path = vec![node.clone()];
+    let mut current = node;
+    while let Some(parent) = parent_map.get(current) {
+        path.push(parent.clone());
+        current = parent;
+        if current == start {
+            break;
+        }
+    }
+    path.reverse();
+    path
+}
+
+/// Build a `GraphQuery` from a `GraphIrQuery` (shared by `graph_ir_parsed` and
+/// `graph_ir_projected`), factoring out the builder setup so it isn't duplicated.
+fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery<'a> {
+    let mut builder = store
+        .graph_query()
+        .from(&q.start)
+        .max_depth(q.max_depth)
+        .direction(q.direction);
+
+    if !q.edge_types.is_empty() {
+        builder = builder.edge_types(q.edge_types.clone());
+    }
+
+    builder = match &q.end_pred {
+        NodeIdPred::Any => builder,
+        NodeIdPred::StartsWith(pfx) => {
+            let pfx = pfx.clone();
+            builder.filter_node(move |obj| obj.object_id.0.starts_with(&pfx))
+        }
+        NodeIdPred::Equals(id) => {
+            let id = id.clone();
+            builder.filter_node(move |obj| obj.object_id.0 == id)
+        }
+    };
+
+    if let Some(pred) = &q.payload_pred {
+        let pred = pred.clone();
+        builder = builder.filter_node(move |obj| {
+            apply_payload_pred(obj.payload.as_deref().unwrap_or(&[]), &pred)
+        });
+    }
+
+    builder
+}
+
+/// Parse `RETURN b` → `([], false)`,
+/// `RETURN b.f1, b.f2` → `(["f1", "f2"], false)`,
+/// `RETURN path` → `([], true)`,
+/// `RETURN b.sentiment, path` → `(["sentiment"], true)`.
+fn parse_return_spec(s: &str) -> (Vec<String>, bool) {
     let s = s.trim();
     if s.is_empty() {
-        return vec![];
+        return (vec![], false);
     }
     let mut fields = Vec::new();
+    let mut return_path = false;
     for part in s.split(',') {
         let p = part.trim();
-        // Strip the "b." / "B." prefix; bare "b" means no field projection.
-        if let Some(field) = p
-            .strip_prefix("b.")
-            .or_else(|| p.strip_prefix("B."))
-        {
+        if p.eq_ignore_ascii_case("path") {
+            return_path = true;
+        } else if let Some(field) = p.strip_prefix("b.").or_else(|| p.strip_prefix("B.")) {
             let f = field.trim().to_string();
             if !f.is_empty() {
                 fields.push(f);
             }
         }
-        // "b" alone → plain return; ignore (fields stays empty for this token)
+        // "b" alone → plain return; ignore
     }
-    fields
+    (fields, return_path)
 }
 
 impl BinderStore {
@@ -557,53 +621,29 @@ impl BinderStore {
 
     /// Execute a pre-parsed restricted graph IR query.
     pub fn graph_ir_parsed(&self, q: &GraphIrQuery) -> Result<Vec<GraphQueryMatch>, StoreError> {
-        let mut builder = self
-            .graph_query()
-            .from(&q.start)
-            .max_depth(q.max_depth)
-            .direction(q.direction);
-
-        if !q.edge_types.is_empty() {
-            builder = builder.edge_types(q.edge_types.clone());
-        }
-
-        builder = match &q.end_pred {
-            NodeIdPred::Any => builder,
-            NodeIdPred::StartsWith(pfx) => {
-                let pfx = pfx.clone();
-                builder.filter_node(move |obj| obj.object_id.0.starts_with(&pfx))
-            }
-            NodeIdPred::Equals(id) => {
-                let id = id.clone();
-                builder.filter_node(move |obj| obj.object_id.0 == id)
-            }
-        };
-
-        if let Some(pred) = &q.payload_pred {
-            let pred = pred.clone();
-            builder = builder.filter_node(move |obj| {
-                apply_payload_pred(obj.payload.as_deref().unwrap_or(&[]), &pred)
-            });
-        }
-
-        let mut matches = builder.execute()?;
+        let mut matches = build_graph_query(self, q).execute()?;
         if q.min_depth > 1 {
             matches.retain(|m| m.depth >= q.min_depth);
         }
         Ok(matches)
     }
 
-    /// Execute a pre-parsed query with field projections (`RETURN b.f1, b.f2`).
+    /// Execute a pre-parsed query with field projections and/or path collection.
     ///
-    /// Each returned [`GraphIrRow`] contains the matched node's id, traversal depth,
-    /// and a map of the requested fields extracted from its JSON payload.
-    /// Fields absent from the payload or non-JSON payloads produce no entry for
-    /// that key rather than an error.
+    /// - `RETURN b.f1, b.f2` → `GraphIrRow::fields` contains the projected JSON fields.
+    /// - `RETURN path` → `GraphIrRow::path` contains the node-id sequence from start to match.
+    /// - Both may be combined: `RETURN b.sentiment, path`.
     ///
-    /// If `q.return_fields` is empty this method still works but `fields` will
-    /// always be empty — prefer `graph_ir_parsed` for plain node return.
+    /// Fields absent from the payload or non-JSON payloads produce no entry for that key.
+    /// For plain `RETURN b`, prefer `graph_ir_parsed` which avoids the overhead of path tracking.
     pub fn graph_ir_projected(&self, q: &GraphIrQuery) -> Result<Vec<GraphIrRow>, StoreError> {
-        let matches = self.graph_ir_parsed(q)?;
+        let (matches, parent_map) = if q.return_path {
+            self.execute_graph_query_with_paths(build_graph_query(self, q))?
+        } else {
+            (self.graph_ir_parsed(q)?, HashMap::new())
+        };
+
+        let start = &q.start;
         let rows = matches
             .into_iter()
             .map(|m| {
@@ -621,10 +661,16 @@ impl BinderStore {
                         }
                     }
                 }
+                let path = if q.return_path {
+                    reconstruct_path(start, &m.object.object_id, &parent_map)
+                } else {
+                    vec![]
+                };
                 GraphIrRow {
                     object_id: m.object.object_id.clone(),
                     depth: m.depth,
                     fields,
+                    path,
                 }
             })
             .collect();
@@ -710,19 +756,16 @@ mod tests {
 
     #[test]
     fn parses_return_single_field() {
-        let q = GraphIrQuery::parse(
-            "MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b.sentiment",
-        )
-        .unwrap();
+        let q =
+            GraphIrQuery::parse("MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b.sentiment").unwrap();
         assert_eq!(q.return_fields, vec!["sentiment"]);
     }
 
     #[test]
     fn parses_return_multiple_fields() {
-        let q = GraphIrQuery::parse(
-            "MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b.sentiment, b.label",
-        )
-        .unwrap();
+        let q =
+            GraphIrQuery::parse("MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b.sentiment, b.label")
+                .unwrap();
         assert_eq!(q.return_fields, vec!["sentiment", "label"]);
     }
 }

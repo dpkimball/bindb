@@ -204,3 +204,83 @@ fn ir_projected_extracts_fields() {
 
     store.close().unwrap();
 }
+
+#[test]
+fn ir_return_path_collects_shortest_path() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    // Chain: a → b → c
+    let mut tx = Transaction::new();
+    tx.put_object(obj("n://a"), b"{}".to_vec());
+    tx.put_object(obj("n://b"), b"{}".to_vec());
+    tx.put_object(obj("n://c"), b"{}".to_vec());
+    tx.put_edge(eid("e1"), obj("n://a"), obj("n://b"), "STEP", None);
+    tx.put_edge(eid("e2"), obj("n://b"), obj("n://c"), "STEP", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse("MATCH (a)-[:STEP*1..3]->(b) WHERE id(a) = 'n://a' RETURN path")
+        .unwrap();
+    assert!(q.return_path);
+    assert!(q.return_fields.is_empty());
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 2); // b and c
+
+    let row_b = rows.iter().find(|r| r.object_id.0 == "n://b").unwrap();
+    assert_eq!(
+        row_b
+            .path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["n://a", "n://b"]
+    );
+
+    let row_c = rows.iter().find(|r| r.object_id.0 == "n://c").unwrap();
+    assert_eq!(
+        row_c
+            .path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["n://a", "n://b", "n://c"]
+    );
+
+    store.close().unwrap();
+}
+
+#[test]
+fn ir_return_path_and_field_combined() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("p://root"), b"{}".to_vec());
+    tx.put_object(obj("p://leaf"), br#"{"score":42}"#.to_vec());
+    tx.put_edge(eid("e1"), obj("p://root"), obj("p://leaf"), "HAS", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:HAS]->(b) WHERE id(a) = 'p://root' RETURN b.score, path")
+            .unwrap();
+    assert!(q.return_path);
+    assert_eq!(q.return_fields, vec!["score"]);
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("score").and_then(|v| v.as_f64()),
+        Some(42.0)
+    );
+    assert_eq!(
+        rows[0]
+            .path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p://root", "p://leaf"]
+    );
+
+    store.close().unwrap();
+}

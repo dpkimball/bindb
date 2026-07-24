@@ -5,7 +5,7 @@ Last updated: 2026-07-24. Prefer this over stale issue bodies.
 | Issue | State | Shipped | Remaining / follow-up |
 |-------|-------|---------|----------------------|
 | [#1](https://github.com/dpkimball/bindb/issues/1) WAL compaction | Closed | `compact()`, snapshot + WAL truncate | Ops policy for when to compact |
-| [#2](https://github.com/dpkimball/bindb/issues/2) Graph query IR | Open | Rust `GraphQuery` builder + `graph_ir()` MATCH (types, directions, id predicates, **JSON payload WHERE** `AND b.field OP value`) + **`RETURN b.f1, b.f2` field projections** (`graph_ir_projected` → `GraphIrRow`) | Full Cypher; path collection; write clauses |
+| [#2](https://github.com/dpkimball/bindb/issues/2) Graph query IR | Open | Rust `GraphQuery` builder + `graph_ir()` MATCH (types, directions, id predicates, **JSON payload WHERE** `AND b.field OP value`) + **`RETURN b.f1, b.f2` field projections** + **`RETURN path` shortest-path collection** (`graph_ir_projected` → `GraphIrRow`) | Full Cypher; write clauses |
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model | Latency SLA @ 100k (OKR O3) |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation / SQL | Open | Rust DSL + `sql_aggregate()` (COUNT/AVG/SUM/MIN/MAX/P50/P99, PATH_SEGMENT, **WHERE id STARTS WITH**) + **`export_observations_jsonl()`** (DuckDB-compatible JSONL) | Full SQL; joins; DuckDB / out-of-process projection |
