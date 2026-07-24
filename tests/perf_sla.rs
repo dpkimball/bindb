@@ -667,6 +667,10 @@ fn sla_xl_list_p99_lte_500ms_returning_100k_of_1m() {
 fn sla_xl_commit_buffered_throughput_gte_3k_per_sec_at_1m_existing() {
     let dir = tempfile::tempdir().unwrap();
     let store = build_store_xl(&dir, 1_000_000, &["a"]);
+    // Compact so the WAL is reset to a small snapshot before measuring.
+    // Without this the ~200 MB accumulated WAL makes flush() dominate the timing.
+    store.compact().unwrap();
+
     // Measure a 10 K batch written on top of 1 M existing objects.
     let n = 10_000usize;
 
