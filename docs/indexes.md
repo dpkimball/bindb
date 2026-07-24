@@ -9,33 +9,65 @@ This document describes each index, its structure, and its rebuild contract.
 ## Index map
 
 ```mermaid
-graph LR
-    WAL["WAL\n(canonical)"]
+graph TD
+    WAL["WAL\ncommits.wal — canonical source of truth"]
 
-    subgraph "Version stores (full history)"
-        OV["object_versions\nVec&lt;BinderObjectVersion&gt;"]
-        EV["edge_versions\nVec&lt;BinderEdgeVersion&gt;"]
+    subgraph RAM ["In-memory (process heap)"]
+        subgraph VS ["WAL projections — full version history"]
+            OV["object_versions\nVec&lt;BinderObjectVersion&gt;\n(valid_from · valid_to · payload)"]
+            EV["edge_versions\nVec&lt;BinderEdgeVersion&gt;\n(valid_from · valid_to · payload)"]
+        end
+
+        subgraph HEAD ["HEAD indexes — current state, O(1) lookup"]
+            HO["head_objects\nHashMap&lt;ObjectId, BinderObjectVersion&gt;"]
+            HE["head_edges\nHashMap&lt;EdgeId, BinderEdgeVersion&gt;"]
+        end
+
+        subgraph GRAPH ["Graph indexes — traversal"]
+            GR["graph\noutgoing + incoming EdgeId sets"]
+            NB["neighbours\nHashMap&lt;ObjectId, Vec&lt;ObjectId&gt;&gt;"]
+        end
+
+        subgraph SEC ["Secondary indexes"]
+            NI["namespace_index\nHashMap&lt;scheme, HashSet&lt;ObjectId&gt;&gt;"]
+            VI["vector_index\nHashMap&lt;object_id, Vec&lt;VectorEntry&gt;&gt;\n(not WAL-derived; persisted separately)"]
+        end
+
+        subgraph VSTORE ["VersionStore — temporal query layer"]
+            VSI["in-memory index\nHashMap&lt;ObjectId, Vec&lt;IndexEntry&gt;&gt;\n~40 B/version\n(valid_from · valid_to · offset)"]
+        end
     end
 
-    subgraph "HEAD indexes (current state)"
-        HO["head_objects\nHashMap&lt;ObjectId, BinderObjectVersion&gt;"]
-        HE["head_edges\nHashMap&lt;EdgeId, BinderEdgeVersion&gt;"]
+    subgraph DISK ["On-disk"]
+        VL["version_log.bin\nlength-prefixed bincode frames\n(full BinderObjectVersion payloads)\nmmap'd for reads"]
+        WF["vector_projection.bin\n(clean-close snapshot)"]
     end
 
-    subgraph "Graph indexes"
-        GR["graph\nEdgeId adjacency sets"]
-        NB["neighbours\nHashMap&lt;ObjectId, Vec&lt;ObjectId&gt;&gt;"]
-    end
+    WAL -->|"replay on open()"| OV & EV
+    OV -->|"rebuild"| HO & NI
+    EV -->|"rebuild"| HE & GR & NB
+    VI -.->|"persisted on close"| WF
 
-    subgraph "Secondary indexes"
-        NI["namespace_index\nHashMap&lt;scheme, HashSet&lt;ObjectId&gt;&gt;"]
-        VI["vector_index\nHashMap&lt;object_id, Vec&lt;VectorEntry&gt;&gt;"]
-    end
+    OV & EV -->|"rebuild_from_versions()"| VSI
+    VSI -->|"append / read offset"| VL
+    VL -->|"mmap — zero seek/read\nper lookup after map"| VSI
 
-    WAL --> OV & EV
-    OV --> HO & NI
-    EV --> HE & GR & NB
+    HO -->|"object_history()\nobject_as_of()"| VSI
+    HE -->|"edge_history()\nedge_as_of()"| VSI
 ```
+
+### Read-path routing
+
+| Query | Route |
+|-------|-------|
+| `get(id)` | `head_objects` → O(1) HashMap |
+| `list(prefix)` | `namespace_index` → O(k_live) |
+| `edges_from(id)` | `graph` → O(degree) |
+| `traverse(id, depth)` | `neighbours` BFS |
+| `object_history(id)` | `VersionStore` → mmap offset lookup |
+| `object_as_of(id, at)` | `VersionStore` → binary scan of index entries → mmap |
+| `semantic_query(vec)` | `vector_index` cosine scan |
+| `sql_aggregate(sql)` | `namespace_index` → `head_objects` filter |
 
 ---
 
@@ -44,6 +76,8 @@ graph LR
 ### `object_versions: Vec<BinderObjectVersion>`
 
 The complete, immutable history of every object version ever written, in commit order.
+Built during WAL replay; updated incrementally on each commit.
+
 Each `BinderObjectVersion` records:
 
 - `object_id` — the object it belongs to
@@ -52,11 +86,13 @@ Each `BinderObjectVersion` records:
 - `payload` — serialized content (`None` = tombstone)
 - `provenance` — optional source attribution
 
-Used for `object_history()` and `object_as_of()` queries.
+**Role:** source of truth for building HEAD/graph/namespace indexes (`rebuild_indexes()`).
+Temporal queries (`object_history`, `object_as_of`) are routed through `VersionStore`,
+not this Vec, so reads do not touch the heap for historical version payloads.
 
 ### `edge_versions: Vec<BinderEdgeVersion>`
 
-Same structure for edges.  Used for `edge_history()` and `edge_as_of()`.
+Same structure for edges.
 
 ---
 
@@ -171,6 +207,55 @@ Search uses brute-force cosine similarity; ANN structures are a future optimizat
 
 ---
 
+## VersionStore — temporal query layer
+
+`VersionStore` (`src/version_store.rs`) is a disk-backed component that decouples
+temporal query reads from the in-memory `object_versions` / `edge_versions` Vecs.
+
+### In-memory index
+
+```
+object_index: HashMap<ObjectId, Vec<IndexEntry>>
+    IndexEntry { valid_from: CommitId, valid_to: Option<CommitId>, offset: u64 }
+```
+
+Each entry is ~40 bytes — just the temporal bounds and a byte offset into the file.
+For a store with 5 M historical versions: ~200 MB (index) vs ~1 GB (full structs).
+
+### On-disk file (`version_log.bin`)
+
+Sequence of length-prefixed bincode frames:
+
+```
+[u64 payload_len LE][bincode VersionRecord]
+```
+
+`VersionRecord` variants: `Object`, `Edge`, `RetireObject { id, retired_at }`,
+`RetireEdge { id, retired_at }`. The file is purely append-only.
+
+### mmap read path
+
+After `rebuild_from_versions()` or `hydrate_index_from_file()`, the full file is
+memory-mapped (`memmap2::Mmap`). `read_record_at(offset)` indexes the mmap slice
+directly — no seek, no heap allocation per read. Appends invalidate the mapping;
+the next read lazily re-maps.
+
+### Lifecycle
+
+| Event | Action |
+|-------|--------|
+| `open()` after WAL replay | `rebuild_from_versions(&object_versions, &edge_versions)` |
+| Each `commit()` / `commit_buffered()` | `retire_object/edge()` then `append_object/edge()` |
+| `rebuild_indexes()` | `rebuild_from_versions(&ovs, &evs)` |
+| `close()` | `flush()` |
+
+### Rebuild invariant
+
+`version_log.bin` is a non-canonical projection. Truncate it and call
+`rebuild_from_versions()` at any time — the WAL is the authoritative source.
+
+---
+
 ## Rebuild
 
 `rebuild_indexes()` replays all in-memory version stores and reconstructs every index:
@@ -181,6 +266,8 @@ let new_he = HeadEdgeIndex::rebuild(&evs);
 let new_gr = GraphIndex::rebuild(live_edges);
 let new_nb = GraphIndex::build_neighbour_map(live_edges);
 let new_ni = NamespaceObjectIndex::rebuild(new_ho.all_live());
+// also:
+version_store.rebuild_from_versions(&ovs, &evs)?;
 ```
 
 Each index rebuilds from the version stores directly — no index may depend on another

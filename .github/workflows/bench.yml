@@ -18,16 +18,24 @@ env:
 jobs:
   # ── SLA gate ────────────────────────────────────────────────────────────────
   # Fails the PR if any SLA threshold in tests/perf_sla.rs is violated.
-  # Runs in --release so timings match the calibrated constants.
+  # On master push: publishes a new perf-report-latest.json to gh-pages so
+  # future PRs have a baseline to compare against.
+  # On labeled PRs: fetches the master baseline, computes a delta table, and
+  # posts (or updates) a PR comment via scripts/compare_perf.py.
   sla:
     name: SLA gate
     runs-on: self-hosted
     timeout-minutes: 20
+    permissions:
+      contents: write      # fetch / push gh-pages baseline
+      pull-requests: write # post delta comment on PRs
     if: >
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'performance')
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: SLA tests (--release, --ignored)
         # Scope to perf_sla only: `cargo test -- --ignored` also executes
@@ -47,7 +55,7 @@ jobs:
           echo "----- perf-report.md -----"
           cat perf-out/perf-report.md
 
-      - name: Upload perf report
+      - name: Upload perf report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -57,6 +65,70 @@ jobs:
             perf-out/perf-report.json
           if-no-files-found: warn
 
+      # ── baseline maintenance (master push only) ───────────────────────────
+      - name: Publish baseline to gh-pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages:gh-pages 2>/dev/null || true
+          git worktree add /tmp/gh-pages gh-pages
+          cp perf-out/perf-report.json /tmp/gh-pages/perf-report-latest.json
+          cd /tmp/gh-pages
+          git config user.email "actions@github.com"
+          git config user.name  "github-actions[bot]"
+          git add perf-report-latest.json
+          git diff --cached --quiet || git commit -m "perf: update baseline from ${{ github.sha }}"
+          git push origin gh-pages
+
+      # ── delta comment (labeled PRs only) ─────────────────────────────────
+      - name: Fetch baseline from gh-pages
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages:gh-pages 2>/dev/null || true
+          git show gh-pages:perf-report-latest.json > /tmp/perf-baseline.json 2>/dev/null \
+            || echo '{}' > /tmp/perf-baseline.json
+
+      - name: Generate delta comment
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          python3 scripts/compare_perf.py /tmp/perf-baseline.json perf-out/perf-report.json \
+            > /tmp/perf-delta.md
+          echo "=== delta comment ==="
+          cat /tmp/perf-delta.md
+
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- bindb-perf-delta -->';
+            const delta = fs.readFileSync('/tmp/perf-delta.md', 'utf8');
+            const body = marker + '\n' + delta;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
   # ── trend benchmarks ────────────────────────────────────────────────────────
   # Runs criterion and stores results for PR comment comparison.
   # Does NOT fail the PR — provides visibility only.
@@ -65,6 +137,8 @@ jobs:
     name: Benchmark trends
     runs-on: self-hosted
     timeout-minutes: 60
+    permissions:
+      contents: write
     if: >
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'performance')
@@ -88,7 +162,10 @@ jobs:
       - name: Run criterion benchmarks
         run: >
           cargo bench --bench store_bench
-          -- --output-format bencher | tee bench_output.txt
+          -- --output-format bencher
+          --measurement-time 3
+          --warm-up-time 1
+          | tee bench_output.txt
 
       - name: Store / compare benchmark results
         uses: benchmark-action/github-action-benchmark@v1

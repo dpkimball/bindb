@@ -870,6 +870,118 @@ impl BinderStore {
         Ok(results)
     }
 
+    /// Like `execute_graph_query` but also returns a `parent_map` for path
+    /// reconstruction. Each entry maps a visited node to the node it was
+    /// reached from; the start node has no entry (it is the root).
+    pub(crate) fn execute_graph_query_with_paths(
+        &self,
+        q: GraphQuery<'_>,
+    ) -> Result<(Vec<GraphQueryMatch>, HashMap<ObjectId, ObjectId>), StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let start = q.start.clone().ok_or(StoreError::QueryMissingStart)?;
+
+        let graph = self.graph.lock().unwrap();
+        let head_edges = self.head_edges.lock().unwrap();
+        let head_objects = self.head_objects.lock().unwrap();
+
+        let mut visited: HashSet<ObjectId> = HashSet::new();
+        visited.insert(start.clone());
+
+        let mut queue: VecDeque<(ObjectId, usize)> = VecDeque::new();
+        queue.push_back((start.clone(), 0));
+
+        let mut results: Vec<GraphQueryMatch> = Vec::new();
+        let mut parent_map: HashMap<ObjectId, ObjectId> = HashMap::new();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= q.max_depth {
+                continue;
+            }
+
+            let mut edge_ids: Vec<EdgeId> = Vec::new();
+            if matches!(q.direction, Direction::Outgoing | Direction::Both) {
+                if q.allowed_edge_types.is_empty() {
+                    edge_ids.extend(graph.edges_from(&current).cloned());
+                } else {
+                    for t in &q.allowed_edge_types {
+                        edge_ids.extend(graph.edges_from_with_type(&current, t));
+                    }
+                }
+            }
+            if matches!(q.direction, Direction::Incoming | Direction::Both) {
+                if q.allowed_edge_types.is_empty() {
+                    edge_ids.extend(graph.edges_to(&current).cloned());
+                } else {
+                    for t in &q.allowed_edge_types {
+                        edge_ids.extend(
+                            graph
+                                .edges_to(&current)
+                                .filter(|eid| {
+                                    head_edges
+                                        .get(eid)
+                                        .and_then(|e| e.relationship_type.as_deref())
+                                        == Some(t.as_str())
+                                })
+                                .cloned(),
+                        );
+                    }
+                }
+            }
+
+            for eid in &edge_ids {
+                let Some(edge) = head_edges.get(eid) else {
+                    continue;
+                };
+                if edge.is_tombstone() {
+                    continue;
+                }
+                if let Some(ef) = &q.edge_filter {
+                    if !ef(edge) {
+                        continue;
+                    }
+                }
+
+                let neighbor = match q.direction {
+                    Direction::Outgoing => edge.to_object.as_ref(),
+                    Direction::Incoming => edge.from_object.as_ref(),
+                    Direction::Both => {
+                        if edge.from_object.as_ref() == Some(&current) {
+                            edge.to_object.as_ref()
+                        } else {
+                            edge.from_object.as_ref()
+                        }
+                    }
+                };
+                let Some(neighbor) = neighbor else { continue };
+                if visited.contains(neighbor) {
+                    continue;
+                }
+                visited.insert(neighbor.clone());
+                parent_map.insert(neighbor.clone(), current.clone());
+
+                let Some(obj) = head_objects.get(neighbor) else {
+                    continue;
+                };
+                if obj.is_tombstone() {
+                    continue;
+                }
+
+                let passes = q.node_filter.as_ref().is_none_or(|f| f(obj));
+                if passes {
+                    results.push(GraphQueryMatch {
+                        object: obj.clone(),
+                        depth: depth + 1,
+                    });
+                }
+                queue.push_back((neighbor.clone(), depth + 1));
+            }
+        }
+
+        Ok((results, parent_map))
+    }
+
     // ── observation aggregation ───────────────────────────────────────────────
 
     /// Start building an aggregation query over namespace observations.
@@ -911,6 +1023,81 @@ impl BinderStore {
         drop(head);
 
         Ok(run_aggregation(versions, q))
+    }
+
+    /// Export all live observation objects in a namespace as JSONL (issue #5).
+    ///
+    /// Each line is a JSON object:
+    /// ```json
+    /// {"object_id":"obs://sleep/2024-01-01","value":7.5,"committed_at":"01JXYZ..."}
+    /// ```
+    ///
+    /// `value` is present when the payload decodes as a little-endian f64, a
+    /// bincode f64, or a UTF-8 float string.  When decoding fails, `value` is
+    /// omitted and the raw payload is base64-encoded as `"payload_b64"`.
+    ///
+    /// The output can be fed directly to DuckDB:
+    /// ```sql
+    /// SELECT * FROM read_json_auto('observations.jsonl');
+    /// ```
+    pub fn export_observations_jsonl(&self, namespace: &str) -> Result<Vec<u8>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let object_ids = self.namespace_index.lock().unwrap().matching(namespace);
+        let head = self.head_objects.lock().unwrap();
+        let versions: Vec<_> = object_ids
+            .iter()
+            .filter_map(|oid| head.get(oid).filter(|v| !v.is_tombstone()).cloned())
+            .collect();
+        drop(head);
+
+        let mut out = Vec::new();
+        for v in versions {
+            let oid = &v.object_id.0;
+            let cid = v.valid_from.to_string();
+            let payload = v.payload.as_deref().unwrap_or(&[]);
+
+            // Try decoding as f64 (LE bytes → bincode → UTF-8 float).
+            let value_f64 = try_decode_f64(payload);
+
+            if let Some(val) = value_f64 {
+                out.extend_from_slice(
+                    format!(
+                        "{{\"object_id\":{},\"value\":{val},\"committed_at\":{}}}\n",
+                        serde_json::to_string(oid).unwrap(),
+                        serde_json::to_string(&cid).unwrap(),
+                    )
+                    .as_bytes(),
+                );
+            } else if let Ok(text) = std::str::from_utf8(payload) {
+                // UTF-8 payload — include as raw JSON string or object.
+                let json_val: serde_json::Value = serde_json::from_str(text)
+                    .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
+                out.extend_from_slice(
+                    format!(
+                        "{{\"object_id\":{},\"payload\":{},\"committed_at\":{}}}\n",
+                        serde_json::to_string(oid).unwrap(),
+                        serde_json::to_string(&json_val).unwrap(),
+                        serde_json::to_string(&cid).unwrap(),
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                // Binary payload — hex-encode for portability.
+                let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+                out.extend_from_slice(
+                    format!(
+                        "{{\"object_id\":{},\"payload_hex\":{},\"committed_at\":{}}}\n",
+                        serde_json::to_string(oid).unwrap(),
+                        serde_json::to_string(&hex).unwrap(),
+                        serde_json::to_string(&cid).unwrap(),
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        Ok(out)
     }
 
     // ── maintenance ───────────────────────────────────────────────────────────
@@ -1411,6 +1598,21 @@ fn derive_object_versions_for_commit(commit: &BinderCommit) -> Vec<BinderObjectV
             provenance: change.provenance.clone(),
         })
         .collect()
+}
+
+/// Attempt to decode `payload` as an f64 using LE bytes, bincode, or UTF-8.
+fn try_decode_f64(payload: &[u8]) -> Option<f64> {
+    if payload.len() == 8 {
+        if let Ok(arr) = <[u8; 8]>::try_from(payload) {
+            return Some(f64::from_le_bytes(arr));
+        }
+    }
+    if let Ok(v) = bincode::deserialize::<f64>(payload) {
+        return Some(v);
+    }
+    std::str::from_utf8(payload)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
 }
 
 fn derive_edge_versions_for_commit(commit: &BinderCommit) -> Vec<BinderEdgeVersion> {

@@ -1,4 +1,4 @@
-use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
+use bindb::{BinderStore, EdgeId, GraphIrQuery, ObjectId, Transaction};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -130,12 +130,157 @@ fn ir_exact_depth_excludes_shallower() {
 }
 
 #[test]
-fn ir_rejects_payload_predicate() {
+fn ir_payload_predicate_filters_by_json_field() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();
-    let err = store
-        .graph_ir("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'x' AND b.sentiment > 0.8 RETURN b")
-        .unwrap_err();
-    assert!(err.to_string().contains("invalid argument"));
+
+    // hub → two spoke nodes; one has sentiment > 0.8, one doesn't.
+    let mut tx = Transaction::new();
+    tx.put_object(obj("a://hub"), b"{}".to_vec());
+    tx.put_object(obj("a://high"), br#"{"sentiment":0.9}"#.to_vec());
+    tx.put_object(obj("a://low"), br#"{"sentiment":0.2}"#.to_vec());
+    tx.put_edge(eid("e1"), obj("a://hub"), obj("a://high"), "KNOWS", None);
+    tx.put_edge(eid("e2"), obj("a://hub"), obj("a://low"), "KNOWS", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .graph_ir("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'a://hub' AND b.sentiment > 0.8 RETURN b")
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "a://high");
+    store.close().unwrap();
+}
+
+#[test]
+fn ir_projected_extracts_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://root"), b"{}".to_vec());
+    tx.put_object(
+        obj("note://a"),
+        br#"{"sentiment":0.9,"label":"positive"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("note://b"),
+        br#"{"sentiment":0.3,"label":"negative"}"#.to_vec(),
+    );
+    tx.put_edge(eid("e1"), obj("hub://root"), obj("note://a"), "LINKS", None);
+    tx.put_edge(eid("e2"), obj("hub://root"), obj("note://b"), "LINKS", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINKS]->(b) WHERE id(a) = 'hub://root' RETURN b.sentiment, b.label",
+    )
+    .unwrap();
+    assert_eq!(q.return_fields, vec!["sentiment", "label"]);
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    // Find the row for note://a and verify both fields are projected.
+    let row_a = rows.iter().find(|r| r.object_id.0 == "note://a").unwrap();
+    assert_eq!(
+        row_a.fields.get("sentiment").and_then(|v| v.as_f64()),
+        Some(0.9)
+    );
+    assert_eq!(
+        row_a.fields.get("label").and_then(|v| v.as_str()),
+        Some("positive")
+    );
+
+    // note://b should have sentiment 0.3 and label "negative".
+    let row_b = rows.iter().find(|r| r.object_id.0 == "note://b").unwrap();
+    assert_eq!(
+        row_b.fields.get("sentiment").and_then(|v| v.as_f64()),
+        Some(0.3)
+    );
+    assert_eq!(
+        row_b.fields.get("label").and_then(|v| v.as_str()),
+        Some("negative")
+    );
+
+    store.close().unwrap();
+}
+
+#[test]
+fn ir_return_path_collects_shortest_path() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    // Chain: a → b → c
+    let mut tx = Transaction::new();
+    tx.put_object(obj("n://a"), b"{}".to_vec());
+    tx.put_object(obj("n://b"), b"{}".to_vec());
+    tx.put_object(obj("n://c"), b"{}".to_vec());
+    tx.put_edge(eid("e1"), obj("n://a"), obj("n://b"), "STEP", None);
+    tx.put_edge(eid("e2"), obj("n://b"), obj("n://c"), "STEP", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse("MATCH (a)-[:STEP*1..3]->(b) WHERE id(a) = 'n://a' RETURN path")
+        .unwrap();
+    assert!(q.return_path);
+    assert!(q.return_fields.is_empty());
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 2); // b and c
+
+    let row_b = rows.iter().find(|r| r.object_id.0 == "n://b").unwrap();
+    assert_eq!(
+        row_b
+            .path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["n://a", "n://b"]
+    );
+
+    let row_c = rows.iter().find(|r| r.object_id.0 == "n://c").unwrap();
+    assert_eq!(
+        row_c
+            .path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["n://a", "n://b", "n://c"]
+    );
+
+    store.close().unwrap();
+}
+
+#[test]
+fn ir_return_path_and_field_combined() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("p://root"), b"{}".to_vec());
+    tx.put_object(obj("p://leaf"), br#"{"score":42}"#.to_vec());
+    tx.put_edge(eid("e1"), obj("p://root"), obj("p://leaf"), "HAS", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:HAS]->(b) WHERE id(a) = 'p://root' RETURN b.score, path")
+            .unwrap();
+    assert!(q.return_path);
+    assert_eq!(q.return_fields, vec!["score"]);
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("score").and_then(|v| v.as_f64()),
+        Some(42.0)
+    );
+    assert_eq!(
+        rows[0]
+            .path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p://root", "p://leaf"]
+    );
+
     store.close().unwrap();
 }
