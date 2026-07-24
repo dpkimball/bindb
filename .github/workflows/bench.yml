@@ -100,24 +100,34 @@ jobs:
 
       - name: Post or update PR comment
         if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          PR="${{ github.event.number }}"
-          MARKER="<!-- bindb-perf-delta -->"
-          BODY="${MARKER}
-          $(cat /tmp/perf-delta.md)"
-
-          # Try to update existing comment; fall back to creating a new one.
-          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
-            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
-          if [ -n "$EXISTING" ]; then
-            gh api "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
-              -X PATCH -f body="$BODY"
-          else
-            gh pr comment "$PR" --body "$BODY"
-          fi
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- bindb-perf-delta -->';
+            const delta = fs.readFileSync('/tmp/perf-delta.md', 'utf8');
+            const body = marker + '\n' + delta;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
 
   # ── trend benchmarks ────────────────────────────────────────────────────────
   # Runs criterion and stores results for PR comment comparison.
