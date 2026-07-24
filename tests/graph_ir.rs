@@ -1,4 +1,6 @@
-use bindb::{BinderStore, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError, ObjectId, Transaction};
+use bindb::{
+    BinderStore, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError, ObjectId, Transaction,
+};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -371,9 +373,7 @@ CREATE EDGE id="e_xy" from="p://x" to="p://y" label="KNOWS"
 
     // MERGE EDGE for existing id should return None.
     let cid = store
-        .graph_ir_write(
-            r#"MERGE EDGE id="e_xy" from="p://x" to="p://y" label="KNOWS""#,
-        )
+        .graph_ir_write(r#"MERGE EDGE id="e_xy" from="p://x" to="p://y" label="KNOWS""#)
         .unwrap();
     assert!(cid.is_none());
 
@@ -393,7 +393,13 @@ fn write_ir_parse_error_unknown_verb() {
 #[test]
 fn write_ir_parse_error_missing_field() {
     let err = GraphIrWrite::parse("CREATE NODE payload={}").unwrap_err();
-    assert!(matches!(err, GraphIrWriteError::MissingField { field: "id", line: 1 }));
+    assert!(matches!(
+        err,
+        GraphIrWriteError::MissingField {
+            field: "id",
+            line: 1
+        }
+    ));
 }
 
 #[test]
