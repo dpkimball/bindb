@@ -162,7 +162,10 @@ jobs:
       - name: Run criterion benchmarks
         run: >
           cargo bench --bench store_bench
-          -- --output-format bencher | tee bench_output.txt
+          -- --output-format bencher
+          --measurement-time 3
+          --warm-up-time 1
+          | tee bench_output.txt
 
       - name: Store / compare benchmark results
         uses: benchmark-action/github-action-benchmark@v1

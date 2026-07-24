@@ -8,7 +8,7 @@
 ///
 /// For pass/fail SLA enforcement see tests/perf_sla.rs.
 use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -123,6 +123,8 @@ fn bench_commit_buffered_throughput(c: &mut Criterion) {
 
 fn bench_flush(c: &mut Criterion) {
     let mut group = c.benchmark_group("flush");
+    // iter_custom re-builds the store each sample; cap to avoid O(samples × setup).
+    group.sample_size(10);
 
     for n in [1_000usize, 10_000] {
         group.throughput(Throughput::Elements(n as u64));
@@ -320,8 +322,11 @@ fn bench_graph_traversal(c: &mut Criterion) {
 
 fn bench_index_rebuild(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_rebuild");
+    // rebuild_indexes() is O(WAL entries); keep n small enough to finish in CI time.
+    group.sample_size(20);
+    group.sampling_mode(SamplingMode::Flat);
 
-    for n in [1_000usize, 10_000, 100_000] {
+    for n in [1_000usize, 10_000] {
         let dir = tmp();
         let store = build_store(&dir, n, 5);
 
@@ -340,6 +345,8 @@ fn bench_index_rebuild(c: &mut Criterion) {
 
 fn bench_cold_startup(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_startup");
+    // Each iteration opens + closes a store; limit samples to avoid long CI runs.
+    group.sample_size(10);
 
     for n in [1_000usize, 10_000] {
         let dir = tmp();
