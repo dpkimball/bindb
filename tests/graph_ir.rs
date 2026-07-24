@@ -130,12 +130,24 @@ fn ir_exact_depth_excludes_shallower() {
 }
 
 #[test]
-fn ir_rejects_payload_predicate() {
+fn ir_payload_predicate_filters_by_json_field() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();
-    let err = store
-        .graph_ir("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'x' AND b.sentiment > 0.8 RETURN b")
-        .unwrap_err();
-    assert!(err.to_string().contains("invalid argument"));
+
+    // hub → two spoke nodes; one has sentiment > 0.8, one doesn't.
+    let mut tx = Transaction::new();
+    tx.put_object(obj("a://hub"), b"{}".to_vec());
+    tx.put_object(obj("a://high"), br#"{"sentiment":0.9}"#.to_vec());
+    tx.put_object(obj("a://low"), br#"{"sentiment":0.2}"#.to_vec());
+    tx.put_edge(eid("e1"), obj("a://hub"), obj("a://high"), "KNOWS", None);
+    tx.put_edge(eid("e2"), obj("a://hub"), obj("a://low"), "KNOWS", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .graph_ir("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'a://hub' AND b.sentiment > 0.8 RETURN b")
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "a://high");
     store.close().unwrap();
 }

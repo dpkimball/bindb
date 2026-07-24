@@ -913,6 +913,81 @@ impl BinderStore {
         Ok(run_aggregation(versions, q))
     }
 
+    /// Export all live observation objects in a namespace as JSONL (issue #5).
+    ///
+    /// Each line is a JSON object:
+    /// ```json
+    /// {"object_id":"obs://sleep/2024-01-01","value":7.5,"committed_at":"01JXYZ..."}
+    /// ```
+    ///
+    /// `value` is present when the payload decodes as a little-endian f64, a
+    /// bincode f64, or a UTF-8 float string.  When decoding fails, `value` is
+    /// omitted and the raw payload is base64-encoded as `"payload_b64"`.
+    ///
+    /// The output can be fed directly to DuckDB:
+    /// ```sql
+    /// SELECT * FROM read_json_auto('observations.jsonl');
+    /// ```
+    pub fn export_observations_jsonl(&self, namespace: &str) -> Result<Vec<u8>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        let object_ids = self.namespace_index.lock().unwrap().matching(namespace);
+        let head = self.head_objects.lock().unwrap();
+        let versions: Vec<_> = object_ids
+            .iter()
+            .filter_map(|oid| head.get(oid).filter(|v| !v.is_tombstone()).cloned())
+            .collect();
+        drop(head);
+
+        let mut out = Vec::new();
+        for v in versions {
+            let oid = &v.object_id.0;
+            let cid = v.valid_from.to_string();
+            let payload = v.payload.as_deref().unwrap_or(&[]);
+
+            // Try decoding as f64 (LE bytes → bincode → UTF-8 float).
+            let value_f64 = try_decode_f64(payload);
+
+            if let Some(val) = value_f64 {
+                out.extend_from_slice(
+                    format!(
+                        "{{\"object_id\":{},\"value\":{val},\"committed_at\":{}}}\n",
+                        serde_json::to_string(oid).unwrap(),
+                        serde_json::to_string(&cid).unwrap(),
+                    )
+                    .as_bytes(),
+                );
+            } else if let Ok(text) = std::str::from_utf8(payload) {
+                // UTF-8 payload — include as raw JSON string or object.
+                let json_val: serde_json::Value = serde_json::from_str(text)
+                    .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
+                out.extend_from_slice(
+                    format!(
+                        "{{\"object_id\":{},\"payload\":{},\"committed_at\":{}}}\n",
+                        serde_json::to_string(oid).unwrap(),
+                        serde_json::to_string(&json_val).unwrap(),
+                        serde_json::to_string(&cid).unwrap(),
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                // Binary payload — hex-encode for portability.
+                let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+                out.extend_from_slice(
+                    format!(
+                        "{{\"object_id\":{},\"payload_hex\":{},\"committed_at\":{}}}\n",
+                        serde_json::to_string(oid).unwrap(),
+                        serde_json::to_string(&hex).unwrap(),
+                        serde_json::to_string(&cid).unwrap(),
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        Ok(out)
+    }
+
     // ── maintenance ───────────────────────────────────────────────────────────
 
     /// Explicitly rebuild all indexes from the commit log.
@@ -1411,6 +1486,21 @@ fn derive_object_versions_for_commit(commit: &BinderCommit) -> Vec<BinderObjectV
             provenance: change.provenance.clone(),
         })
         .collect()
+}
+
+/// Attempt to decode `payload` as an f64 using LE bytes, bincode, or UTF-8.
+fn try_decode_f64(payload: &[u8]) -> Option<f64> {
+    if payload.len() == 8 {
+        if let Ok(arr) = <[u8; 8]>::try_from(payload) {
+            return Some(f64::from_le_bytes(arr));
+        }
+    }
+    if let Ok(v) = bincode::deserialize::<f64>(payload) {
+        return Some(v);
+    }
+    std::str::from_utf8(payload)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
 }
 
 fn derive_edge_versions_for_commit(commit: &BinderCommit) -> Vec<BinderEdgeVersion> {

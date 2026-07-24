@@ -1,8 +1,8 @@
-//! Restricted graph query IR (issue #2, first slice).
+//! Restricted graph query IR (issue #2).
 //!
-//! This is **not** Cypher. It parses a tiny MATCH dialect and maps it onto
-//! [`GraphQuery`]. Variable-length min hops, edge predicates beyond type lists,
-//! path collection, and RETURN projections remain future work.
+//! This is **not** Cypher. It parses a MATCH dialect and maps it onto
+//! [`GraphQuery`]. Full Cypher (path collection, arbitrary RETURN projections,
+//! write clauses) remains future work.
 //!
 //! Supported forms:
 //! ```text
@@ -10,15 +10,21 @@
 //! WHERE id(a) = 'person://alice' AND id(b) STARTS WITH 'memory://'
 //! RETURN b
 //!
-//! MATCH (a)-[*2]->(b) WHERE id(a) = 'x' RETURN b
-//! MATCH (a)<-[:KNOWS*1..2]-(b) WHERE id(a) = 'memory://m1' RETURN b
-//! MATCH (a)-[:KNOWS]-(b) WHERE id(a) = 'x' RETURN b
+//! -- JSON payload predicates (payload must be a UTF-8 JSON object):
+//! MATCH (a)-[:RELATES_TO*1..3]->(b)
+//! WHERE id(a) = 'person://alice'
+//!   AND id(b) STARTS WITH 'memory://'
+//!   AND b.sentiment > 0.8
+//! RETURN b
 //! ```
 //!
+//! Payload predicate operators: `>`, `<`, `>=`, `<=`, `=`, `!=`.
+//! The right-hand side may be a number literal or a quoted string.
+//! String comparison uses lexicographic ordering.
+//!
 //! Notes:
-//! - `*min..max` / `*n` set max_depth and filter results to `depth >= min`
-//!   (`*n` means exactly n hops).
-//! - Node filters apply to **results**, not traversal (same as `filter_node`).
+//! - `*min..max` / `*n` set max_depth and filter results to `depth >= min`.
+//! - Node filters apply to **results**, not traversal.
 //! - Undirected `-[]-` → [`Direction::Both`]; `<-[]-` → Incoming; `-[]->` → Outgoing.
 
 use crate::engine::BinderStore;
@@ -47,7 +53,34 @@ pub enum NodeIdPred {
     Equals(String),
 }
 
+/// Comparison operator for payload field predicates.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+}
+
+/// Right-hand side of a payload predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CmpValue {
+    Number(f64),
+    Text(String),
+}
+
+/// Predicate on a JSON field of the matched end node's payload.
+/// Payload must be a UTF-8 JSON object; non-JSON payloads never match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PayloadPred {
+    pub field: String,
+    pub op: CmpOp,
+    pub value: CmpValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraphIrQuery {
     pub start: ObjectId,
     pub edge_types: Vec<String>,
@@ -57,6 +90,8 @@ pub struct GraphIrQuery {
     pub max_depth: usize,
     pub direction: Direction,
     pub end_pred: NodeIdPred,
+    /// Optional payload field predicate applied to matched end nodes.
+    pub payload_pred: Option<PayloadPred>,
 }
 
 impl GraphIrQuery {
@@ -82,11 +117,25 @@ impl GraphIrQuery {
         let (start, end_pred, after_preds) = parse_where(after_where)?;
         let after_preds = after_preds.trim_start();
 
-        if !starts_with_keyword(after_preds, "RETURN") {
+        // Optional payload predicate: AND b.FIELD OP VALUE
+        let (payload_pred, after_preds2) = if starts_with_keyword(after_preds, "AND") {
+            let after_and = skip_keyword(after_preds, "AND");
+            if after_and.trim_start().starts_with("b.") || after_and.trim_start().starts_with("B.")
+            {
+                let (pred, rest) = parse_payload_pred(after_and.trim_start())?;
+                (Some(pred), rest.trim_start())
+            } else {
+                (None, after_preds)
+            }
+        } else {
+            (None, after_preds)
+        };
+
+        if !starts_with_keyword(after_preds2, "RETURN") {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
         // RETURN clause is accepted but ignored (always return matched nodes).
-        let _ = skip_keyword(after_preds, "RETURN");
+        let _ = skip_keyword(after_preds2, "RETURN");
 
         Ok(GraphIrQuery {
             start,
@@ -95,6 +144,7 @@ impl GraphIrQuery {
             max_depth,
             direction,
             end_pred,
+            payload_pred,
         })
     }
 }
@@ -270,12 +320,74 @@ fn parse_where(s: &str) -> Result<(ObjectId, NodeIdPred, &str), GraphIrError> {
     let (start, rest) = parse_id_eq(s, "a")?;
     let rest = rest.trim_start();
     if starts_with_keyword(rest, "AND") {
-        let after_and = skip_keyword(rest, "AND");
-        let (end_pred, rest2) = parse_end_pred(after_and)?;
-        Ok((start, end_pred, rest2))
+        let after_and = skip_keyword(rest, "AND").trim_start();
+        // Peek: if it starts with id(b) parse as end predicate; if b. it's a payload pred.
+        if after_and.starts_with("id(") || after_and.starts_with("ID(") {
+            let (end_pred, rest2) = parse_end_pred(after_and)?;
+            Ok((start, end_pred, rest2))
+        } else {
+            // Payload pred comes after; leave rest pointing at AND so the
+            // caller's payload-pred parser sees it.
+            Ok((start, NodeIdPred::Any, rest))
+        }
     } else {
         Ok((start, NodeIdPred::Any, rest))
     }
+}
+
+fn parse_payload_pred(s: &str) -> Result<(PayloadPred, &str), GraphIrError> {
+    // s starts with "b." or "B."
+    let s = &s[2..]; // skip "b."
+                     // field name: alphanumeric + underscore
+    let field_end = s
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(s.len());
+    if field_end == 0 {
+        return Err(GraphIrError::Unsupported(
+            "expected field name after b.".into(),
+        ));
+    }
+    let field = s[..field_end].to_string();
+    let rest = s[field_end..].trim_start();
+
+    let (op, rest) = if let Some(r) = rest.strip_prefix(">=") {
+        (CmpOp::Gte, r.trim_start())
+    } else if let Some(r) = rest.strip_prefix("<=") {
+        (CmpOp::Lte, r.trim_start())
+    } else if let Some(r) = rest.strip_prefix("!=") {
+        (CmpOp::Ne, r.trim_start())
+    } else if let Some(r) = rest.strip_prefix('>') {
+        (CmpOp::Gt, r.trim_start())
+    } else if let Some(r) = rest.strip_prefix('<') {
+        (CmpOp::Lt, r.trim_start())
+    } else if let Some(r) = rest.strip_prefix('=') {
+        (CmpOp::Eq, r.trim_start())
+    } else {
+        return Err(GraphIrError::Unsupported(format!(
+            "expected comparison operator after b.{field}"
+        )));
+    };
+
+    // RHS: quoted string or numeric literal
+    let (value, rest) = if rest.starts_with('\'') || rest.starts_with('"') {
+        let (s, r) = parse_quoted(rest)?;
+        (CmpValue::Text(s), r)
+    } else {
+        let num_end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(rest.len());
+        if num_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "expected number or string on RHS of payload predicate".into(),
+            ));
+        }
+        let n: f64 = rest[..num_end]
+            .parse()
+            .map_err(|_| GraphIrError::Unsupported("invalid number literal".into()))?;
+        (CmpValue::Number(n), &rest[num_end..])
+    };
+
+    Ok((PayloadPred { field, op, value }, rest))
 }
 
 fn parse_id_eq<'a>(s: &'a str, var: &str) -> Result<(ObjectId, &'a str), GraphIrError> {
@@ -336,6 +448,51 @@ fn parse_quoted(s: &str) -> Result<(String, &str), GraphIrError> {
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
 }
 
+/// Evaluate a payload predicate against raw payload bytes.
+/// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
+fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let field_val = match v.get(&pred.field) {
+        Some(fv) => fv,
+        None => return false,
+    };
+    match &pred.value {
+        CmpValue::Number(rhs) => {
+            let lhs = match field_val.as_f64() {
+                Some(n) => n,
+                None => return false,
+            };
+            match pred.op {
+                CmpOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
+                CmpOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
+                CmpOp::Gt => lhs > *rhs,
+                CmpOp::Lt => lhs < *rhs,
+                CmpOp::Gte => lhs >= *rhs,
+                CmpOp::Lte => lhs <= *rhs,
+            }
+        }
+        CmpValue::Text(rhs) => {
+            let lhs = match field_val.as_str() {
+                Some(s) => s,
+                None => return false,
+            };
+            match pred.op {
+                CmpOp::Eq => lhs == rhs,
+                CmpOp::Ne => lhs != rhs,
+                CmpOp::Gt => lhs > rhs.as_str(),
+                CmpOp::Lt => lhs < rhs.as_str(),
+                CmpOp::Gte => lhs >= rhs.as_str(),
+                CmpOp::Lte => lhs <= rhs.as_str(),
+            }
+        }
+    }
+}
+
 impl BinderStore {
     /// Execute a restricted MATCH / WHERE / RETURN graph IR string (issue #2).
     pub fn graph_ir(&self, query: &str) -> Result<Vec<GraphQueryMatch>, StoreError> {
@@ -368,6 +525,13 @@ impl BinderStore {
                 builder.filter_node(move |obj| obj.object_id.0 == id)
             }
         };
+
+        if let Some(pred) = &q.payload_pred {
+            let pred = pred.clone();
+            builder = builder.filter_node(move |obj| {
+                apply_payload_pred(obj.payload.as_deref().unwrap_or(&[]), &pred)
+            });
+        }
 
         let mut matches = builder.execute()?;
         if q.min_depth > 1 {
@@ -423,10 +587,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cypher_extras() {
-        assert!(GraphIrQuery::parse(
-            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'x' AND b.sentiment > 0.8 RETURN b"
+    fn parses_payload_pred_gt() {
+        let q = GraphIrQuery::parse(
+            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'x' AND b.sentiment > 0.8 RETURN b",
         )
-        .is_err());
+        .unwrap();
+        let pred = q.payload_pred.unwrap();
+        assert_eq!(pred.field, "sentiment");
+        assert_eq!(pred.op, CmpOp::Gt);
+        assert_eq!(pred.value, CmpValue::Number(0.8));
+    }
+
+    #[test]
+    fn parses_payload_pred_string_eq() {
+        let q = GraphIrQuery::parse(
+            "MATCH (a)-[]->(b) WHERE id(a) = 'x' AND b.status = 'active' RETURN b",
+        )
+        .unwrap();
+        let pred = q.payload_pred.unwrap();
+        assert_eq!(pred.field, "status");
+        assert_eq!(pred.op, CmpOp::Eq);
+        assert_eq!(pred.value, CmpValue::Text("active".into()));
+    }
+
+    #[test]
+    fn no_payload_pred_when_absent() {
+        let q = GraphIrQuery::parse("MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b").unwrap();
+        assert!(q.payload_pred.is_none());
     }
 }

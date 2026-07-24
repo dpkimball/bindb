@@ -9,7 +9,8 @@
 //! SELECT COUNT(*) FROM 'obs://health.sleep'
 //! SELECT AVG(VALUE) FROM 'obs://health.sleep'
 //! SELECT SUM(VALUE) FROM 'obs://ns' GROUP BY PATH_SEGMENT(1)
-//! SELECT MIN(VALUE) FROM 'obs://ns' GROUP BY PATH_SEGMENT(2)
+//! SELECT MIN(VALUE) FROM 'obs://ns' WHERE id STARTS WITH '2024'
+//! SELECT AVG(VALUE) FROM 'obs://ns' WHERE id STARTS WITH '2024-01' GROUP BY PATH_SEGMENT(2)
 //! SELECT MAX(VALUE) FROM 'obs://ns'
 //! SELECT P50(VALUE) FROM 'obs://ns'
 //! SELECT P99(VALUE) FROM 'obs://ns'
@@ -18,6 +19,7 @@
 //! `VALUE` extraction order: little-endian `f64` (8 bytes), then `bincode` `f64`,
 //! then UTF-8 parse of payload as `f64`.
 //! `PATH_SEGMENT(i)` splits `object_id` on `/` and `:` and takes 0-based index.
+//! `WHERE id STARTS WITH 'prefix'` filters by the object_id suffix after the namespace.
 
 use crate::aggregation::{Aggregate, AggregateResult, ObservationAggregation};
 use crate::engine::BinderStore;
@@ -50,6 +52,8 @@ pub struct SqlAggregateQuery {
     pub group_by: SqlGroupBy,
     /// True when the aggregate needs numeric `VALUE` extraction.
     pub needs_value: bool,
+    /// Optional `WHERE id STARTS WITH '...'` filter applied to object_id.
+    pub id_prefix: Option<String>,
 }
 
 impl SqlAggregateQuery {
@@ -73,10 +77,20 @@ impl SqlAggregateQuery {
 
         let (namespace, rest) = parse_quoted(after_from)?;
         let rest = rest.trim_start();
-        let group_by = if rest.is_empty() {
+
+        // Optional WHERE id STARTS WITH '...'
+        let (id_prefix, rest) = if starts_with_keyword(rest, "WHERE") {
+            let after_where = skip_keyword(rest, "WHERE");
+            let prefix = parse_where_id_prefix(after_where)?;
+            (Some(prefix.0), prefix.1)
+        } else {
+            (None, rest)
+        };
+
+        let group_by = if rest.trim_start().is_empty() {
             SqlGroupBy::None
         } else {
-            parse_group_by(rest)?
+            parse_group_by(rest.trim_start())?
         };
 
         Ok(SqlAggregateQuery {
@@ -84,6 +98,7 @@ impl SqlAggregateQuery {
             namespace,
             group_by,
             needs_value,
+            id_prefix,
         })
     }
 }
@@ -135,6 +150,31 @@ fn parse_quoted(s: &str) -> Result<(String, &str), SqlAggError> {
         return Err(SqlAggError::MissingNamespace);
     }
     Ok((ns, &rest[end + quote.len_utf8()..]))
+}
+
+fn parse_where_id_prefix(s: &str) -> Result<(String, &str), SqlAggError> {
+    let s = s.trim_start();
+    // id STARTS WITH '…'
+    if !starts_with_keyword(s, "id") {
+        return Err(SqlAggError::Unsupported(
+            "WHERE clause must be: id STARTS WITH '…'".into(),
+        ));
+    }
+    let after_id = skip_keyword(s, "id");
+    if !starts_with_keyword(after_id, "STARTS") {
+        return Err(SqlAggError::Unsupported(
+            "expected STARTS WITH after id".into(),
+        ));
+    }
+    let after_starts = skip_keyword(after_id, "STARTS");
+    if !starts_with_keyword(after_starts, "WITH") {
+        return Err(SqlAggError::Unsupported(
+            "expected WITH after STARTS".into(),
+        ));
+    }
+    let after_with = skip_keyword(after_starts, "WITH");
+    let (prefix, rest) = parse_quoted(after_with)?;
+    Ok((prefix, rest.trim_start()))
 }
 
 fn parse_group_by(s: &str) -> Result<SqlGroupBy, SqlAggError> {
@@ -215,6 +255,11 @@ impl BinderStore {
             builder = builder.extract_f64(extract_value);
         }
 
+        if let Some(prefix) = &q.id_prefix {
+            let prefix = prefix.clone();
+            builder = builder.filter(move |v| v.object_id.0.contains(prefix.as_str()));
+        }
+
         builder = match q.group_by {
             SqlGroupBy::None => builder,
             SqlGroupBy::PathSegment(idx) => {
@@ -237,6 +282,7 @@ mod tests {
         assert_eq!(q.namespace, "obs://sleep");
         assert!(!q.needs_value);
         assert_eq!(q.group_by, SqlGroupBy::None);
+        assert_eq!(q.id_prefix, None);
     }
 
     #[test]
@@ -247,6 +293,29 @@ mod tests {
         .unwrap();
         assert_eq!(q.aggregate, Aggregate::Avg);
         assert!(q.needs_value);
+        assert_eq!(q.group_by, SqlGroupBy::PathSegment(1));
+        assert_eq!(q.id_prefix, None);
+    }
+
+    #[test]
+    fn parses_where_id_prefix() {
+        let q = SqlAggregateQuery::parse(
+            "SELECT AVG(VALUE) FROM 'obs://sleep' WHERE id STARTS WITH '2024'",
+        )
+        .unwrap();
+        assert_eq!(q.aggregate, Aggregate::Avg);
+        assert_eq!(q.namespace, "obs://sleep");
+        assert_eq!(q.id_prefix, Some("2024".into()));
+        assert_eq!(q.group_by, SqlGroupBy::None);
+    }
+
+    #[test]
+    fn parses_where_then_group_by() {
+        let q = SqlAggregateQuery::parse(
+            "SELECT COUNT(*) FROM 'obs://sleep' WHERE id STARTS WITH '2024' GROUP BY PATH_SEGMENT(1)",
+        )
+        .unwrap();
+        assert_eq!(q.id_prefix, Some("2024".into()));
         assert_eq!(q.group_by, SqlGroupBy::PathSegment(1));
     }
 

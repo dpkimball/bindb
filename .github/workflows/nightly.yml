@@ -1,0 +1,30 @@
+name: Nightly XL
+
+on:
+  schedule:
+    # 02:00 UTC every day — self-hosted runner must be online.
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: bindb-nightly
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── XL-scale SLA gate ────────────────────────────────────────────────────────
+  # Validates performance at 1 M objects. Not run on every PR because build +
+  # store setup takes 5–20 minutes per test; a nightly job is sufficient.
+  xl_sla:
+    name: XL scale SLA
+    runs-on: self-hosted
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: XL SLA tests (--release, scale:XL)
+        run: >
+          cargo test --release --test perf_sla
+          -- --ignored --test-threads=1 scale:XL

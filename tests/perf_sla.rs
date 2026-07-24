@@ -44,6 +44,13 @@ const LIST_L_P99_MS_MAX: u64 = 20; // ms — namespace list returning 10 K of 10
 const REBUILD_L_MS_MAX: u64 = 2_000; // ms — rebuild_indexes() at 100 K objects
 const OPEN_REPLAY_L_MS_MAX: u64 = 300; // ms — WAL replay at 100 K commits
 
+// ── XL-scale threshold constants (1 M objects) ───────────────────────────────
+// O(1) operations stay constant; open() requires compact() first (bare WAL
+// replay at 1 M is O(n) but slow without the position index optimisation).
+
+const GET_XL_P99_US_MAX: u64 = 10; // µs — HashMap lookup stays O(1) at 1 M
+const OPEN_XL_AFTER_COMPACT_MS_MAX: u64 = 5_000; // ms — snapshot replay at 1 M
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn obj(s: impl Into<String>) -> ObjectId {
@@ -545,5 +552,82 @@ fn sla_l_open_wal_replay_lte_300ms_at_100k_commits() {
         "open() WAL replay worst-of-3 {} ms > L-scale SLA maximum {} ms (100 K commits)",
         worst_ms,
         OPEN_REPLAY_L_MS_MAX
+    );
+}
+
+// ── XL-scale SLAs (1 M objects) ───────────────────────────────────────────────
+// Run with: cargo test --release -- --ignored --test-threads=1 scale:XL
+// Expected runtime per test: 5–20 minutes. Run on a nightly schedule only.
+
+/// Build a store with `n` objects — XL-scale variant.
+/// Flushes every 100 K to keep write pressure reasonable.
+fn build_store_xl(dir: &TempDir, n: usize, namespaces: &[&str]) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    for i in 0..n {
+        let ns = namespaces[i % namespaces.len()];
+        let mut tx = Transaction::new();
+        tx.put_object(
+            obj(format!("{}://obj.{:08}", ns, i)),
+            vec![i as u8 % 255; 64],
+        );
+        store.commit_buffered(tx, "test", "").unwrap();
+        if i > 0 && i % 100_000 == 0 {
+            store.flush().unwrap();
+        }
+    }
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf scale:XL — cargo test --release -- --ignored --test-threads=1"]
+fn sla_xl_get_p99_lte_10us_at_1m_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_store_xl(&dir, 1_000_000, &["a"]);
+    let target = obj("a://obj.00500000");
+    let iterations = 5_000;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let _ = store.get(&target).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000; // ns → µs
+    assert!(
+        p99 <= GET_XL_P99_US_MAX,
+        "get() p99 {} µs > XL-scale SLA maximum {} µs (HashMap must stay O(1) at 1 M objects)",
+        p99,
+        GET_XL_P99_US_MAX
+    );
+}
+
+#[test]
+#[ignore = "perf scale:XL — cargo test --release -- --ignored --test-threads=1"]
+fn sla_xl_open_lte_5s_after_compact_at_1m_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = build_store_xl(&dir, 1_000_000, &["a"]);
+        // compact() snapshots current state and truncates the WAL so reopen
+        // replays only from the snapshot — much faster than bare WAL replay.
+        store.compact().unwrap();
+        store.close().unwrap();
+    }
+
+    let mut worst_ms = 0u64;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let store = BinderStore::open(dir.path()).unwrap();
+        let ms = t.elapsed().as_millis() as u64;
+        worst_ms = worst_ms.max(ms);
+        store.close().unwrap();
+    }
+
+    assert!(
+        worst_ms <= OPEN_XL_AFTER_COMPACT_MS_MAX,
+        "open() worst-of-3 {} ms > XL-scale SLA maximum {} ms (1 M objects after compact)",
+        worst_ms,
+        OPEN_XL_AFTER_COMPACT_MS_MAX
     );
 }

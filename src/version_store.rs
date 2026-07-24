@@ -1,4 +1,4 @@
-/// Disk-backed version history store.
+/// Disk-backed version history store with memory-mapped reads (issue #6).
 ///
 /// Keeps only `(valid_from, valid_to, file_offset)` per version in RAM,
 /// while the full `BinderObjectVersion` / `BinderEdgeVersion` payloads live
@@ -8,6 +8,11 @@
 /// Without this: O(n_total_versions × avg_version_size) in RAM.
 /// With this: O(n_total_versions × ~40 bytes) in RAM for the index.
 /// For a store with 5 M historical versions the index uses ~200 MB vs ~1 GB.
+///
+/// ### mmap read path
+/// After rebuild or hydration the file is memory-mapped for reads.
+/// Appends invalidate the mapping; the next read lazily re-maps, keeping
+/// the file descriptor open but avoiding a seek+read syscall per lookup.
 ///
 /// ### File format
 /// Sequence of length-prefixed bincode frames:
@@ -25,6 +30,7 @@
 use crate::edge::BinderEdgeVersion;
 use crate::object::BinderObjectVersion;
 use crate::types::{CommitId, EdgeId, ObjectId};
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -55,6 +61,8 @@ struct IndexEntry {
 pub struct VersionStore {
     file: File,
     write_pos: u64,
+    /// Lazily refreshed read mapping. None when dirty (after an append).
+    mmap: Option<Mmap>,
     object_index: HashMap<ObjectId, Vec<IndexEntry>>,
     edge_index: HashMap<EdgeId, Vec<IndexEntry>>,
 }
@@ -68,9 +76,15 @@ impl VersionStore {
             .truncate(false)
             .open(path)?;
         let write_pos = file.metadata()?.len();
+        let mmap = if write_pos > 0 {
+            Some(unsafe { Mmap::map(&file)? })
+        } else {
+            None
+        };
         Ok(Self {
             file,
             write_pos,
+            mmap,
             object_index: HashMap::new(),
             edge_index: HashMap::new(),
         })
@@ -84,6 +98,7 @@ impl VersionStore {
         objects: &[BinderObjectVersion],
         edges: &[BinderEdgeVersion],
     ) -> io::Result<()> {
+        self.mmap = None;
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.write_pos = 0;
@@ -114,7 +129,9 @@ impl VersionStore {
                 });
         }
 
-        self.file.flush()
+        self.file.flush()?;
+        self.refresh_mmap()?;
+        Ok(())
     }
 
     /// Rebuild in-memory indexes by scanning an existing `version_log.bin`
@@ -188,6 +205,7 @@ impl VersionStore {
 
         self.write_pos = pos;
         self.file.seek(SeekFrom::Start(self.write_pos))?;
+        self.refresh_mmap()?;
         Ok(())
     }
 
@@ -362,10 +380,41 @@ impl VersionStore {
         self.file.write_all(&(bytes.len() as u64).to_le_bytes())?;
         self.file.write_all(&bytes)?;
         self.write_pos += 8 + bytes.len() as u64;
+        // Invalidate mmap — it no longer covers the full file.
+        self.mmap = None;
         Ok(offset)
     }
 
+    fn refresh_mmap(&mut self) -> io::Result<()> {
+        if self.write_pos > 0 {
+            self.mmap = Some(unsafe { Mmap::map(&self.file)? });
+        } else {
+            self.mmap = None;
+        }
+        Ok(())
+    }
+
     fn read_record_at(&mut self, offset: u64) -> io::Result<VersionRecord> {
+        // Lazily re-map after appends; use mmap slice instead of seek+read.
+        if self.mmap.is_none() && self.write_pos > 0 {
+            self.refresh_mmap()?;
+        }
+        if let Some(ref mmap) = self.mmap {
+            let start = offset as usize;
+            if start + 8 > mmap.len() {
+                return Err(io::Error::other("version_store: offset out of bounds"));
+            }
+            let len = u64::from_le_bytes(mmap[start..start + 8].try_into().unwrap()) as usize;
+            let data_start = start + 8;
+            if data_start + len > mmap.len() {
+                return Err(io::Error::other(
+                    "version_store: frame extends past end of file",
+                ));
+            }
+            return bincode::deserialize(&mmap[data_start..data_start + len])
+                .map_err(|e| io::Error::other(e.to_string()));
+        }
+        // Fallback for empty file (shouldn't occur in normal use).
         self.file.seek(SeekFrom::Start(offset))?;
         let mut len_buf = [0u8; 8];
         self.file.read_exact(&mut len_buf)?;

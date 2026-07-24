@@ -25,7 +25,7 @@ pub use commit::BinderCommit;
 pub use edge::{BinderEdgeVersion, EdgeVersionId};
 pub use engine::BinderStore;
 pub use error::StoreError;
-pub use graph_ir::{GraphIrError, GraphIrQuery, NodeIdPred};
+pub use graph_ir::{CmpOp, CmpValue, GraphIrError, GraphIrQuery, NodeIdPred, PayloadPred};
 pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;
 pub use object::{BinderObjectVersion, ObjectVersionId};
