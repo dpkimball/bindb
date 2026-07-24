@@ -8,7 +8,9 @@
 ///
 /// For pass/fail SLA enforcement see tests/perf_sla.rs.
 use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
+};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
