@@ -9,6 +9,15 @@
 /// With this: O(n_total_versions × ~40 bytes) in RAM for the index.
 /// For a store with 5 M historical versions the index uses ~200 MB vs ~1 GB.
 ///
+/// ### Cold-version eviction (issue #6)
+/// When `total_index_entries` exceeds `max_history_entries` (default: 1 M),
+/// all historical IndexEntries (`valid_to = Some(…)`) are dropped from RAM
+/// while live entries (`valid_to = None`) are kept.  Affected IDs are recorded
+/// in `evicted_object_ids` / `evicted_edge_ids`.  Temporal queries
+/// (`object_history`, `object_as_of`, `edge_history`, `edge_as_of`) for evicted
+/// IDs fall back to a mmap scan of `version_log.bin` — O(file_size) but
+/// page-cache-backed, and only on the cold query path.
+///
 /// ### mmap read path
 /// After rebuild or hydration the file is memory-mapped for reads.
 /// Appends invalidate the mapping; the next read lazily re-maps, keeping
@@ -32,7 +41,7 @@ use crate::object::BinderObjectVersion;
 use crate::types::{CommitId, EdgeId, ObjectId};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -56,6 +65,12 @@ struct IndexEntry {
     offset: u64,
 }
 
+// ── default eviction cap ──────────────────────────────────────────────────────
+
+/// Default maximum number of IndexEntry records held in RAM before historical
+/// (non-live) entries are evicted.  At ~40 B each this is ~40 MB.
+const DEFAULT_MAX_HISTORY_ENTRIES: usize = 1_000_000;
+
 // ── public struct ─────────────────────────────────────────────────────────────
 
 pub struct VersionStore {
@@ -65,10 +80,27 @@ pub struct VersionStore {
     mmap: Option<Mmap>,
     object_index: HashMap<ObjectId, Vec<IndexEntry>>,
     edge_index: HashMap<EdgeId, Vec<IndexEntry>>,
+    /// Running count of all IndexEntry records across both indexes.
+    total_index_entries: usize,
+    /// Cap above which `evict_cold_history()` is triggered.
+    max_history_entries: usize,
+    /// IDs whose historical (non-live) index entries have been evicted.
+    /// Temporal queries for these IDs fall back to a mmap scan.
+    evicted_object_ids: HashSet<ObjectId>,
+    evicted_edge_ids: HashSet<EdgeId>,
 }
 
 impl VersionStore {
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
+        Self::open_or_create_with_cap(path, DEFAULT_MAX_HISTORY_ENTRIES)
+    }
+
+    /// Like `open_or_create` but with a custom eviction cap.  Used by tests
+    /// and internal code that needs a lower cap for deterministic eviction.
+    pub(crate) fn open_or_create_with_cap(
+        path: &Path,
+        max_history_entries: usize,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -87,6 +119,10 @@ impl VersionStore {
             mmap,
             object_index: HashMap::new(),
             edge_index: HashMap::new(),
+            total_index_entries: 0,
+            max_history_entries,
+            evicted_object_ids: HashSet::new(),
+            evicted_edge_ids: HashSet::new(),
         })
     }
 
@@ -104,6 +140,9 @@ impl VersionStore {
         self.write_pos = 0;
         self.object_index.clear();
         self.edge_index.clear();
+        self.total_index_entries = 0;
+        self.evicted_object_ids.clear();
+        self.evicted_edge_ids.clear();
 
         for v in objects {
             let offset = self.append_record(&VersionRecord::Object(v.clone()))?;
@@ -115,6 +154,7 @@ impl VersionStore {
                     valid_to: v.valid_to,
                     offset,
                 });
+            self.total_index_entries += 1;
         }
 
         for v in edges {
@@ -127,10 +167,12 @@ impl VersionStore {
                     valid_to: v.valid_to,
                     offset,
                 });
+            self.total_index_entries += 1;
         }
 
         self.file.flush()?;
         self.refresh_mmap()?;
+        self.maybe_evict();
         Ok(())
     }
 
@@ -140,6 +182,9 @@ impl VersionStore {
     pub fn hydrate_index_from_file(&mut self) -> io::Result<()> {
         self.object_index.clear();
         self.edge_index.clear();
+        self.total_index_entries = 0;
+        self.evicted_object_ids.clear();
+        self.evicted_edge_ids.clear();
         self.file.seek(SeekFrom::Start(0))?;
         let file_len = self.file.metadata()?.len();
         let mut pos = 0u64;
@@ -175,6 +220,7 @@ impl VersionStore {
                             valid_to: v.valid_to,
                             offset,
                         });
+                    self.total_index_entries += 1;
                 }
                 VersionRecord::Edge(v) => {
                     self.edge_index
@@ -185,6 +231,7 @@ impl VersionStore {
                             valid_to: v.valid_to,
                             offset,
                         });
+                    self.total_index_entries += 1;
                 }
                 VersionRecord::RetireObject { id, retired_at } => {
                     if let Some(entries) = self.object_index.get_mut(&id) {
@@ -206,6 +253,7 @@ impl VersionStore {
         self.write_pos = pos;
         self.file.seek(SeekFrom::Start(self.write_pos))?;
         self.refresh_mmap()?;
+        self.maybe_evict();
         Ok(())
     }
 
@@ -219,6 +267,18 @@ impl VersionStore {
         self.write_pos > 0 || self.file.metadata().map(|m| m.len() > 0).unwrap_or(false)
     }
 
+    /// Current number of IndexEntry records held in RAM (live + historical).
+    #[allow(dead_code)]
+    pub fn index_entry_count(&self) -> usize {
+        self.total_index_entries
+    }
+
+    /// Number of object IDs whose historical entries have been evicted.
+    #[allow(dead_code)]
+    pub fn evicted_object_count(&self) -> usize {
+        self.evicted_object_ids.len()
+    }
+
     /// Append a new object version and record it in the in-memory index.
     pub fn append_object(&mut self, v: &BinderObjectVersion) -> io::Result<()> {
         let offset = self.append_record(&VersionRecord::Object(v.clone()))?;
@@ -230,6 +290,8 @@ impl VersionStore {
                 valid_to: v.valid_to,
                 offset,
             });
+        self.total_index_entries += 1;
+        self.maybe_evict();
         Ok(())
     }
 
@@ -244,6 +306,8 @@ impl VersionStore {
                 valid_to: v.valid_to,
                 offset,
             });
+        self.total_index_entries += 1;
+        self.maybe_evict();
         Ok(())
     }
 
@@ -278,6 +342,9 @@ impl VersionStore {
 
     /// All versions of an object in ascending commit order.
     pub fn object_history(&mut self, id: &ObjectId) -> io::Result<Vec<BinderObjectVersion>> {
+        if self.evicted_object_ids.contains(id) {
+            return self.scan_object_history_from_mmap(id);
+        }
         let offsets: Vec<(u64, Option<CommitId>)> = self
             .object_index
             .get(id)
@@ -300,6 +367,12 @@ impl VersionStore {
         id: &ObjectId,
         at: CommitId,
     ) -> io::Result<Option<BinderObjectVersion>> {
+        if self.evicted_object_ids.contains(id) {
+            let history = self.scan_object_history_from_mmap(id)?;
+            return Ok(history
+                .into_iter()
+                .rfind(|v| v.valid_from <= at && v.valid_to.is_none_or(|to| at < to)));
+        }
         let entry = self
             .object_index
             .get(id)
@@ -324,6 +397,9 @@ impl VersionStore {
 
     /// All versions of an edge in ascending commit order.
     pub fn edge_history(&mut self, id: &EdgeId) -> io::Result<Vec<BinderEdgeVersion>> {
+        if self.evicted_edge_ids.contains(id) {
+            return self.scan_edge_history_from_mmap(id);
+        }
         let offsets: Vec<(u64, Option<CommitId>)> = self
             .edge_index
             .get(id)
@@ -345,6 +421,12 @@ impl VersionStore {
         id: &EdgeId,
         at: CommitId,
     ) -> io::Result<Option<BinderEdgeVersion>> {
+        if self.evicted_edge_ids.contains(id) {
+            let history = self.scan_edge_history_from_mmap(id)?;
+            return Ok(history
+                .into_iter()
+                .rfind(|v| v.valid_from <= at && v.valid_to.is_none_or(|to| at < to)));
+        }
         let entry = self
             .edge_index
             .get(id)
@@ -422,5 +504,229 @@ impl VersionStore {
         let mut buf = vec![0u8; len];
         self.file.read_exact(&mut buf)?;
         bincode::deserialize(&buf).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    /// Drop all historical (valid_to = Some) IndexEntry records from RAM.
+    /// Live entries (valid_to = None) are kept so retire / append remain correct.
+    /// Affected IDs are added to `evicted_object_ids` / `evicted_edge_ids`.
+    fn evict_cold_history(&mut self) {
+        for (id, entries) in &mut self.object_index {
+            let before = entries.len();
+            entries.retain(|e| e.valid_to.is_none());
+            let dropped = before - entries.len();
+            if dropped > 0 {
+                self.total_index_entries -= dropped;
+                self.evicted_object_ids.insert(id.clone());
+            }
+        }
+        for (id, entries) in &mut self.edge_index {
+            let before = entries.len();
+            entries.retain(|e| e.valid_to.is_none());
+            let dropped = before - entries.len();
+            if dropped > 0 {
+                self.total_index_entries -= dropped;
+                self.evicted_edge_ids.insert(id.clone());
+            }
+        }
+    }
+
+    fn maybe_evict(&mut self) {
+        if self.total_index_entries > self.max_history_entries {
+            self.evict_cold_history();
+        }
+    }
+
+    /// Scan the mmap'd `version_log.bin` to rebuild the full history for `id`.
+    /// Used when the ID's historical index entries have been evicted.
+    fn scan_object_history_from_mmap(
+        &mut self,
+        id: &ObjectId,
+    ) -> io::Result<Vec<BinderObjectVersion>> {
+        if self.mmap.is_none() && self.write_pos > 0 {
+            self.refresh_mmap()?;
+        }
+        let Some(ref mmap) = self.mmap else {
+            return Ok(vec![]);
+        };
+        // Borrow the mmap slice for the scan.
+        let mut versions: Vec<BinderObjectVersion> = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= mmap.len() {
+            let len = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            let data_start = pos + 8;
+            if data_start + len > mmap.len() {
+                break;
+            }
+            let record: VersionRecord =
+                match bincode::deserialize(&mmap[data_start..data_start + len]) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+            match record {
+                VersionRecord::Object(v) if &v.object_id == id => {
+                    versions.push(v);
+                }
+                VersionRecord::RetireObject {
+                    id: ref rid,
+                    retired_at,
+                } if rid == id => {
+                    if let Some(v) = versions.iter_mut().rfind(|v| v.valid_to.is_none()) {
+                        v.valid_to = Some(retired_at);
+                    }
+                }
+                _ => {}
+            }
+            pos += 8 + len;
+        }
+        Ok(versions)
+    }
+
+    /// Same as `scan_object_history_from_mmap` but for edges.
+    fn scan_edge_history_from_mmap(&mut self, id: &EdgeId) -> io::Result<Vec<BinderEdgeVersion>> {
+        if self.mmap.is_none() && self.write_pos > 0 {
+            self.refresh_mmap()?;
+        }
+        let Some(ref mmap) = self.mmap else {
+            return Ok(vec![]);
+        };
+        let mut versions: Vec<BinderEdgeVersion> = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= mmap.len() {
+            let len = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            let data_start = pos + 8;
+            if data_start + len > mmap.len() {
+                break;
+            }
+            let record: VersionRecord =
+                match bincode::deserialize(&mmap[data_start..data_start + len]) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+            match record {
+                VersionRecord::Edge(v) if &v.edge_id == id => {
+                    versions.push(v);
+                }
+                VersionRecord::RetireEdge {
+                    id: ref rid,
+                    retired_at,
+                } if rid == id => {
+                    if let Some(v) = versions.iter_mut().rfind(|v| v.valid_to.is_none()) {
+                        v.valid_to = Some(retired_at);
+                    }
+                }
+                _ => {}
+            }
+            pos += 8 + len;
+        }
+        Ok(versions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{BinderObjectVersion, ObjectVersionId};
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    fn cid(n: u128) -> CommitId {
+        CommitId(Ulid(n))
+    }
+
+    fn make_obj_version(
+        id: &str,
+        payload: &[u8],
+        valid_from: CommitId,
+        valid_to: Option<CommitId>,
+    ) -> BinderObjectVersion {
+        BinderObjectVersion {
+            version_id: ObjectVersionId(Ulid::nil()),
+            object_id: ObjectId::new(id),
+            commit_id: valid_from,
+            valid_from,
+            valid_to,
+            payload: Some(payload.to_vec()),
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn eviction_drops_historical_entries_and_keeps_live() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.bin");
+        // Cap of 3: after 4 appends of the same object eviction triggers.
+        let mut vs = VersionStore::open_or_create_with_cap(&path, 3).unwrap();
+
+        // Write 4 versions of object "x" — v1 → v2 → v3 → v4.
+        let v1 = make_obj_version("x", b"v1", cid(1), Some(cid(2)));
+        let v2 = make_obj_version("x", b"v2", cid(2), Some(cid(3)));
+        let v3 = make_obj_version("x", b"v3", cid(3), Some(cid(4)));
+        let v4 = make_obj_version("x", b"v4", cid(4), None);
+
+        vs.append_object(&v1).unwrap();
+        vs.retire_object(&ObjectId::new("x"), cid(2)).unwrap();
+        vs.append_object(&v2).unwrap();
+        vs.retire_object(&ObjectId::new("x"), cid(3)).unwrap();
+        vs.append_object(&v3).unwrap();
+        vs.retire_object(&ObjectId::new("x"), cid(4)).unwrap();
+        // 3 entries now — cap reached. Next append triggers eviction.
+        vs.append_object(&v4).unwrap();
+
+        // After eviction x should be in evicted_object_ids.
+        assert!(vs.evicted_object_ids.contains(&ObjectId::new("x")));
+        assert_eq!(vs.evicted_object_count(), 1);
+        // The live entry (v4) is kept; historical ones were dropped.
+        let in_mem = vs.object_index.get(&ObjectId::new("x")).unwrap();
+        assert_eq!(in_mem.len(), 1, "only live entry should remain in memory");
+        assert!(in_mem[0].valid_to.is_none(), "surviving entry must be live");
+    }
+
+    #[test]
+    fn evicted_id_history_recovered_via_mmap_scan() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.bin");
+        let mut vs = VersionStore::open_or_create_with_cap(&path, 3).unwrap();
+
+        let id = ObjectId::new("y");
+        for i in 0u128..4 {
+            let valid_to = if i < 3 { Some(cid(i + 2)) } else { None };
+            let v = make_obj_version("y", format!("v{i}").as_bytes(), cid(i + 1), valid_to);
+            if i > 0 {
+                vs.retire_object(&id, cid(i + 1)).unwrap();
+            }
+            vs.append_object(&v).unwrap();
+        }
+
+        // y must have been evicted.
+        assert!(vs.evicted_object_ids.contains(&id));
+
+        // Full history must still be recoverable.
+        let history = vs.object_history(&id).unwrap();
+        assert_eq!(history.len(), 4);
+        assert!(history.last().unwrap().valid_to.is_none());
+
+        // as_of at commit 2 should return v1 (valid_from=1, valid_to=2).
+        let snap = vs.object_as_of(&id, cid(1)).unwrap();
+        assert!(snap.is_some());
+        assert_eq!(snap.unwrap().payload, Some(b"v0".to_vec()));
+    }
+
+    #[test]
+    fn index_entry_count_tracks_correctly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.bin");
+        let mut vs = VersionStore::open_or_create_with_cap(&path, 1_000_000).unwrap();
+
+        let id = ObjectId::new("z");
+        assert_eq!(vs.index_entry_count(), 0, "fresh store has no entries");
+        let v1 = make_obj_version("z", b"a", cid(1), None);
+        vs.append_object(&v1).unwrap();
+        assert_eq!(vs.index_entry_count(), 1, "one entry after first append");
+
+        // Retire and append second version.
+        vs.retire_object(&id, cid(2)).unwrap();
+        let v2 = make_obj_version("z", b"b", cid(2), None);
+        vs.append_object(&v2).unwrap();
+        assert_eq!(vs.index_entry_count(), 2);
     }
 }
