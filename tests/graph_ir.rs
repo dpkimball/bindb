@@ -1,4 +1,4 @@
-use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
+use bindb::{BinderStore, EdgeId, GraphIrQuery, ObjectId, Transaction};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -149,5 +149,58 @@ fn ir_payload_predicate_filters_by_json_field() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].object.object_id.0, "a://high");
+    store.close().unwrap();
+}
+
+#[test]
+fn ir_projected_extracts_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://root"), b"{}".to_vec());
+    tx.put_object(
+        obj("note://a"),
+        br#"{"sentiment":0.9,"label":"positive"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("note://b"),
+        br#"{"sentiment":0.3,"label":"negative"}"#.to_vec(),
+    );
+    tx.put_edge(eid("e1"), obj("hub://root"), obj("note://a"), "LINKS", None);
+    tx.put_edge(eid("e2"), obj("hub://root"), obj("note://b"), "LINKS", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINKS]->(b) WHERE id(a) = 'hub://root' RETURN b.sentiment, b.label",
+    )
+    .unwrap();
+    assert_eq!(q.return_fields, vec!["sentiment", "label"]);
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    // Find the row for note://a and verify both fields are projected.
+    let row_a = rows.iter().find(|r| r.object_id.0 == "note://a").unwrap();
+    assert_eq!(
+        row_a.fields.get("sentiment").and_then(|v| v.as_f64()),
+        Some(0.9)
+    );
+    assert_eq!(
+        row_a.fields.get("label").and_then(|v| v.as_str()),
+        Some("positive")
+    );
+
+    // note://b should have sentiment 0.3 and label "negative".
+    let row_b = rows.iter().find(|r| r.object_id.0 == "note://b").unwrap();
+    assert_eq!(
+        row_b.fields.get("sentiment").and_then(|v| v.as_f64()),
+        Some(0.3)
+    );
+    assert_eq!(
+        row_b.fields.get("label").and_then(|v| v.as_str()),
+        Some("negative")
+    );
+
     store.close().unwrap();
 }

@@ -16,11 +16,23 @@
 //!   AND id(b) STARTS WITH 'memory://'
 //!   AND b.sentiment > 0.8
 //! RETURN b
+//!
+//! -- Field projections (payload must be a UTF-8 JSON object):
+//! MATCH (a)-[:RELATES_TO*1..3]->(b)
+//! WHERE id(a) = 'person://alice'
+//! RETURN b.sentiment
+//!
+//! MATCH (a)-[:RELATES_TO*1..3]->(b)
+//! WHERE id(a) = 'person://alice'
+//! RETURN b.sentiment, b.label
 //! ```
 //!
 //! Payload predicate operators: `>`, `<`, `>=`, `<=`, `=`, `!=`.
 //! The right-hand side may be a number literal or a quoted string.
 //! String comparison uses lexicographic ordering.
+//!
+//! `RETURN b` returns matched node ids (`graph_ir` / `graph_ir_parsed`).
+//! `RETURN b.field …` returns projected rows via `graph_ir_projected`.
 //!
 //! Notes:
 //! - `*min..max` / `*n` set max_depth and filter results to `depth >= min`.
@@ -31,6 +43,7 @@ use crate::engine::BinderStore;
 use crate::error::StoreError;
 use crate::graph_query::{Direction, GraphQueryMatch};
 use crate::types::ObjectId;
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -80,6 +93,17 @@ pub struct PayloadPred {
     pub value: CmpValue,
 }
 
+/// One row returned by `graph_ir_projected`.
+///
+/// `fields` contains only the keys requested in `RETURN b.field1, b.field2`.
+/// Missing or non-JSON payloads produce no entries for that key.
+#[derive(Debug, Clone)]
+pub struct GraphIrRow {
+    pub object_id: ObjectId,
+    pub depth: usize,
+    pub fields: HashMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphIrQuery {
     pub start: ObjectId,
@@ -92,6 +116,9 @@ pub struct GraphIrQuery {
     pub end_pred: NodeIdPred,
     /// Optional payload field predicate applied to matched end nodes.
     pub payload_pred: Option<PayloadPred>,
+    /// Fields to project from each matched node's JSON payload (`RETURN b.f1, b.f2`).
+    /// Empty = plain node return via `graph_ir` / `graph_ir_parsed`.
+    pub return_fields: Vec<String>,
 }
 
 impl GraphIrQuery {
@@ -134,8 +161,8 @@ impl GraphIrQuery {
         if !starts_with_keyword(after_preds2, "RETURN") {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
-        // RETURN clause is accepted but ignored (always return matched nodes).
-        let _ = skip_keyword(after_preds2, "RETURN");
+        let after_return = skip_keyword(after_preds2, "RETURN");
+        let return_fields = parse_return_fields(after_return);
 
         Ok(GraphIrQuery {
             start,
@@ -145,6 +172,7 @@ impl GraphIrQuery {
             direction,
             end_pred,
             payload_pred,
+            return_fields,
         })
     }
 }
@@ -493,6 +521,31 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
     }
 }
 
+/// Parse `RETURN b` → `[]` (plain node return) or
+/// `RETURN b.f1, b.f2` → `["f1", "f2"]`.
+fn parse_return_fields(s: &str) -> Vec<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return vec![];
+    }
+    let mut fields = Vec::new();
+    for part in s.split(',') {
+        let p = part.trim();
+        // Strip the "b." / "B." prefix; bare "b" means no field projection.
+        if let Some(field) = p
+            .strip_prefix("b.")
+            .or_else(|| p.strip_prefix("B."))
+        {
+            let f = field.trim().to_string();
+            if !f.is_empty() {
+                fields.push(f);
+            }
+        }
+        // "b" alone → plain return; ignore (fields stays empty for this token)
+    }
+    fields
+}
+
 impl BinderStore {
     /// Execute a restricted MATCH / WHERE / RETURN graph IR string (issue #2).
     pub fn graph_ir(&self, query: &str) -> Result<Vec<GraphQueryMatch>, StoreError> {
@@ -538,6 +591,44 @@ impl BinderStore {
             matches.retain(|m| m.depth >= q.min_depth);
         }
         Ok(matches)
+    }
+
+    /// Execute a pre-parsed query with field projections (`RETURN b.f1, b.f2`).
+    ///
+    /// Each returned [`GraphIrRow`] contains the matched node's id, traversal depth,
+    /// and a map of the requested fields extracted from its JSON payload.
+    /// Fields absent from the payload or non-JSON payloads produce no entry for
+    /// that key rather than an error.
+    ///
+    /// If `q.return_fields` is empty this method still works but `fields` will
+    /// always be empty — prefer `graph_ir_parsed` for plain node return.
+    pub fn graph_ir_projected(&self, q: &GraphIrQuery) -> Result<Vec<GraphIrRow>, StoreError> {
+        let matches = self.graph_ir_parsed(q)?;
+        let rows = matches
+            .into_iter()
+            .map(|m| {
+                let mut fields = HashMap::new();
+                if !q.return_fields.is_empty() {
+                    if let Some(payload) = m.object.payload.as_deref() {
+                        if let Ok(text) = std::str::from_utf8(payload) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                                for key in &q.return_fields {
+                                    if let Some(val) = v.get(key) {
+                                        fields.insert(key.clone(), val.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                GraphIrRow {
+                    object_id: m.object.object_id.clone(),
+                    depth: m.depth,
+                    fields,
+                }
+            })
+            .collect();
+        Ok(rows)
     }
 }
 
@@ -614,5 +705,24 @@ mod tests {
     fn no_payload_pred_when_absent() {
         let q = GraphIrQuery::parse("MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b").unwrap();
         assert!(q.payload_pred.is_none());
+        assert!(q.return_fields.is_empty());
+    }
+
+    #[test]
+    fn parses_return_single_field() {
+        let q = GraphIrQuery::parse(
+            "MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b.sentiment",
+        )
+        .unwrap();
+        assert_eq!(q.return_fields, vec!["sentiment"]);
+    }
+
+    #[test]
+    fn parses_return_multiple_fields() {
+        let q = GraphIrQuery::parse(
+            "MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b.sentiment, b.label",
+        )
+        .unwrap();
+        assert_eq!(q.return_fields, vec!["sentiment", "label"]);
     }
 }
