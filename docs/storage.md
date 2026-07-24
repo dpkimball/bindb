@@ -12,9 +12,33 @@ For implementation invariants see [PRINCIPLES.md](../PRINCIPLES.md).
 {store_path}/
 ├── commits.wal           ← append-only WAL — the only canonical store
 ├── checkpoint.log        ← 20-byte records: wal_offset + commit_count + CRC32
+├── version_log.bin       ← disk projection of version history (rebuildable from WAL)
 ├── vector_projection.bin ← persisted VectorIndex snapshot (written on clean close)
 └── .dirty                ← crash sentinel; present = last close was unclean
 ```
+
+### version_log.bin
+
+Offloads `BinderObjectVersion` / `BinderEdgeVersion` payloads from RAM to disk.
+In RAM, `VersionStore` keeps only `(valid_from, valid_to, byte_offset)` per version
+(~40 bytes), while full structs live in the file.
+
+**Format:** sequence of length-prefixed bincode frames:
+```
+[u64 payload_len LE][bincode of VersionRecord]
+```
+
+`VersionRecord` variants: `Object`, `Edge`, `RetireObject { id, retired_at }`,
+`RetireEdge { id, retired_at }`. Retire records are appended when a version is
+superseded — the file is purely append-only; no frame rewriting.
+
+**mmap read path:** After rebuild or hydration the file is memory-mapped (`memmap2`).
+`read_record_at` indexes the mmap slice directly — zero seek/read syscalls per lookup.
+Appends invalidate the mapping; the next read lazily re-maps.
+
+**Rebuild invariant:** `version_log.bin` is a non-canonical projection. It can be
+truncated and fully rebuilt from `object_versions` / `edge_versions` (WAL projections)
+at any time.
 
 The store directory is also used as a process-level lock — only one process may open a
 given store path at a time.
