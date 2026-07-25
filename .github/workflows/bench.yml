@@ -71,6 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch origin gh-pages:gh-pages 2>/dev/null || true
+          git worktree remove --force /tmp/gh-pages 2>/dev/null || rm -rf /tmp/gh-pages || true
           git worktree add /tmp/gh-pages gh-pages
 
           # Update rolling history: append current run, keep last 10 entries.
