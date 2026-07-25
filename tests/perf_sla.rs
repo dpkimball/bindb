@@ -38,6 +38,9 @@ const OPEN_REPLAY_M_MS_MAX: u64 = 30; // ms — WAL replay at 10 K commits (O(n)
 
 // ── bulk ingest threshold constants ──────────────────────────────────────────
 const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — 50 K batch (OKR O2/KR2.2)
+/// 500 K single-field observation import must complete in ≤ 90 s (OKR O2/KR2.3).
+/// Apple Health import scenario: one object per data point, 64-byte payload.
+const HEALTH_IMPORT_500K_S_MAX: f64 = 90.0;
 
 // ── vector / ANN threshold constants ─────────────────────────────────────────
 const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
@@ -853,5 +856,33 @@ fn sla_xl_rebuild_indexes_lte_60s_at_1m_objects() {
         "rebuild_indexes() {} ms > XL-scale SLA maximum {} ms (1 M objects)",
         ms,
         REBUILD_XL_MS_MAX
+    );
+}
+
+// ── health import SLA (OKR O2/KR2.3) ─────────────────────────────────────────
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_health_import_500k_lte_90s() {
+    // Simulates a full Apple Health annual import: 500 K observations, each a
+    // single object with a 64-byte payload, committed buffered + one flush.
+    let dir = tempfile::tempdir().unwrap();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let n = 500_000usize;
+
+    let start = Instant::now();
+    for i in 0..n {
+        let mut tx = Transaction::new();
+        tx.put_object(ObjectId::new(format!("health://obs/{i}")), vec![0u8; 64]);
+        store.commit_buffered(tx, "test", "").unwrap();
+    }
+    store.flush().unwrap();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    assert!(
+        elapsed <= HEALTH_IMPORT_500K_S_MAX,
+        "500 K health import took {:.1} s — SLA ≤ {:.0} s",
+        elapsed,
+        HEALTH_IMPORT_500K_S_MAX
     );
 }
