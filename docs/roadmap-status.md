@@ -2,6 +2,7 @@
 
 Last updated: 2026-07-25. Prefer this over stale issue bodies.
 
+
 | Issue | State | Shipped | Remaining / follow-up |
 |-------|-------|---------|----------------------|
 | [#1](https://github.com/dpkimball/bindb/issues/1) WAL compaction | Closed | `compact()`, snapshot + WAL truncate | Ops policy for when to compact |

@@ -49,10 +49,13 @@ One fsync for an entire batch.  Throughput is serialization-bound.
 | Throughput at **M** (10 K batch, CI floor) | ≥ 8 K commits/sec |
 | Throughput at **M** (50 K batch, CI floor) | ≥ 5 K commits/sec |
 | `flush()` wall time after 10 K buffered commits | ≤ 20 ms |
+| **Apple Health import: 500 K observations, 64-byte payload** | **≤ 90 s end-to-end** |
 
 Rationale: Apple Health import (500 K data points) must complete in < 2 minutes.
-8 K commits/sec means 500 K points takes ~62 seconds.  The 50 K batch floor ensures
-throughput stays above 5 K/sec as store size grows past a single namespace.
+8 K commits/sec means 500 K points takes ~62 seconds at the 10 K-batch floor.
+The 90 s end-to-end ceiling (OKR O2/KR2.3) accounts for serialization + the single
+`flush()` and is measured in `perf_sla.rs` (`sla_health_import_500k_lte_90s`) and
+`examples/perf_report.rs` (`health_import_500k_s` metric).
 
 ---
 

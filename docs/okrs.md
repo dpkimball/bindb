@@ -30,7 +30,7 @@ Life-scale: ~500 K observations/year. Buffered path is the bottleneck.
 |----|--------|-------------|
 | KR2.1 | `commit_buffered` 10 K batch ≥ **8_000** commits/sec on CI runner (raise SLA floor from 3_000) | `commit_buffered_tps` in report + SLA constant bump |
 | KR2.2 | `commit_buffered` 50 K batch ≥ **5_000** commits/sec (new report metric + SLA) | New metric id in `perf-report.json` |
-| KR2.3 | Documented wall-clock for **500 K** single-field observation import ≤ **90 s** on baseline hardware | Scripted import in report or separate `examples/health_import_bench.rs`; number checked into report comment |
+| KR2.3 ✅ | Documented wall-clock for **500 K** single-field observation import ≤ **90 s** on baseline hardware | `health_import_500k_s` metric in `perf-report.json`; SLA test `sla_health_import_500k_lte_90s` in `perf_sla.rs`; row in `docs/sla.md` |
 
 If KR2.* miss: attach flamegraph / lock contention notes; do not silently lower the bar.
 
@@ -44,7 +44,7 @@ HNSW landed; it is not yet an SLA.
 |----|--------|-------------|
 | KR3.1 | Add `vector_search_p99_ms` at **100 K** vectors (dim 384 or project default) ≤ **5 ms** for k=10 | New SLA + report row |
 | KR3.2 | `hnsw_recall_at_10` ≥ **90%** at 100 K (raise from 80% @ 1.2 K) | Report + `tests/vector_index.rs` |
-| KR3.3 | `docs/performance.md` complexity table says ANN (HNSW), not O(n) scan | Doc fix merged |
+| KR3.3 ✅ | `docs/performance.md` complexity table says ANN (HNSW), not O(n) scan | Already present: table row says "O(log n) approx with HNSW when live count ≥ 1 000 / model; else O(n) brute cosine" |
 
 ---
 

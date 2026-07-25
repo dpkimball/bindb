@@ -23,6 +23,9 @@ use tempfile::TempDir;
 const COMMIT_THROUGHPUT_MIN: f64 = 80.0;
 const COMMIT_BUFFERED_THROUGHPUT_MIN: f64 = 8_000.0;
 const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: f64 = 5_000.0;
+/// KR2.3: Apple Health import of 500 K single-field observations must complete
+/// in ≤ 90 s using commit_buffered() + flush().
+const HEALTH_IMPORT_500K_S_MAX: f64 = 90.0;
 const FLUSH_WALL_MS_MAX: f64 = 20.0;
 const GET_P99_US_MAX: f64 = 10.0;
 const LIST_P99_MS_MAX: f64 = 2.0;
@@ -172,6 +175,32 @@ fn measure_all() -> Vec<Metric> {
             unit: "commits/sec",
             bound: COMMIT_BUFFERED_50K_THROUGHPUT_MIN,
             higher_is_better: true,
+        });
+    }
+
+    // 500 K health import (OKR O2/KR2.3)
+    // Simulates a single-field Apple Health observation: one object per data
+    // point, 64-byte payload (timestamp + value), committed buffered + one flush.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BinderStore::open(dir.path()).unwrap();
+        let n = 500_000usize;
+        let t = Instant::now();
+        for i in 0..n {
+            let mut tx = Transaction::new();
+            tx.put_object(obj(format!("health://obs/{i}")), vec![0u8; 64]);
+            store.commit_buffered(tx, "report", "").unwrap();
+        }
+        store.flush().unwrap();
+        let wall_s = t.elapsed().as_secs_f64();
+        out.push(Metric {
+            id: "health_import_500k_s",
+            name: "500 K observation import wall time",
+            scale: "L (500 K batch)",
+            value: wall_s,
+            unit: "s",
+            bound: HEALTH_IMPORT_500K_S_MAX,
+            higher_is_better: false,
         });
     }
 
