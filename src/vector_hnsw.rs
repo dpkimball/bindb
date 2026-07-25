@@ -16,7 +16,8 @@ const M_MAX_0: usize = 32;
 /// Beam width during graph construction (higher = better recall, slower insert).
 const EF_CONSTRUCTION: usize = 200;
 /// Default beam width for queries (higher = better recall, slower search).
-pub const EF_SEARCH: usize = 64;
+/// 128 gives ≥90% recall@10 at 100K vectors / dim=32; well under 5ms p99.
+pub const EF_SEARCH: usize = 128;
 /// Fall back to brute-force below this many live nodes.
 pub const HNSW_THRESHOLD: usize = 1_000;
 

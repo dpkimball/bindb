@@ -187,8 +187,10 @@ jobs:
           auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           # Post a PR comment showing delta from master baseline.
           comment-on-alert: true
-          # Flag (but don't fail) if a benchmark regresses more than 20 %.
-          alert-threshold: "120%"
+          # Flag (but don't fail) if a benchmark regresses more than 3×.
+          # durable-commit benchmarks are fsync-latency-bound and highly variable
+          # on shared runners; 200% avoids false alerts from runner preemption.
+          alert-threshold: "300%"
           fail-on-alert: false
           # Store baseline data in the gh-pages branch.
           gh-pages-branch: gh-pages
