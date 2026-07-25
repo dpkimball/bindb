@@ -309,7 +309,11 @@ fn evicted_edges_still_accessible_via_version_store() {
     store.commit(tx3, "actor", "edge1").unwrap();
 
     let edges = store.edges_from(&ObjectId::new("node:0")).unwrap();
-    assert_eq!(edges.len(), 2, "both edges must be returned even if evicted");
+    assert_eq!(
+        edges.len(),
+        2,
+        "both edges must be returned even if evicted"
+    );
 
     store.close().unwrap();
 }

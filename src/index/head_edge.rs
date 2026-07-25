@@ -61,13 +61,9 @@ impl HeadEdgeIndex {
     }
 
     pub fn all_live(&self) -> impl Iterator<Item = &BinderEdgeVersion> {
-        self.map.values().filter_map(|(v, _)| {
-            if v.is_tombstone() {
-                None
-            } else {
-                Some(v)
-            }
-        })
+        self.map
+            .values()
+            .filter_map(|(v, _)| if v.is_tombstone() { None } else { Some(v) })
     }
 
     pub fn len(&self) -> usize {

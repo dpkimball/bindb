@@ -84,13 +84,9 @@ impl HeadObjectIndex {
     /// All non-tombstone current versions in the cache.
     /// See `all()` for the completeness caveat.
     pub fn all_live(&self) -> impl Iterator<Item = &BinderObjectVersion> {
-        self.map.values().filter_map(|(v, _)| {
-            if v.is_tombstone() {
-                None
-            } else {
-                Some(v)
-            }
-        })
+        self.map
+            .values()
+            .filter_map(|(v, _)| if v.is_tombstone() { None } else { Some(v) })
     }
 
     pub fn len(&self) -> usize {
