@@ -154,7 +154,9 @@ impl VersionStore {
                     valid_to: v.valid_to,
                     offset,
                 });
-            self.total_index_entries += 1;
+            if v.valid_to.is_some() {
+                self.total_index_entries += 1;
+            }
         }
 
         for v in edges {
@@ -167,7 +169,9 @@ impl VersionStore {
                     valid_to: v.valid_to,
                     offset,
                 });
-            self.total_index_entries += 1;
+            if v.valid_to.is_some() {
+                self.total_index_entries += 1;
+            }
         }
 
         self.file.flush()?;
@@ -212,6 +216,7 @@ impl VersionStore {
             };
             match record {
                 VersionRecord::Object(v) => {
+                    let historical = v.valid_to.is_some();
                     self.object_index
                         .entry(v.object_id)
                         .or_default()
@@ -220,9 +225,12 @@ impl VersionStore {
                             valid_to: v.valid_to,
                             offset,
                         });
-                    self.total_index_entries += 1;
+                    if historical {
+                        self.total_index_entries += 1;
+                    }
                 }
                 VersionRecord::Edge(v) => {
+                    let historical = v.valid_to.is_some();
                     self.edge_index
                         .entry(v.edge_id)
                         .or_default()
@@ -231,12 +239,15 @@ impl VersionStore {
                             valid_to: v.valid_to,
                             offset,
                         });
-                    self.total_index_entries += 1;
+                    if historical {
+                        self.total_index_entries += 1;
+                    }
                 }
                 VersionRecord::RetireObject { id, retired_at } => {
                     if let Some(entries) = self.object_index.get_mut(&id) {
                         if let Some(e) = entries.iter_mut().rfind(|e| e.valid_to.is_none()) {
                             e.valid_to = Some(retired_at);
+                            self.total_index_entries += 1;
                         }
                     }
                 }
@@ -244,6 +255,7 @@ impl VersionStore {
                     if let Some(entries) = self.edge_index.get_mut(&id) {
                         if let Some(e) = entries.iter_mut().rfind(|e| e.valid_to.is_none()) {
                             e.valid_to = Some(retired_at);
+                            self.total_index_entries += 1;
                         }
                     }
                 }
@@ -290,8 +302,13 @@ impl VersionStore {
                 valid_to: v.valid_to,
                 offset,
             });
-        self.total_index_entries += 1;
-        self.maybe_evict();
+        // Only historical (valid_to = Some) entries count toward the eviction
+        // cap. Live entries cannot be freed, so counting them would cause
+        // spurious O(N) eviction sweeps that drop nothing.
+        if v.valid_to.is_some() {
+            self.total_index_entries += 1;
+            self.maybe_evict();
+        }
         Ok(())
     }
 
@@ -306,8 +323,10 @@ impl VersionStore {
                 valid_to: v.valid_to,
                 offset,
             });
-        self.total_index_entries += 1;
-        self.maybe_evict();
+        if v.valid_to.is_some() {
+            self.total_index_entries += 1;
+            self.maybe_evict();
+        }
         Ok(())
     }
 
@@ -321,6 +340,9 @@ impl VersionStore {
         if let Some(entries) = self.object_index.get_mut(id) {
             if let Some(e) = entries.iter_mut().rfind(|e| e.valid_to.is_none()) {
                 e.valid_to = Some(retired_at);
+                // The entry just became historical — count it now.
+                self.total_index_entries += 1;
+                self.maybe_evict();
             }
         }
         Ok(())
@@ -335,6 +357,8 @@ impl VersionStore {
         if let Some(entries) = self.edge_index.get_mut(id) {
             if let Some(e) = entries.iter_mut().rfind(|e| e.valid_to.is_none()) {
                 e.valid_to = Some(retired_at);
+                self.total_index_entries += 1;
+                self.maybe_evict();
             }
         }
         Ok(())
@@ -654,28 +678,28 @@ mod tests {
     fn eviction_drops_historical_entries_and_keeps_live() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vs.bin");
-        // Cap of 3: after 4 appends of the same object eviction triggers.
-        let mut vs = VersionStore::open_or_create_with_cap(&path, 3).unwrap();
+        // Cap of 2 historical entries. Only retired (valid_to=Some) entries count
+        // toward the cap; live entries do not. Eviction fires when historical > cap.
+        let mut vs = VersionStore::open_or_create_with_cap(&path, 2).unwrap();
 
         // Write 4 versions of object "x" — v1 → v2 → v3 → v4.
+        // v1/v2/v3 are appended pre-retired (valid_to already set).
         let v1 = make_obj_version("x", b"v1", cid(1), Some(cid(2)));
         let v2 = make_obj_version("x", b"v2", cid(2), Some(cid(3)));
         let v3 = make_obj_version("x", b"v3", cid(3), Some(cid(4)));
         let v4 = make_obj_version("x", b"v4", cid(4), None);
 
-        vs.append_object(&v1).unwrap();
-        vs.retire_object(&ObjectId::new("x"), cid(2)).unwrap();
-        vs.append_object(&v2).unwrap();
-        vs.retire_object(&ObjectId::new("x"), cid(3)).unwrap();
-        vs.append_object(&v3).unwrap();
-        vs.retire_object(&ObjectId::new("x"), cid(4)).unwrap();
-        // 3 entries now — cap reached. Next append triggers eviction.
-        vs.append_object(&v4).unwrap();
+        // Each historical append increments the counter; eviction fires at > 2.
+        vs.append_object(&v1).unwrap(); // historical count = 1
+        vs.append_object(&v2).unwrap(); // historical count = 2
+        vs.append_object(&v3).unwrap(); // historical count = 3 → eviction fires here
 
         // After eviction x should be in evicted_object_ids.
         assert!(vs.evicted_object_ids.contains(&ObjectId::new("x")));
         assert_eq!(vs.evicted_object_count(), 1);
-        // The live entry (v4) is kept; historical ones were dropped.
+
+        // Appending the live version does not affect the historical count.
+        vs.append_object(&v4).unwrap();
         let in_mem = vs.object_index.get(&ObjectId::new("x")).unwrap();
         assert_eq!(in_mem.len(), 1, "only live entry should remain in memory");
         assert!(in_mem[0].valid_to.is_none(), "surviving entry must be live");
@@ -685,7 +709,8 @@ mod tests {
     fn evicted_id_history_recovered_via_mmap_scan() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vs.bin");
-        let mut vs = VersionStore::open_or_create_with_cap(&path, 3).unwrap();
+        // Cap of 2 historical entries; eviction fires when a 3rd historical is added.
+        let mut vs = VersionStore::open_or_create_with_cap(&path, 2).unwrap();
 
         let id = ObjectId::new("y");
         for i in 0u128..4 {
@@ -719,14 +744,23 @@ mod tests {
 
         let id = ObjectId::new("z");
         assert_eq!(vs.index_entry_count(), 0, "fresh store has no entries");
+
+        // Appending a live entry does NOT count — only historical entries do.
         let v1 = make_obj_version("z", b"a", cid(1), None);
         vs.append_object(&v1).unwrap();
-        assert_eq!(vs.index_entry_count(), 1, "one entry after first append");
+        assert_eq!(vs.index_entry_count(), 0, "live entry is not counted");
 
-        // Retire and append second version.
+        // Retiring v1 makes it historical — now it counts.
         vs.retire_object(&id, cid(2)).unwrap();
+        assert_eq!(
+            vs.index_entry_count(),
+            1,
+            "retired entry counted as historical"
+        );
+
+        // Appending a new live version still doesn't increase the historical count.
         let v2 = make_obj_version("z", b"b", cid(2), None);
         vs.append_object(&v2).unwrap();
-        assert_eq!(vs.index_entry_count(), 2);
+        assert_eq!(vs.index_entry_count(), 1, "second live entry not counted");
     }
 }

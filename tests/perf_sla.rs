@@ -50,6 +50,9 @@ const OPEN_REPLAY_L_MS_MAX: u64 = 300; // ms — WAL replay at 100 K commits
 
 const GET_XL_P99_US_MAX: u64 = 10; // µs — HashMap lookup stays O(1) at 1 M
 const OPEN_XL_AFTER_COMPACT_MS_MAX: u64 = 5_000; // ms — snapshot replay at 1 M
+const LIST_XL_P99_MS_MAX: u64 = 500; // ms — namespace list returning 100 K of 1 M
+const COMMIT_XL_BUFFERED_MIN: u64 = 3_000; // commits/sec — buffered writes must not degrade at XL
+const REBUILD_XL_MS_MAX: u64 = 60_000; // ms — rebuild_indexes() at 1 M objects (O(n) WAL replay)
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -629,5 +632,79 @@ fn sla_xl_open_lte_5s_after_compact_at_1m_objects() {
         "open() worst-of-3 {} ms > XL-scale SLA maximum {} ms (1 M objects after compact)",
         worst_ms,
         OPEN_XL_AFTER_COMPACT_MS_MAX
+    );
+}
+
+#[test]
+#[ignore = "perf scale:XL — cargo test --release -- --ignored --test-threads=1"]
+fn sla_xl_list_p99_lte_500ms_returning_100k_of_1m() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 namespaces × 100 K objects each = 1 M total; list("ns0://") returns 100 K.
+    let namespaces: Vec<String> = (0..10).map(|i| format!("ns{}", i)).collect();
+    let ns_refs: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    let store = build_store_xl(&dir, 1_000_000, &ns_refs);
+    let iterations = 20;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let results = store.list("ns0://").unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(results.len(), 100_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000; // ns → ms
+    assert!(
+        p99 <= LIST_XL_P99_MS_MAX,
+        "list() p99 {} ms > XL-scale SLA maximum {} ms (returning 100 K of 1 M objects)",
+        p99,
+        LIST_XL_P99_MS_MAX
+    );
+}
+
+#[test]
+#[ignore = "perf scale:XL — cargo test --release -- --ignored --test-threads=1"]
+fn sla_xl_commit_buffered_throughput_gte_3k_per_sec_at_1m_existing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_store_xl(&dir, 1_000_000, &["a"]);
+    // Measure a 10 K batch written on top of 1 M existing objects.
+    let n = 10_000usize;
+
+    let start = Instant::now();
+    for i in 0..n {
+        let mut tx = Transaction::new();
+        tx.put_object(obj(format!("b://new.{i:08}")), vec![0u8; 64]);
+        store.commit_buffered(tx, "test", "").unwrap();
+    }
+    store.flush().unwrap();
+    let elapsed = start.elapsed();
+
+    let throughput = n as f64 / elapsed.as_secs_f64();
+    assert!(
+        throughput >= COMMIT_XL_BUFFERED_MIN as f64,
+        "commit_buffered() throughput at XL scale {:.0} commits/sec < SLA minimum {} commits/sec",
+        throughput,
+        COMMIT_XL_BUFFERED_MIN
+    );
+}
+
+#[test]
+#[ignore = "perf scale:XL — cargo test --release -- --ignored --test-threads=1"]
+fn sla_xl_rebuild_indexes_lte_60s_at_1m_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_store_xl(&dir, 1_000_000, &["a", "b", "c", "d", "e"]);
+
+    // Single warm run, then measure once (rebuild at 1 M is slow by design).
+    store.rebuild_indexes().unwrap();
+
+    let t = Instant::now();
+    store.rebuild_indexes().unwrap();
+    let ms = t.elapsed().as_millis() as u64;
+
+    assert!(
+        ms <= REBUILD_XL_MS_MAX,
+        "rebuild_indexes() {} ms > XL-scale SLA maximum {} ms (1 M objects)",
+        ms,
+        REBUILD_XL_MS_MAX
     );
 }

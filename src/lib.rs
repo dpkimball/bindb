@@ -26,7 +26,8 @@ pub use edge::{BinderEdgeVersion, EdgeVersionId};
 pub use engine::BinderStore;
 pub use error::StoreError;
 pub use graph_ir::{
-    CmpOp, CmpValue, GraphIrError, GraphIrQuery, GraphIrRow, NodeIdPred, PayloadPred,
+    CmpOp, CmpValue, GraphIrError, GraphIrQuery, GraphIrRow, GraphIrWrite, GraphIrWriteError,
+    NodeIdPred, PayloadPred, WriteOp,
 };
 pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;

@@ -1100,6 +1100,76 @@ impl BinderStore {
         Ok(out)
     }
 
+    /// Run an arbitrary SQL query over observations via an out-of-process DuckDB.
+    ///
+    /// Exports the namespace's observations to a temporary NDJSON file, then
+    /// invokes `duckdb` (must be on `$PATH`) with a SQL query that references
+    /// `observations` as a virtual table name:
+    ///
+    /// ```text
+    /// SELECT object_id, value FROM observations WHERE value > 0.5
+    /// ```
+    ///
+    /// The literal string `observations` is rewritten to
+    /// `read_ndjson_auto('<tmp_path>')` before the query is executed.
+    /// Results are returned as raw DuckDB text output (tab-separated by default).
+    ///
+    /// Returns `StoreError::InvalidArgument` if `duckdb` is not installed.
+    pub fn query_sql_observations(
+        &self,
+        namespace_prefix: &str,
+        sql: &str,
+    ) -> Result<String, StoreError> {
+        use std::io::Write as _;
+
+        let jsonl = self.export_observations_jsonl(namespace_prefix)?;
+
+        // Write NDJSON to a temp file that DuckDB will read.
+        // Use a unique filename in the OS temp dir — no extra crate needed.
+        let tmp_path = std::env::temp_dir().join(format!(
+            "bindb_obs_{}.ndjson",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp_path).map_err(StoreError::Io)?;
+            f.write_all(&jsonl).map_err(StoreError::Io)?;
+        }
+        let path = tmp_path.to_string_lossy();
+
+        // Rewrite the virtual table name so callers use a stable alias.
+        let rewritten = sql.replace(
+            "observations",
+            &format!("read_ndjson_auto('{path}', ignore_errors=true)"),
+        );
+
+        let output = std::process::Command::new("duckdb")
+            .args(["-csv", "-c", &rewritten])
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StoreError::InvalidArgument {
+                        message: "duckdb binary not found on $PATH; install DuckDB to use query_sql_observations".to_string(),
+                    }
+                } else {
+                    StoreError::Io(e)
+                }
+            })?;
+
+        let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(StoreError::InvalidArgument {
+                message: format!("duckdb exited with error: {stderr}"),
+            });
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     // ── maintenance ───────────────────────────────────────────────────────────
 
     /// Explicitly rebuild all indexes from the commit log.
