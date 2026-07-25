@@ -64,7 +64,7 @@ Open() is the noisy gate today.
 
 | KR | Target | How we know |
 |----|--------|-------------|
-| KR5.1 | Written decision on issue **#6** (mmap / larger-than-RAM): ship spike, defer, or won’t-do with rationale | Issue comment + [`roadmap-status.md`](roadmap-status.md) interim defer |
+| KR5.1 ✅ | Written decision on issue **#6** (mmap / larger-than-RAM): ship spike, defer, or won’t-do with rationale | Head-cache LRU shipped (PR #17); next slice (payload stripping from `object_versions`) documented in [issue #6 comment](https://github.com/dpkimball/bindb/issues/6#issuecomment-5079074892) and `roadmap-status.md` |
 | KR5.2 | If defer/won’t-do: documented max practical store size for Binder (objects + RAM) in docs | Section in `roadmap-status.md` (+ pointer from `sla.md`) |
 | KR5.3 | Optional XL rows in `perf-report` (`PERF_REPORT_XL=1`); issue #7 stays open until a measured 1 M run is attached | Report contains `get_xl_p99_us` / `open_xl_ms` |
 
