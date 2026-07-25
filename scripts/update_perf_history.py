@@ -4,6 +4,10 @@ Append the current perf run to the rolling history file (last 10 entries).
 
 Usage:
     python3 scripts/update_perf_history.py <history.json> <perf-report.json>
+    python3 scripts/update_perf_history.py --seed-if-empty <history.json> <perf-report.json>
+
+With --seed-if-empty: only appends if history.json is currently empty (used to
+seed history with the existing master baseline on the first PR run).
 
 Reads history.json (array, may not exist), appends a new entry from
 perf-report.json, trims to 10 entries, and writes back to history.json.
@@ -15,12 +19,21 @@ from pathlib import Path
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        print("Usage: update_perf_history.py <history.json> <perf-report.json>", file=sys.stderr)
+    args = sys.argv[1:]
+    seed_if_empty = False
+    if args and args[0] == "--seed-if-empty":
+        seed_if_empty = True
+        args = args[1:]
+
+    if len(args) != 2:
+        print(
+            "Usage: update_perf_history.py [--seed-if-empty] <history.json> <perf-report.json>",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    history_path = Path(sys.argv[1])
-    report_path = Path(sys.argv[2])
+    history_path = Path(args[0])
+    report_path = Path(args[1])
 
     try:
         history = json.loads(history_path.read_text())
@@ -28,6 +41,9 @@ def main() -> None:
             history = []
     except (FileNotFoundError, json.JSONDecodeError):
         history = []
+
+    if seed_if_empty and history:
+        return
 
     try:
         with open(report_path) as f:
