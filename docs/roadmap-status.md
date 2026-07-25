@@ -9,7 +9,7 @@ Last updated: 2026-07-25. Prefer this over stale issue bodies.
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model; **100K SLA gate** (`knn_search` p99 ≤5ms, recall@10 ≥90%; OKR O3) | — |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation / SQL | Open | Rust DSL + `sql_aggregate()` (COUNT/AVG/SUM/MIN/MAX/P50/P99, PATH_SEGMENT, **WHERE id STARTS WITH**) + **`export_observations_jsonl()`** (DuckDB-compatible JSONL) + **`query_sql_observations(ns, sql)`** (out-of-process DuckDB; rewrites `observations` → `read_ndjson_auto(...)`) | Full SQL; joins |
-| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss) | mmap for head indexes |
+| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss); **head-cache LRU** (bounded HeadObjectIndex/HeadEdgeIndex, default 200 K; miss falls back to mmap-backed VersionStore; `open_with_head_cap()`; 6 integration tests) | Payload stripping from in-memory `object_versions` Vec (historical entries still hold payloads in RAM) |
 | [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open | Snapshot fast open; XL get/open-after-compact PASS; **formal XL SLA tests** + **nightly CI job** (02:00 UTC) + **3 new XL SLA tests** (`list` p99 ≤500ms, `commit_buffered` ≥5K/s, `rebuild_indexes` ≤60s at 1M objects); **eviction bug fix** (O(1M) sweep per commit fixed; `commit_buffered` at XL now 260K/s) | nightly runner uptime guarantee |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
 | [#9](https://github.com/dpkimball/bindb/issues/9) Checkpoint open | Closed | Snapshot fast path on `open()` | Variance / flake control (OKR O4) |
@@ -35,17 +35,24 @@ Rough **process RSS** model for a Binder life-scale store (order-of-magnitude):
 
 | Content | Count | Ballpark RAM |
 |---------|-------|--------------|
-| Live object heads | 100 K × ~200 B | ~20 MB |
-| Observation heads (1 yr health) | ~500 K × ~100 B | ~50 MB |
+| Live object heads (cached) | min(live, 200 K) × ~300 B | ≤ 60 MB |
+| Observation heads (1 yr health, cached) | min(live, 200 K) × ~100 B | ≤ 20 MB |
 | Version history index (10× churn) | ~1–5 M × ~40 B (index only) | ~40–200 MB |
 | Version history payloads | ~1–5 M records | on disk (version_log.bin) |
+| `object_versions` Vec (all live+hist in RAM) | ~1–5 M × ~300 B | **~300 MB–1.5 GB** |
 | Graph adjacency | proportional to edges | tens of MB |
 | Vector index (HNSW, if large) | model-dependent | separate |
 
-**Change from prior baseline:** version payloads are now on disk. The ~40 B/version
-index entry stays in RAM; `read_record_at` hits the mmap (OS page cache) rather than
-the heap. This reduces steady-state RSS for history-heavy stores by the payload size
-(~150–200 B/version saved from heap → page cache).
+**Change from prior baseline:** head cache is now bounded (default 200 K entries).
+Cold misses fall back to the mmap-backed VersionStore (~1 µs page-cache read).
+At XL with 1 M live objects only the 200 K most-recently-committed objects stay in
+the HeadObjectIndex; the rest are served from disk on first access.
+
+**Dominant remaining RAM contributor** (not yet addressed): the `object_versions`
+Vec still holds every live + historical version (including payloads) in RAM.
+At XL this is the largest single allocation (~300 MB–1.5 GB).  The next slice of #6
+work is stripping payloads from retired entries in `object_versions` after the payload
+has been persisted to `version_log.bin`.
 
 **Measured XL (1 M objects, 2026-07-23, Apple Silicon, release, after compact):**
 

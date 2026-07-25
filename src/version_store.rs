@@ -364,6 +364,54 @@ impl VersionStore {
         Ok(())
     }
 
+    /// Current (head) version of an object, read from the mmap'd log.
+    /// Returns `None` when the object is unknown to this VersionStore.
+    /// Used by the engine as a fallback when the head cache has evicted the entry.
+    pub fn get_head_object(&mut self, id: &ObjectId) -> io::Result<Option<BinderObjectVersion>> {
+        if self.evicted_object_ids.contains(id) {
+            let history = self.scan_object_history_from_mmap(id)?;
+            return Ok(history.into_iter().find(|v| v.valid_to.is_none()));
+        }
+        let entry = self
+            .object_index
+            .get(id)
+            .and_then(|entries| entries.iter().rfind(|e| e.valid_to.is_none()))
+            .map(|e| e.offset);
+        match entry {
+            None => Ok(None),
+            Some(offset) => match self.read_record_at(offset)? {
+                VersionRecord::Object(mut v) => {
+                    v.valid_to = None;
+                    Ok(Some(v))
+                }
+                _ => Ok(None),
+            },
+        }
+    }
+
+    /// Current (head) version of an edge, read from the mmap'd log.
+    pub fn get_head_edge(&mut self, id: &EdgeId) -> io::Result<Option<BinderEdgeVersion>> {
+        if self.evicted_edge_ids.contains(id) {
+            let history = self.scan_edge_history_from_mmap(id)?;
+            return Ok(history.into_iter().find(|v| v.valid_to.is_none()));
+        }
+        let entry = self
+            .edge_index
+            .get(id)
+            .and_then(|entries| entries.iter().rfind(|e| e.valid_to.is_none()))
+            .map(|e| e.offset);
+        match entry {
+            None => Ok(None),
+            Some(offset) => match self.read_record_at(offset)? {
+                VersionRecord::Edge(mut v) => {
+                    v.valid_to = None;
+                    Ok(Some(v))
+                }
+                _ => Ok(None),
+            },
+        }
+    }
+
     /// All versions of an object in ascending commit order.
     pub fn object_history(&mut self, id: &ObjectId) -> io::Result<Vec<BinderObjectVersion>> {
         if self.evicted_object_ids.contains(id) {
