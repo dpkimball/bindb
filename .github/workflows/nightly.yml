@@ -1,5 +1,9 @@
 name: Nightly XL
 
+# Runs XL-scale (1 M objects) SLA tests on the self-hosted runner.
+# Failures are detected by nightly_watchdog.yml (02:45 UTC, ubuntu-latest)
+# which opens a GitHub issue if this job is still queued, failed, or absent.
+
 on:
   schedule:
     # 02:00 UTC every day — self-hosted runner must be online.
@@ -9,6 +13,9 @@ on:
 concurrency:
   group: bindb-nightly
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
