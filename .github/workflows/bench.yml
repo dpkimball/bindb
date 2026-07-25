@@ -72,11 +72,16 @@ jobs:
           set -euo pipefail
           git fetch origin gh-pages:gh-pages 2>/dev/null || true
           git worktree add /tmp/gh-pages gh-pages
+
+          # Update rolling history: append current run, keep last 10 entries.
+          python3 scripts/update_perf_history.py \
+            /tmp/gh-pages/perf-history.json perf-out/perf-report.json
+
           cp perf-out/perf-report.json /tmp/gh-pages/perf-report-latest.json
           cd /tmp/gh-pages
           git config user.email "actions@github.com"
           git config user.name  "github-actions[bot]"
-          git add perf-report-latest.json
+          git add perf-report-latest.json perf-history.json
           git diff --cached --quiet || git commit -m "perf: update baseline from ${{ github.sha }}"
           git push origin gh-pages
 
@@ -88,12 +93,15 @@ jobs:
           git fetch origin gh-pages:gh-pages 2>/dev/null || true
           git show gh-pages:perf-report-latest.json > /tmp/perf-baseline.json 2>/dev/null \
             || echo '{}' > /tmp/perf-baseline.json
+          git show gh-pages:perf-history.json > /tmp/perf-history.json 2>/dev/null \
+            || echo '[]' > /tmp/perf-history.json
 
       - name: Generate delta comment
         if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
-          python3 scripts/compare_perf.py /tmp/perf-baseline.json perf-out/perf-report.json \
+          python3 scripts/compare_perf.py \
+            /tmp/perf-baseline.json perf-out/perf-report.json /tmp/perf-history.json \
             > /tmp/perf-delta.md
           echo "=== delta comment ==="
           cat /tmp/perf-delta.md
