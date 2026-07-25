@@ -72,11 +72,16 @@ jobs:
           set -euo pipefail
           git fetch origin gh-pages:gh-pages 2>/dev/null || true
           git worktree add /tmp/gh-pages gh-pages
+
+          # Update rolling history: append current run, keep last 10 entries.
+          python3 scripts/update_perf_history.py \
+            /tmp/gh-pages/perf-history.json perf-out/perf-report.json
+
           cp perf-out/perf-report.json /tmp/gh-pages/perf-report-latest.json
           cd /tmp/gh-pages
           git config user.email "actions@github.com"
           git config user.name  "github-actions[bot]"
-          git add perf-report-latest.json
+          git add perf-report-latest.json perf-history.json
           git diff --cached --quiet || git commit -m "perf: update baseline from ${{ github.sha }}"
           git push origin gh-pages
 
@@ -88,12 +93,24 @@ jobs:
           git fetch origin gh-pages:gh-pages 2>/dev/null || true
           git show gh-pages:perf-report-latest.json > /tmp/perf-baseline.json 2>/dev/null \
             || echo '{}' > /tmp/perf-baseline.json
+          git show gh-pages:perf-history.json > /tmp/perf-history.json 2>/dev/null \
+            || echo '[]' > /tmp/perf-history.json
+          # If no history on gh-pages yet, seed with the master baseline so the
+          # history table is never empty on the first run.
+          python3 scripts/update_perf_history.py \
+            --seed-if-empty /tmp/perf-history.json /tmp/perf-baseline.json
 
       - name: Generate delta comment
         if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
-          python3 scripts/compare_perf.py /tmp/perf-baseline.json perf-out/perf-report.json \
+          # Build a PR-local view: master history + this PR's run (newest entry).
+          # We don't push this back to gh-pages; it's only for the comment.
+          cp /tmp/perf-history.json /tmp/perf-history-pr.json
+          python3 scripts/update_perf_history.py \
+            /tmp/perf-history-pr.json perf-out/perf-report.json
+          python3 scripts/compare_perf.py \
+            /tmp/perf-baseline.json perf-out/perf-report.json /tmp/perf-history-pr.json \
             > /tmp/perf-delta.md
           echo "=== delta comment ==="
           cat /tmp/perf-delta.md
@@ -179,8 +196,10 @@ jobs:
           auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           # Post a PR comment showing delta from master baseline.
           comment-on-alert: true
-          # Flag (but don't fail) if a benchmark regresses more than 20 %.
-          alert-threshold: "120%"
+          # Flag (but don't fail) if a benchmark regresses more than 3×.
+          # durable-commit benchmarks are fsync-latency-bound and highly variable
+          # on shared runners; 200% avoids false alerts from runner preemption.
+          alert-threshold: "300%"
           fail-on-alert: false
           # Store baseline data in the gh-pages branch.
           gh-pages-branch: gh-pages

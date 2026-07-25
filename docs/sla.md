@@ -46,12 +46,13 @@ One fsync for an entire batch.  Throughput is serialization-bound.
 
 | Metric | Target |
 |--------|--------|
-| Throughput at **M** (10 K batch, CI floor) | ≥ 3 K commits/sec |
-| Throughput at **M** (10 K batch, isolated peak) | ≥ 5.5 K commits/sec |
+| Throughput at **M** (10 K batch, CI floor) | ≥ 8 K commits/sec |
+| Throughput at **M** (50 K batch, CI floor) | ≥ 5 K commits/sec |
 | `flush()` wall time after 10 K buffered commits | ≤ 20 ms |
 
 Rationale: Apple Health import (500 K data points) must complete in < 2 minutes.
-5 K commits/sec means 500 K points takes ~100 seconds.
+8 K commits/sec means 500 K points takes ~62 seconds.  The 50 K batch floor ensures
+throughput stays above 5 K/sec as store size grows past a single namespace.
 
 ---
 
@@ -125,6 +126,22 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 > defers version-log index hydration until the first history/as_of/write. Raw
 > unrecompacted WAL open at XL remains slow; ops path is `compact()` then reopen
 > (see issue #7 / `PERF_REPORT_XL=1`).
+
+---
+
+## Vector search SLAs (ANN / HNSW)
+
+Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the
+implementation falls back to brute-force cosine scan).
+
+| Metric | Scale | Target |
+|--------|-------|--------|
+| `knn_search()` p99 (k=10) | 100 K vectors | ≤ 5 ms |
+| recall@10 vs exact brute-force | 100 K vectors, dim 32 | ≥ 90% |
+
+Rationale: semantic search over a user's full memory / document corpus (~100 K embeddings)
+must return results within a single UI round-trip budget.  90% recall ensures fewer than
+1 missing result per 10-result page in expectation.
 
 ---
 

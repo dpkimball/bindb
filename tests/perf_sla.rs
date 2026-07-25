@@ -13,7 +13,8 @@
 ///   1. Add the target to docs/sla.md.
 ///   2. Write the test here with a matching threshold constant.
 ///   3. Use `#[ignore = "perf: ..."]` so it is excluded from the default test run.
-use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
+use bindb::{BinderStore, EdgeId, ObjectId, Transaction, VectorEntry, VectorFilter, VectorIndex};
+use std::collections::HashSet;
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -21,7 +22,7 @@ use tempfile::TempDir;
 // Adjust these if the self-hosted CI runner changes.
 
 const COMMIT_THROUGHPUT_MIN: u64 = 80; // commits/sec — durable single-object commit
-const COMMIT_BUFFERED_THROUGHPUT_MIN: u64 = 3_000; // commits/sec — buffered batch (CI floor; isolated peak ~5,500+)
+const COMMIT_BUFFERED_THROUGHPUT_MIN: u64 = 8_000; // commits/sec — buffered batch (OKR O2/KR2.1; measured ~260K+)
 const FLUSH_WALL_MS_MAX: u64 = 20; // ms — flush() after 10 K buffered commits
 
 const GET_P99_US_MAX: u64 = 10; // µs — HEAD lookup at M scale
@@ -34,6 +35,13 @@ const TRAVERSE_DEPTH5_P99_MS_MAX: u64 = 2; // ms — BFS depth 5
 
 const REBUILD_M_MS_MAX: u64 = 200; // ms — rebuild_indexes() at 10 K objects
 const OPEN_REPLAY_M_MS_MAX: u64 = 30; // ms — WAL replay at 10 K commits (O(n) position-index replay)
+
+// ── bulk ingest threshold constants ──────────────────────────────────────────
+const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — 50 K batch (OKR O2/KR2.2)
+
+// ── vector / ANN threshold constants ─────────────────────────────────────────
+const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
+const VECTOR_SEARCH_P99_MS_MAX: u64 = 5; // ms — knn_search p99 at 100 K vectors (OKR O3/KR3.1)
 
 // ── L-scale threshold constants (100 K objects) ──────────────────────────────
 // get() and edges_from() are O(1) HashMap lookups — same target as M.
@@ -51,7 +59,7 @@ const OPEN_REPLAY_L_MS_MAX: u64 = 300; // ms — WAL replay at 100 K commits
 const GET_XL_P99_US_MAX: u64 = 10; // µs — HashMap lookup stays O(1) at 1 M
 const OPEN_XL_AFTER_COMPACT_MS_MAX: u64 = 5_000; // ms — snapshot replay at 1 M
 const LIST_XL_P99_MS_MAX: u64 = 500; // ms — namespace list returning 100 K of 1 M
-const COMMIT_XL_BUFFERED_MIN: u64 = 3_000; // commits/sec — buffered writes must not degrade at XL
+const COMMIT_XL_BUFFERED_MIN: u64 = 5_000; // commits/sec — buffered writes must not degrade at XL
 const REBUILD_XL_MS_MAX: u64 = 60_000; // ms — rebuild_indexes() at 1 M objects (O(n) WAL replay)
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -159,6 +167,31 @@ fn sla_flush_wall_time_lte_20ms_after_10k_buffered() {
         "flush() after 10 K buffered commits took {} ms > SLA maximum {} ms",
         ms,
         FLUSH_WALL_MS_MAX
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_commit_buffered_50k_throughput_gte_5k_per_sec() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let n = 50_000usize;
+
+    let start = Instant::now();
+    for i in 0..n {
+        let mut tx = Transaction::new();
+        tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
+        store.commit_buffered(tx, "test", "").unwrap();
+    }
+    store.flush().unwrap();
+    let elapsed = start.elapsed();
+
+    let throughput = n as f64 / elapsed.as_secs_f64();
+    assert!(
+        throughput >= COMMIT_BUFFERED_50K_THROUGHPUT_MIN as f64,
+        "commit_buffered() 50 K throughput {:.0} commits/sec < SLA minimum {} commits/sec",
+        throughput,
+        COMMIT_BUFFERED_50K_THROUGHPUT_MIN
     );
 }
 
@@ -428,6 +461,120 @@ fn sla_open_wal_replay_lte_500ms_at_10k_commits() {
         "open() WAL replay worst-of-3 {} ms > SLA maximum {} ms",
         worst_ms,
         OPEN_REPLAY_M_MS_MAX
+    );
+}
+
+// ── vector / ANN SLAs ────────────────────────────────────────────────────────
+
+/// LCG pseudo-random unit vector at dim=32 (deterministic, no rand dependency).
+fn rand_unit_vec_32(seed: &mut u64) -> Vec<f32> {
+    let mut v = vec![0.0f32; 32];
+    let mut sq = 0.0f32;
+    for x in &mut v {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let f = (*seed >> 33) as f32 / 0x7fff_ffff_u32 as f32 - 1.0;
+        *x = f;
+        sq += f * f;
+    }
+    let norm = sq.sqrt().max(1e-8);
+    v.iter_mut().for_each(|x| *x /= norm);
+    v
+}
+
+fn make_vector_entry(i: usize, v: Vec<f32>) -> VectorEntry {
+    VectorEntry {
+        object_id: format!("v://{i}"),
+        object_version_id: format!("v://{i}-v1"),
+        chunk_id: format!("c{i}"),
+        chunk_index: 0,
+        model_id: "sla".into(),
+        dimensions: v.len() as u32,
+        vector: v,
+        content_hash: [0u8; 32],
+        source_text: String::new(),
+        binder_id: None,
+        app_id: None,
+    }
+}
+
+/// Build a 100 K HNSW index and return it along with the raw vectors.
+fn build_hnsw_100k() -> (VectorIndex, Vec<Vec<f32>>) {
+    let n = 100_000usize;
+    let mut seed = 0xDEAD_BEEF_1234_u64;
+    let mut idx = VectorIndex::new();
+    let mut raw = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = rand_unit_vec_32(&mut seed);
+        raw.push(v.clone());
+        idx.insert(make_vector_entry(i, v));
+    }
+    (idx, raw)
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_hnsw_recall_at_10_gte_90pct_at_100k_vectors() {
+    let (hnsw, raw_vecs) = build_hnsw_100k();
+    let k = 10usize;
+    let filter = VectorFilter::default();
+    let queries = 100usize;
+    let mut seed = 0xFEED_FACE_u64;
+    let mut correct = 0usize;
+
+    for _ in 0..queries {
+        let query = rand_unit_vec_32(&mut seed);
+        let mut scores: Vec<(f32, usize)> = raw_vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.iter().zip(&query).map(|(a, b)| a * b).sum::<f32>(), i))
+            .collect();
+        scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let ground_truth: HashSet<String> = scores[..k]
+            .iter()
+            .map(|(_, id)| format!("v://{id}"))
+            .collect();
+
+        let results = hnsw.knn_search(&query, &filter, k);
+        correct += results
+            .iter()
+            .filter(|r| ground_truth.contains(&r.object_id))
+            .count();
+    }
+
+    let recall_pct = correct as f64 / (queries * k) as f64 * 100.0;
+    assert!(
+        recall_pct >= HNSW_RECALL_100K_PMIN,
+        "HNSW recall@10 at 100 K = {:.1}% < SLA minimum {:.1}%",
+        recall_pct,
+        HNSW_RECALL_100K_PMIN
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_vector_search_p99_lte_5ms_at_100k_vectors() {
+    let (hnsw, _) = build_hnsw_100k();
+    let k = 10usize;
+    let filter = VectorFilter::default();
+    let iterations = 500usize;
+    let mut seed = 0xCAFE_BABE_u64;
+    let mut timings = Vec::with_capacity(iterations);
+
+    for _ in 0..iterations {
+        let query = rand_unit_vec_32(&mut seed);
+        let t = Instant::now();
+        let _ = hnsw.knn_search(&query, &filter, k);
+        timings.push(t.elapsed().as_nanos() as u64);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000; // ns → ms
+    assert!(
+        p99 <= VECTOR_SEARCH_P99_MS_MAX,
+        "knn_search() p99 {} ms > SLA maximum {} ms (100 K vectors, k=10)",
+        p99,
+        VECTOR_SEARCH_P99_MS_MAX
     );
 }
 
