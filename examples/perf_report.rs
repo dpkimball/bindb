@@ -21,7 +21,8 @@ use tempfile::TempDir;
 
 // Thresholds mirrored from tests/perf_sla.rs / docs/sla.md (M-tier unless noted).
 const COMMIT_THROUGHPUT_MIN: f64 = 80.0;
-const COMMIT_BUFFERED_THROUGHPUT_MIN: f64 = 3_000.0;
+const COMMIT_BUFFERED_THROUGHPUT_MIN: f64 = 8_000.0;
+const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: f64 = 5_000.0;
 const FLUSH_WALL_MS_MAX: f64 = 20.0;
 const GET_P99_US_MAX: f64 = 10.0;
 const LIST_P99_MS_MAX: f64 = 2.0;
@@ -33,7 +34,8 @@ const REBUILD_M_MS_MAX: f64 = 200.0;
 const OPEN_M_MS_MAX: f64 = 30.0;
 const OPEN_L_MS_MAX: f64 = 300.0;
 const LIST_L_P99_MS_MAX: f64 = 20.0;
-const HNSW_RECALL_MIN: f64 = 0.80;
+const HNSW_RECALL_MIN: f64 = 0.90;
+const VECTOR_SEARCH_P99_MS_MAX: f64 = 5.0;
 
 #[derive(Clone)]
 struct Metric {
@@ -145,6 +147,30 @@ fn measure_all() -> Vec<Metric> {
             value: thr,
             unit: "commits/sec",
             bound: COMMIT_BUFFERED_THROUGHPUT_MIN,
+            higher_is_better: true,
+        });
+    }
+
+    // buffered 50 K batch (OKR O2/KR2.2)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BinderStore::open(dir.path()).unwrap();
+        let n = 50_000usize;
+        let t = Instant::now();
+        for i in 0..n {
+            let mut tx = Transaction::new();
+            tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
+            store.commit_buffered(tx, "report", "").unwrap();
+        }
+        store.flush().unwrap();
+        let thr = n as f64 / t.elapsed().as_secs_f64();
+        out.push(Metric {
+            id: "commit_buffered_50k_tps",
+            name: "commit_buffered()+flush throughput",
+            scale: "M (50 K batch)",
+            value: thr,
+            unit: "commits/sec",
+            bound: COMMIT_BUFFERED_50K_THROUGHPUT_MIN,
             higher_is_better: true,
         });
     }
@@ -436,17 +462,28 @@ fn measure_all() -> Vec<Metric> {
         });
     }
 
-    // HNSW recall@10 vs brute (above threshold)
+    // HNSW recall@10 vs brute-force + search p99 at 100 K vectors (OKR O3)
     {
         use bindb::{VectorEntry, VectorFilter, VectorIndex};
-        fn unit(mut v: Vec<f32>) -> Vec<f32> {
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        use std::collections::HashSet;
+
+        fn rand_unit_32(seed: &mut u64) -> Vec<f32> {
+            let mut v = vec![0.0f32; 32];
+            let mut sq = 0.0f32;
             for x in &mut v {
-                *x /= norm;
+                *seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let f = (*seed >> 33) as f32 / 0x7fff_ffff_u32 as f32 - 1.0;
+                *x = f;
+                sq += f * f;
             }
+            let norm = sq.sqrt().max(1e-8);
+            v.iter_mut().for_each(|x| *x /= norm);
             v
         }
-        fn entry(i: usize, v: Vec<f32>) -> VectorEntry {
+
+        fn ve(i: usize, v: Vec<f32>) -> VectorEntry {
             VectorEntry {
                 object_id: format!("v://{i}"),
                 object_version_id: format!("v://{i}-v1"),
@@ -461,40 +498,71 @@ fn measure_all() -> Vec<Metric> {
                 app_id: None,
             }
         }
-        let n = 1_200usize;
-        let dim = 32usize;
-        let mut hnsw = VectorIndex::new();
-        let mut brute = VectorIndex::new();
-        for i in 0..n {
-            let mut v = vec![0.0f32; dim];
-            v[i % dim] = 1.0;
-            let e = entry(i, unit(v));
-            hnsw.insert(e.clone());
-            brute.insert(e);
-        }
+
+        let n = 100_000usize;
         let k = 10usize;
-        let queries = 10usize;
         let filter = VectorFilter::default();
-        let mut correct = 0usize;
-        for q in 0..queries {
-            let mut query = vec![0.0f32; dim];
-            query[q % dim] = 1.0;
-            let query = unit(query);
-            let h = hnsw.knn_search(&query, &filter, k);
-            let b = brute.knn_search(&query, &filter, k);
-            let bset: std::collections::HashSet<_> =
-                b.iter().map(|r| r.object_id.clone()).collect();
-            correct += h.iter().filter(|r| bset.contains(&r.object_id)).count();
+        let mut seed = 0x1234_5678_9ABC_DEF0_u64;
+
+        let mut hnsw = VectorIndex::new();
+        let mut raw: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = rand_unit_32(&mut seed);
+            raw.push(v.clone());
+            hnsw.insert(ve(i, v));
         }
-        let recall = correct as f64 / (queries * k) as f64;
+
+        // Recall: compare HNSW top-k against exact brute-force top-k.
+        let recall_queries = 100usize;
+        let mut correct = 0usize;
+        for _ in 0..recall_queries {
+            let query = rand_unit_32(&mut seed);
+            let mut scores: Vec<(f32, usize)> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (v.iter().zip(&query).map(|(a, b)| a * b).sum::<f32>(), i))
+                .collect();
+            scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let ground_truth: HashSet<String> = scores[..k]
+                .iter()
+                .map(|(_, id)| format!("v://{id}"))
+                .collect();
+            let results = hnsw.knn_search(&query, &filter, k);
+            correct += results
+                .iter()
+                .filter(|r| ground_truth.contains(&r.object_id))
+                .count();
+        }
+        let recall = correct as f64 / (recall_queries * k) as f64;
+
+        // Search latency: measure knn_search p99 in isolation (no brute-force overhead).
+        let latency_iters = 500usize;
+        let mut timings = Vec::with_capacity(latency_iters);
+        for _ in 0..latency_iters {
+            let query = rand_unit_32(&mut seed);
+            let t = Instant::now();
+            let _ = hnsw.knn_search(&query, &filter, k);
+            timings.push(t.elapsed().as_nanos() as u64);
+        }
+        let search_p99_ms = percentile(&mut timings, 99.0) as f64 / 1_000_000.0;
+
         out.push(Metric {
             id: "hnsw_recall_at_10",
             name: "HNSW recall@10 vs brute",
-            scale: "1.2 K vectors",
+            scale: "100 K vectors",
             value: recall * 100.0,
             unit: "%",
             bound: HNSW_RECALL_MIN * 100.0,
             higher_is_better: true,
+        });
+        out.push(Metric {
+            id: "vector_search_p99_ms",
+            name: "knn_search() p99 (k=10)",
+            scale: "100 K vectors",
+            value: search_p99_ms,
+            unit: "ms",
+            bound: VECTOR_SEARCH_P99_MS_MAX,
+            higher_is_better: false,
         });
     }
 

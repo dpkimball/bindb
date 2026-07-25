@@ -1,16 +1,16 @@
 # bindb — Issue / roadmap status
 
-Last updated: 2026-07-24. Prefer this over stale issue bodies.
+Last updated: 2026-07-25. Prefer this over stale issue bodies.
 
 | Issue | State | Shipped | Remaining / follow-up |
 |-------|-------|---------|----------------------|
 | [#1](https://github.com/dpkimball/bindb/issues/1) WAL compaction | Closed | `compact()`, snapshot + WAL truncate | Ops policy for when to compact |
 | [#2](https://github.com/dpkimball/bindb/issues/2) Graph query IR | Open | Rust `GraphQuery` builder + `graph_ir()` MATCH (types, directions, id predicates, **JSON payload WHERE** `AND b.field OP value`) + **`RETURN b.f1, b.f2` field projections** + **`RETURN path` shortest-path collection** (`graph_ir_projected` → `GraphIrRow`) + **write IR** (`CREATE`/`MERGE` NODE + EDGE via `graph_ir_write`; 8 integration tests) | Full Cypher |
-| [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model | Latency SLA @ 100k (OKR O3) |
+| [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model; **100K SLA gate** (`knn_search` p99 ≤5ms, recall@10 ≥90%; OKR O3) | — |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation / SQL | Open | Rust DSL + `sql_aggregate()` (COUNT/AVG/SUM/MIN/MAX/P50/P99, PATH_SEGMENT, **WHERE id STARTS WITH**) + **`export_observations_jsonl()`** (DuckDB-compatible JSONL) + **`query_sql_observations(ns, sql)`** (out-of-process DuckDB; rewrites `observations` → `read_ndjson_auto(...)`) | Full SQL; joins |
 | [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss) | mmap for head indexes |
-| [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open | Snapshot fast open; XL get/open-after-compact PASS; **formal XL SLA tests** + **nightly CI job** (02:00 UTC) + **3 new XL SLA tests** (`list` p99 ≤500ms, `commit_buffered` ≥3K/s, `rebuild_indexes` ≤60s at 1M objects) | nightly runner uptime guarantee |
+| [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open | Snapshot fast open; XL get/open-after-compact PASS; **formal XL SLA tests** + **nightly CI job** (02:00 UTC) + **3 new XL SLA tests** (`list` p99 ≤500ms, `commit_buffered` ≥5K/s, `rebuild_indexes` ≤60s at 1M objects); **eviction bug fix** (O(1M) sweep per commit fixed; `commit_buffered` at XL now 260K/s) | nightly runner uptime guarantee |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
 | [#9](https://github.com/dpkimball/bindb/issues/9) Checkpoint open | Closed | Snapshot fast path on `open()` | Variance / flake control (OKR O4) |
 

@@ -222,7 +222,7 @@ This runs automatically on crash recovery.
 | Bulk import | 15–500× slower than SQLite/DuckDB | Per-write version history + in-memory index maintenance | Expected — structural cost of full history |
 | Cold startup | Comparable to SQLite (~14 ms at 10 K) | O(n) replay after position-index fix | Fixed |
 | Analytical aggregations | Not supported | No query engine | Roadmap — SQL projection layer |
-| ANN vector search | Latency SLA not yet gated at 100 K | HNSW on master (≥1 K / model); recall@10 in `perf-report` | OKR O3 — add latency SLA |
+| ANN vector search | knn_search() p99 ≤ 5 ms, recall@10 ≥ 90% at 100 K vectors — CI-gated | HNSW (M=16, EF_C=200, EF_S=64); brute-force below 1 K / model | — |
 
 See also: [OKRs](okrs.md). Generate a report anytime with:
 
