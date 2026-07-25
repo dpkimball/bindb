@@ -68,6 +68,23 @@ pub struct BinderStore {
 
 impl BinderStore {
     pub fn open(store_path: &Path) -> Result<Self, StoreError> {
+        Self::open_inner(
+            store_path,
+            crate::index::head_object::DEFAULT_HEAD_CACHE_CAP,
+        )
+    }
+
+    /// Like `open` but with a custom head-cache capacity.
+    /// `cap = 0` disables eviction (unbounded).  Useful for tests and for
+    /// deployments that want to tune memory vs. latency explicitly.
+    pub fn open_with_head_cap(
+        store_path: &Path,
+        head_cache_cap: usize,
+    ) -> Result<Self, StoreError> {
+        Self::open_inner(store_path, head_cache_cap)
+    }
+
+    fn open_inner(store_path: &Path, head_cache_cap: usize) -> Result<Self, StoreError> {
         fs::create_dir_all(store_path)?;
 
         let dirty_marker = store_path.join(".dirty");
@@ -166,8 +183,8 @@ impl BinderStore {
             .last()
             .map(|c| c.commit_id)
             .or_else(|| head_from_versions(&object_versions, &edge_versions));
-        let head_objects = HeadObjectIndex::rebuild(&object_versions);
-        let head_edges = HeadEdgeIndex::rebuild(&edge_versions);
+        let head_objects = HeadObjectIndex::rebuild_with_cap(&object_versions, head_cache_cap);
+        let head_edges = HeadEdgeIndex::rebuild_with_cap(&edge_versions, head_cache_cap);
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
         let neighbours =
             GraphIndex::build_neighbour_map(edge_versions.iter().filter(|v| !v.is_tombstone()));
@@ -549,19 +566,36 @@ impl BinderStore {
 
     // ── query API ─────────────────────────────────────────────────────────────
 
-    /// Current version of an object (O(1) HEAD index lookup).
+    /// Current version of an object.
+    ///
+    /// Checks the in-memory head cache first (O(1)).  On a cache miss the
+    /// entry may have been evicted under memory pressure; the call falls back
+    /// to the mmap-backed VersionStore (one page-cache read, typically ~1 µs).
     /// Returns None if the object is unknown or has been tombstoned.
     pub fn get(&self, object_id: &ObjectId) -> Result<Option<BinderObjectVersion>, StoreError> {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let v = self
+        // Fast path: head cache hit.
+        let cached = self
             .head_objects
             .lock()
             .unwrap()
             .get(object_id)
             .filter(|v| !v.is_tombstone())
             .cloned();
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        // Slow path: cache miss — read head version from the mmap'd log.
+        self.ensure_version_store_ready()?;
+        let v = self
+            .version_store
+            .lock()
+            .unwrap()
+            .get_head_object(object_id)
+            .map_err(StoreError::Io)?
+            .filter(|v| !v.is_tombstone());
         Ok(v)
     }
 
@@ -570,6 +604,7 @@ impl BinderStore {
     ///
     /// Uses the namespace secondary index for O(k) performance where k is the
     /// number of live objects in the namespace, rather than scanning all versions.
+    /// For each ID, tries the head cache; misses fall back to the VersionStore.
     pub fn list(&self, namespace_prefix: &str) -> Result<Vec<BinderObjectVersion>, StoreError> {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
@@ -579,11 +614,31 @@ impl BinderStore {
             .lock()
             .unwrap()
             .matching(namespace_prefix);
-        let head = self.head_objects.lock().unwrap();
-        Ok(object_ids
-            .iter()
-            .filter_map(|oid| head.get(oid).filter(|v| !v.is_tombstone()).cloned())
-            .collect())
+        let mut results = Vec::with_capacity(object_ids.len());
+        let mut misses: Vec<ObjectId> = Vec::new();
+        {
+            let head = self.head_objects.lock().unwrap();
+            for oid in &object_ids {
+                match head.get(oid).filter(|v| !v.is_tombstone()).cloned() {
+                    Some(v) => results.push(v),
+                    None => misses.push(oid.clone()),
+                }
+            }
+        }
+        if misses.is_empty() {
+            return Ok(results);
+        }
+        // Resolve misses from the disk-backed VersionStore.
+        self.ensure_version_store_ready()?;
+        let mut vs = self.version_store.lock().unwrap();
+        for oid in &misses {
+            if let Some(v) = vs.get_head_object(oid).map_err(StoreError::Io)? {
+                if !v.is_tombstone() {
+                    results.push(v);
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Ensure the disk-backed version index is loaded. Clean snapshot reopens
@@ -674,13 +729,14 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let graph = self.graph.lock().unwrap();
-        let hedge = self.head_edges.lock().unwrap();
-        let edge_ids: Vec<EdgeId> = graph.edges_from(object_id).cloned().collect();
-        Ok(edge_ids
-            .into_iter()
-            .filter_map(|eid| hedge.get(&eid).cloned())
-            .collect())
+        let edge_ids: Vec<EdgeId> = self
+            .graph
+            .lock()
+            .unwrap()
+            .edges_from(object_id)
+            .cloned()
+            .collect();
+        self.resolve_edges(edge_ids)
     }
 
     /// Live edges pointing to an object.
@@ -688,13 +744,14 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let graph = self.graph.lock().unwrap();
-        let hedge = self.head_edges.lock().unwrap();
-        let edge_ids: Vec<EdgeId> = graph.edges_to(object_id).cloned().collect();
-        Ok(edge_ids
-            .into_iter()
-            .filter_map(|eid| hedge.get(&eid).cloned())
-            .collect())
+        let edge_ids: Vec<EdgeId> = self
+            .graph
+            .lock()
+            .unwrap()
+            .edges_to(object_id)
+            .cloned()
+            .collect();
+        self.resolve_edges(edge_ids)
     }
 
     /// Live edges from an object of a specific relationship type.
@@ -706,13 +763,40 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let graph = self.graph.lock().unwrap();
-        let hedge = self.head_edges.lock().unwrap();
-        let edge_ids: Vec<EdgeId> = graph.edges_from_with_type(object_id, rel_type).collect();
-        Ok(edge_ids
-            .into_iter()
-            .filter_map(|eid| hedge.get(&eid).cloned())
-            .collect())
+        let edge_ids: Vec<EdgeId> = self
+            .graph
+            .lock()
+            .unwrap()
+            .edges_from_with_type(object_id, rel_type)
+            .collect();
+        self.resolve_edges(edge_ids)
+    }
+
+    /// Resolve a list of edge IDs to their current versions.
+    /// Checks the head cache first; falls back to VersionStore on misses.
+    fn resolve_edges(&self, edge_ids: Vec<EdgeId>) -> Result<Vec<BinderEdgeVersion>, StoreError> {
+        let mut results = Vec::with_capacity(edge_ids.len());
+        let mut misses: Vec<EdgeId> = Vec::new();
+        {
+            let hedge = self.head_edges.lock().unwrap();
+            for eid in &edge_ids {
+                match hedge.get(eid).cloned() {
+                    Some(v) => results.push(v),
+                    None => misses.push(eid.clone()),
+                }
+            }
+        }
+        if misses.is_empty() {
+            return Ok(results);
+        }
+        self.ensure_version_store_ready()?;
+        let mut vs = self.version_store.lock().unwrap();
+        for eid in &misses {
+            if let Some(v) = vs.get_head_edge(eid).map_err(StoreError::Io)? {
+                results.push(v);
+            }
+        }
+        Ok(results)
     }
 
     /// BFS traversal: all live objects reachable from `start` within `max_depth` hops.
@@ -1208,10 +1292,15 @@ impl BinderStore {
             .unwrap()
             .rebuild_from_versions(&ovs, &evs)?;
 
+        // Rebuild namespace index from the authoritative version store, not the
+        // potentially-evicted head cache (which may be incomplete at XL scale).
+        let new_namespace_index = NamespaceObjectIndex::rebuild(
+            ovs.iter()
+                .filter(|v| v.valid_to.is_none() && !v.is_tombstone()),
+        );
+
         drop(ovs);
         drop(evs);
-
-        let new_namespace_index = NamespaceObjectIndex::rebuild(new_head_objects.all_live());
 
         *self.head_objects.lock().unwrap() = new_head_objects;
         *self.head_edges.lock().unwrap() = new_head_edges;
