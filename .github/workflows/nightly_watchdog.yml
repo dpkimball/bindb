@@ -1,0 +1,108 @@
+name: Nightly watchdog
+
+# Runs 45 minutes after the nightly XL job (02:45 UTC).  Checks whether the
+# nightly completed successfully.  If it failed or never started (runner
+# offline), opens a GitHub issue so the team knows within the hour.
+#
+# Runs on ubuntu-latest (GitHub-hosted) so it fires even when the self-hosted
+# runner is down — that is the whole point.
+
+on:
+  schedule:
+    - cron: "45 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  actions: read
+
+jobs:
+  watchdog:
+    name: Check nightly XL health
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check last nightly run status
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Fetch the most recent run of the "Nightly XL" workflow on master.
+          RESULT=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/nightly.yml/runs?branch=master&per_page=1" \
+            --jq '.workflow_runs[0] | {status: .status, conclusion: .conclusion, created_at: .created_at, html_url: .html_url}')
+
+          STATUS=$(echo "$RESULT" | jq -r '.status')
+          CONCLUSION=$(echo "$RESULT" | jq -r '.conclusion')
+          CREATED_AT=$(echo "$RESULT" | jq -r '.created_at')
+          RUN_URL=$(echo "$RESULT" | jq -r '.html_url')
+
+          echo "status=$STATUS"         >> "$GITHUB_OUTPUT"
+          echo "conclusion=$CONCLUSION" >> "$GITHUB_OUTPUT"
+          echo "created_at=$CREATED_AT" >> "$GITHUB_OUTPUT"
+          echo "run_url=$RUN_URL"       >> "$GITHUB_OUTPUT"
+
+          echo "Nightly status=$STATUS conclusion=$CONCLUSION created_at=$CREATED_AT"
+
+          # Decide whether to raise an alert.
+          # Alert when: no run exists, run is still queued/in_progress after 45 min,
+          # or run completed with a non-success conclusion.
+          if [ "$STATUS" = "null" ] || [ -z "$STATUS" ]; then
+            echo "alert=true"  >> "$GITHUB_OUTPUT"
+            echo "reason=No nightly run found" >> "$GITHUB_OUTPUT"
+          elif [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
+            echo "alert=true"  >> "$GITHUB_OUTPUT"
+            echo "reason=Nightly still $STATUS after 45 min — runner may be offline" >> "$GITHUB_OUTPUT"
+          elif [ "$CONCLUSION" != "success" ]; then
+            echo "alert=true"  >> "$GITHUB_OUTPUT"
+            echo "reason=Nightly concluded: $CONCLUSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "alert=false" >> "$GITHUB_OUTPUT"
+            echo "reason=ok"   >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update alert issue
+        if: steps.check.outputs.alert == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TITLE="[Nightly watchdog] XL run unhealthy — ${{ steps.check.outputs.reason }}"
+          BODY="**Date:** $(date -u +%Y-%m-%d)
+          **Reason:** ${{ steps.check.outputs.reason }}
+          **Last run status:** ${{ steps.check.outputs.status }} / ${{ steps.check.outputs.conclusion }}
+          **Last run started:** ${{ steps.check.outputs.created_at }}
+          **Run URL:** ${{ steps.check.outputs.run_url }}
+
+          The nightly XL SLA job did not complete successfully. Possible causes:
+          - Self-hosted runner offline or overloaded
+          - XL SLA test failure
+          - Workflow error
+
+          **Action:** Check the runner and re-run manually via \`workflow_dispatch\` if needed."
+
+          # Check if an open watchdog issue already exists (avoid spam).
+          EXISTING=$(gh issue list \
+            --label "nightly-watchdog" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "Commented on existing issue #$EXISTING"
+          else
+            gh issue create \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "nightly-watchdog"
+            echo "Created new watchdog issue"
+          fi
+
+      - name: Confirm healthy
+        if: steps.check.outputs.alert != 'true'
+        run: |
+          echo "✓ Nightly XL completed successfully at ${{ steps.check.outputs.created_at }}"
