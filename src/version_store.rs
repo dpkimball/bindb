@@ -392,16 +392,16 @@ impl VersionStore {
 
     /// Check whether a specific version (identified by valid_from) exists in the index for an object.
     pub fn object_has_version_at(&self, id: &ObjectId, valid_from: CommitId) -> bool {
-        self.object_index
-            .get(id)
-            .map_or(false, |entries| entries.iter().any(|e| e.valid_from == valid_from))
+        self.object_index.get(id).map_or(false, |entries| {
+            entries.iter().any(|e| e.valid_from == valid_from)
+        })
     }
 
     /// Check whether a specific version (identified by valid_from) exists in the index for an edge.
     pub fn edge_has_version_at(&self, id: &EdgeId, valid_from: CommitId) -> bool {
-        self.edge_index
-            .get(id)
-            .map_or(false, |entries| entries.iter().any(|e| e.valid_from == valid_from))
+        self.edge_index.get(id).map_or(false, |entries| {
+            entries.iter().any(|e| e.valid_from == valid_from)
+        })
     }
 
     /// Current number of IndexEntry records held in RAM (live + historical).

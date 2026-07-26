@@ -38,7 +38,10 @@ fn live_only_vec_after_overwrites() {
 
     // Each live object has the correct current payload.
     for i in 0..3usize {
-        let v = store.get(&obj(format!("ns/obj{i}"))).unwrap().expect("live");
+        let v = store
+            .get(&obj(format!("ns/obj{i}")))
+            .unwrap()
+            .expect("live");
         assert_eq!(
             v.payload.as_deref(),
             Some([100 + i as u8].as_slice()),
@@ -46,7 +49,10 @@ fn live_only_vec_after_overwrites() {
         );
     }
     for i in 3..5usize {
-        let v = store.get(&obj(format!("ns/obj{i}"))).unwrap().expect("live");
+        let v = store
+            .get(&obj(format!("ns/obj{i}")))
+            .unwrap()
+            .expect("live");
         assert_eq!(
             v.payload.as_deref(),
             Some([i as u8].as_slice()),
@@ -96,16 +102,16 @@ fn tombstone_removed_from_list() {
 
     // get() on the deleted object must return None.
     let result = store.get(&oid_del).unwrap();
-    assert!(result.is_none(), "deleted object must not be returned by get");
+    assert!(
+        result.is_none(),
+        "deleted object must not be returned by get"
+    );
 
     // list() must return only the alive object.
     let live = store.list("ns").unwrap();
     assert_eq!(live.len(), 1, "list must return exactly one live object");
     assert_eq!(live[0].object_id, oid_alive);
-    assert_eq!(
-        live[0].payload.as_deref(),
-        Some(b"alive-data".as_slice())
-    );
+    assert_eq!(live[0].payload.as_deref(), Some(b"alive-data".as_slice()));
 
     store.close().unwrap();
 }
@@ -144,7 +150,10 @@ fn reopen_after_vec_compaction() {
         Some(b"updated".as_slice()),
         "live payload must be updated after reopen"
     );
-    assert!(live.valid_to.is_none(), "live version must have no valid_to");
+    assert!(
+        live.valid_to.is_none(),
+        "live version must have no valid_to"
+    );
 
     // Historical object_as_of() at c1 must return the original.
     let historical = store2
@@ -163,7 +172,11 @@ fn reopen_after_vec_compaction() {
 
     // Full history must have both versions.
     let history = store2.object_history(&oid).unwrap();
-    assert_eq!(history.len(), 2, "must have 2 versions in history after reopen");
+    assert_eq!(
+        history.len(),
+        2,
+        "must have 2 versions in history after reopen"
+    );
     assert_eq!(history[0].payload.as_deref(), Some(b"original".as_slice()));
     assert_eq!(history[1].payload.as_deref(), Some(b"updated".as_slice()));
 

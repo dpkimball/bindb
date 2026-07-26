@@ -109,7 +109,10 @@ impl BinderStore {
         // full_versions_for_rebuild: populated on full WAL replay paths so the
         // VersionStore can be rebuilt from complete history (live + retired).
         // None on snapshot+delta path (VersionStore is updated incrementally).
-        let mut full_versions_for_rebuild: Option<(Vec<BinderObjectVersion>, Vec<BinderEdgeVersion>)> = None;
+        let mut full_versions_for_rebuild: Option<(
+            Vec<BinderObjectVersion>,
+            Vec<BinderEdgeVersion>,
+        )> = None;
         // vs_delta_commits: on snapshot+delta path, the commits that must be
         // applied to the existing version_log.bin (hydrate + apply delta).
         let mut vs_delta_commits: Vec<BinderCommit> = Vec::new();
@@ -132,25 +135,24 @@ impl BinderStore {
                             }
 
                             // build_version_stores_delta now returns live-only Vecs.
-                            let (ovs, evs, ov_pos, ev_pos) =
-                                if delta.is_empty() {
-                                    // No delta: filter snapshot to live-only (backward compat).
-                                    build_version_stores_delta(
-                                        &delta,
-                                        snap.object_versions,
-                                        snap.edge_versions,
-                                        snap.ov_positions,
-                                        snap.ev_positions,
-                                    )
-                                } else {
-                                    build_version_stores_delta(
-                                        &delta,
-                                        snap.object_versions,
-                                        snap.edge_versions,
-                                        snap.ov_positions,
-                                        snap.ev_positions,
-                                    )
-                                };
+                            let (ovs, evs, ov_pos, ev_pos) = if delta.is_empty() {
+                                // No delta: filter snapshot to live-only (backward compat).
+                                build_version_stores_delta(
+                                    &delta,
+                                    snap.object_versions,
+                                    snap.edge_versions,
+                                    snap.ov_positions,
+                                    snap.ev_positions,
+                                )
+                            } else {
+                                build_version_stores_delta(
+                                    &delta,
+                                    snap.object_versions,
+                                    snap.edge_versions,
+                                    snap.ov_positions,
+                                    snap.ev_positions,
+                                )
+                            };
 
                             let mut commits = snap.commits;
                             commits.extend(delta);
@@ -186,8 +188,7 @@ impl BinderStore {
                 // No checkpoint: full WAL replay.
                 let (wal, commits) = Wal::open_or_create(&wal_path)?;
                 let (full_ovs, full_evs, _, _) = build_version_stores(&commits);
-                let (ovs, evs, ov_pos, ev_pos) =
-                    compact_live_only_from_full(&full_ovs, &full_evs);
+                let (ovs, evs, ov_pos, ev_pos) = compact_live_only_from_full(&full_ovs, &full_evs);
                 full_versions_for_rebuild = Some((full_ovs, full_evs));
                 (wal, commits, ovs, evs, ov_pos, ev_pos)
             };
@@ -1333,9 +1334,8 @@ impl BinderStore {
         // The VersionStore is updated incrementally by apply_commit_to_memory.
 
         // Rebuild namespace index from live Vec entries.
-        let new_namespace_index = NamespaceObjectIndex::rebuild(
-            ovs.iter().filter(|v| !v.is_tombstone()),
-        );
+        let new_namespace_index =
+            NamespaceObjectIndex::rebuild(ovs.iter().filter(|v| !v.is_tombstone()));
 
         drop(ovs);
         drop(evs);
@@ -1686,10 +1686,20 @@ fn build_version_stores_delta(
     _ev_pos: HashMap<EdgeId, usize>,
 ) -> VersionStores {
     // Filter incoming snapshot vecs to live-only (backward compat: old snapshots had retired entries).
-    let mut ovs: Vec<BinderObjectVersion> = ovs.into_iter().filter(|v| v.valid_to.is_none()).collect();
-    let mut evs: Vec<BinderEdgeVersion> = evs.into_iter().filter(|v| v.valid_to.is_none()).collect();
-    let mut ov_pos: HashMap<ObjectId, usize> = ovs.iter().enumerate().map(|(i, v)| (v.object_id.clone(), i)).collect();
-    let mut ev_pos: HashMap<EdgeId, usize> = evs.iter().enumerate().map(|(i, v)| (v.edge_id.clone(), i)).collect();
+    let mut ovs: Vec<BinderObjectVersion> =
+        ovs.into_iter().filter(|v| v.valid_to.is_none()).collect();
+    let mut evs: Vec<BinderEdgeVersion> =
+        evs.into_iter().filter(|v| v.valid_to.is_none()).collect();
+    let mut ov_pos: HashMap<ObjectId, usize> = ovs
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.object_id.clone(), i))
+        .collect();
+    let mut ev_pos: HashMap<EdgeId, usize> = evs
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.edge_id.clone(), i))
+        .collect();
 
     for commit in delta_commits {
         let new_ovs = derive_object_versions_for_commit(commit);
@@ -1755,10 +1765,26 @@ fn compact_live_only_from_full(
     full_ovs: &[BinderObjectVersion],
     full_evs: &[BinderEdgeVersion],
 ) -> VersionStores {
-    let ovs: Vec<BinderObjectVersion> = full_ovs.iter().filter(|v| v.valid_to.is_none()).cloned().collect();
-    let evs: Vec<BinderEdgeVersion> = full_evs.iter().filter(|v| v.valid_to.is_none()).cloned().collect();
-    let ov_pos: HashMap<ObjectId, usize> = ovs.iter().enumerate().map(|(i, v)| (v.object_id.clone(), i)).collect();
-    let ev_pos: HashMap<EdgeId, usize> = evs.iter().enumerate().map(|(i, v)| (v.edge_id.clone(), i)).collect();
+    let ovs: Vec<BinderObjectVersion> = full_ovs
+        .iter()
+        .filter(|v| v.valid_to.is_none())
+        .cloned()
+        .collect();
+    let evs: Vec<BinderEdgeVersion> = full_evs
+        .iter()
+        .filter(|v| v.valid_to.is_none())
+        .cloned()
+        .collect();
+    let ov_pos: HashMap<ObjectId, usize> = ovs
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.object_id.clone(), i))
+        .collect();
+    let ev_pos: HashMap<EdgeId, usize> = evs
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.edge_id.clone(), i))
+        .collect();
     (ovs, evs, ov_pos, ev_pos)
 }
 
