@@ -1,5 +1,6 @@
 use bindb::{
-    BinderStore, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError, ObjectId, Transaction,
+    BinderStore, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError, ObjectId, OrderByField,
+    OrderDirection, Transaction,
 };
 use tempfile::TempDir;
 
@@ -422,5 +423,261 @@ CREATE NODE id="n://2" payload={"x":2}
     assert!(store.get(&ObjectId::new("n://1")).unwrap().is_some());
     assert!(store.get(&ObjectId::new("n://2")).unwrap().is_some());
 
+    store.close().unwrap();
+}
+
+// ── ORDER BY / LIMIT / SKIP ───────────────────────────────────────────────────
+
+/// Build a small graph where alice connects to three nodes with known IDs so
+/// that ORDER BY id(b) has a deterministic expected sequence.
+fn build_sortable_graph(store: &BinderStore) {
+    let mut tx = Transaction::new();
+    tx.put_object(obj("root://alice"), b"alice".to_vec());
+    // IDs chosen so alphabetical order is c < a < b (reverse of name order).
+    tx.put_object(obj("node://charlie"), b"c".to_vec());
+    tx.put_object(obj("node://alpha"), b"a".to_vec());
+    tx.put_object(obj("node://bravo"), b"b".to_vec());
+    store.commit(tx, "test", "nodes").unwrap();
+
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ea"),
+        obj("root://alice"),
+        obj("node://charlie"),
+        "LINK",
+        None,
+    );
+    tx2.put_edge(
+        eid("eb"),
+        obj("root://alice"),
+        obj("node://alpha"),
+        "LINK",
+        None,
+    );
+    tx2.put_edge(
+        eid("ec"),
+        obj("root://alice"),
+        obj("node://bravo"),
+        "LINK",
+        None,
+    );
+    store.commit(tx2, "test", "edges").unwrap();
+}
+
+#[test]
+fn order_by_id_asc() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_sortable_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK*1]->(b) WHERE id(a) = 'root://alice' RETURN b ORDER BY id(b) ASC",
+        )
+        .unwrap();
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|m| m.object.object_id.0.as_str())
+        .collect();
+    assert_eq!(ids, vec!["node://alpha", "node://bravo", "node://charlie"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_id_desc() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_sortable_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK*1]->(b) WHERE id(a) = 'root://alice' RETURN b ORDER BY id(b) DESC",
+        )
+        .unwrap();
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|m| m.object.object_id.0.as_str())
+        .collect();
+    assert_eq!(ids, vec!["node://charlie", "node://bravo", "node://alpha"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn limit_truncates_results() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_sortable_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK*1]->(b) WHERE id(a) = 'root://alice' RETURN b ORDER BY id(b) ASC LIMIT 2",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].object.object_id.0, "node://alpha");
+    assert_eq!(results[1].object.object_id.0, "node://bravo");
+    store.close().unwrap();
+}
+
+#[test]
+fn skip_and_limit() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_sortable_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK*1]->(b) WHERE id(a) = 'root://alice' RETURN b ORDER BY id(b) ASC SKIP 1 LIMIT 1",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "node://bravo");
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_depth_asc() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("root://a"), b"a".to_vec());
+    tx.put_object(obj("node://near"), b"near".to_vec());
+    tx.put_object(obj("node://far"), b"far".to_vec());
+    store.commit(tx, "test", "nodes").unwrap();
+
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("e1"), obj("root://a"), obj("node://near"), "LINK", None);
+    tx2.put_edge(
+        eid("e2"),
+        obj("node://near"),
+        obj("node://far"),
+        "LINK",
+        None,
+    );
+    store.commit(tx2, "test", "edges").unwrap();
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK*1..2]->(b) WHERE id(a) = 'root://a' RETURN b ORDER BY depth ASC",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].depth, 1);
+    assert_eq!(results[1].depth, 2);
+    assert_eq!(results[0].object.object_id.0, "node://near");
+    assert_eq!(results[1].object.object_id.0, "node://far");
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_payload_field_asc() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("root://a"), b"a".to_vec());
+    tx.put_object(obj("node://x"), br#"{"score":3.0}"#.to_vec());
+    tx.put_object(obj("node://y"), br#"{"score":1.0}"#.to_vec());
+    tx.put_object(obj("node://z"), br#"{"score":2.0}"#.to_vec());
+    store.commit(tx, "test", "nodes").unwrap();
+
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("ex"), obj("root://a"), obj("node://x"), "LINK", None);
+    tx2.put_edge(eid("ey"), obj("root://a"), obj("node://y"), "LINK", None);
+    tx2.put_edge(eid("ez"), obj("root://a"), obj("node://z"), "LINK", None);
+    store.commit(tx2, "test", "edges").unwrap();
+
+    let results = store
+        .graph_ir("MATCH (a)-[:LINK*1]->(b) WHERE id(a) = 'root://a' RETURN b ORDER BY b.score ASC")
+        .unwrap();
+
+    assert_eq!(results.len(), 3);
+    // Expect ascending order: 1.0 (y), 2.0 (z), 3.0 (x)
+    assert_eq!(results[0].object.object_id.0, "node://y");
+    assert_eq!(results[1].object.object_id.0, "node://z");
+    assert_eq!(results[2].object.object_id.0, "node://x");
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_payload_field_desc_limit() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("root://a"), b"a".to_vec());
+    tx.put_object(obj("node://x"), br#"{"score":3.0}"#.to_vec());
+    tx.put_object(obj("node://y"), br#"{"score":1.0}"#.to_vec());
+    tx.put_object(obj("node://z"), br#"{"score":2.0}"#.to_vec());
+    store.commit(tx, "test", "nodes").unwrap();
+
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("ex"), obj("root://a"), obj("node://x"), "LINK", None);
+    tx2.put_edge(eid("ey"), obj("root://a"), obj("node://y"), "LINK", None);
+    tx2.put_edge(eid("ez"), obj("root://a"), obj("node://z"), "LINK", None);
+    store.commit(tx2, "test", "edges").unwrap();
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK*1]->(b) WHERE id(a) = 'root://a' RETURN b ORDER BY b.score DESC LIMIT 2",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    // Top 2 descending: 3.0 (x), 2.0 (z)
+    assert_eq!(results[0].object.object_id.0, "node://x");
+    assert_eq!(results[1].object.object_id.0, "node://z");
+    store.close().unwrap();
+}
+
+#[test]
+fn parse_order_by_fields() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b ORDER BY id(b) DESC LIMIT 5",
+    )
+    .unwrap();
+    let ob = q.order_by.unwrap();
+    assert_eq!(ob.field, OrderByField::ObjectId);
+    assert_eq!(ob.direction, OrderDirection::Desc);
+    assert_eq!(q.limit, Some(5));
+    assert_eq!(q.skip, None);
+
+    let q2 = GraphIrQuery::parse(
+        "MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b ORDER BY depth ASC SKIP 2 LIMIT 10",
+    )
+    .unwrap();
+    let ob2 = q2.order_by.unwrap();
+    assert_eq!(ob2.field, OrderByField::Depth);
+    assert_eq!(ob2.direction, OrderDirection::Asc);
+    assert_eq!(q2.skip, Some(2));
+    assert_eq!(q2.limit, Some(10));
+
+    let q3 = GraphIrQuery::parse(
+        "MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b ORDER BY b.sentiment DESC",
+    )
+    .unwrap();
+    let ob3 = q3.order_by.unwrap();
+    assert_eq!(ob3.field, OrderByField::PayloadField("sentiment".into()));
+    assert_eq!(ob3.direction, OrderDirection::Desc);
+    assert_eq!(q3.limit, None);
+}
+
+#[test]
+fn limit_without_order_by() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_sortable_graph(&store);
+
+    let results = store
+        .graph_ir("MATCH (a)-[:LINK*1]->(b) WHERE id(a) = 'root://alice' RETURN b LIMIT 2")
+        .unwrap();
+
+    assert_eq!(results.len(), 2, "LIMIT 2 must return at most 2 results");
     store.close().unwrap();
 }
