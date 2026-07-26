@@ -46,6 +46,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+// ── type aliases ─────────────────────────────────────────────────────────────
+
+type ObjPayloadMap = HashMap<(ObjectId, CommitId), Option<Vec<u8>>>;
+type EdgePayloadMap = HashMap<(EdgeId, CommitId), Option<Vec<u8>>>;
+
 // ── on-disk record type ───────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -211,8 +216,8 @@ impl VersionStore {
     fn recover_stripped_obj_payloads(
         &mut self,
         objects: &[BinderObjectVersion],
-    ) -> io::Result<HashMap<(ObjectId, CommitId), Option<Vec<u8>>>> {
-        let mut map = HashMap::new();
+    ) -> io::Result<ObjPayloadMap> {
+        let mut map = ObjPayloadMap::new();
         if !objects.iter().any(|v| v.payload_stripped) {
             return Ok(map);
         }
@@ -244,8 +249,8 @@ impl VersionStore {
     fn recover_stripped_edge_payloads(
         &mut self,
         edges: &[BinderEdgeVersion],
-    ) -> io::Result<HashMap<(EdgeId, CommitId), Option<Vec<u8>>>> {
-        let mut map = HashMap::new();
+    ) -> io::Result<EdgePayloadMap> {
+        let mut map = EdgePayloadMap::new();
         if !edges.iter().any(|v| v.payload_stripped) {
             return Ok(map);
         }
