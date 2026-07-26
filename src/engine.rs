@@ -106,6 +106,14 @@ impl BinderStore {
         // `hydrate_ok`: clean reopen with no WAL delta — version_log.bin can
         // be indexed in place instead of rewritten.
         let mut hydrate_ok = false;
+        // full_versions_for_rebuild: populated on full WAL replay paths so the
+        // VersionStore can be rebuilt from complete history (live + retired).
+        // None on snapshot+delta path (VersionStore is updated incrementally).
+        let mut full_versions_for_rebuild: Option<(Vec<BinderObjectVersion>, Vec<BinderEdgeVersion>)> = None;
+        // vs_delta_commits: on snapshot+delta path, the commits that must be
+        // applied to the existing version_log.bin (hydrate + apply delta).
+        let mut vs_delta_commits: Vec<BinderCommit> = Vec::new();
+
         let (wal, commits, object_versions, edge_versions, ov_positions, ev_positions) =
             if let Some(cp) = last_checkpoint {
                 if let Some(snap) = read_snapshot(&snapshot_path) {
@@ -119,18 +127,16 @@ impl BinderStore {
                             wal.set_next_entry_id(cp.commit_count + delta.len() as u64);
                             hydrate_ok = was_clean && delta.is_empty();
 
+                            if !hydrate_ok {
+                                vs_delta_commits = delta.clone();
+                            }
+
+                            // build_version_stores_delta now returns live-only Vecs.
                             let (ovs, evs, ov_pos, ev_pos) =
-                                if cp.wal_offset == 0 && snap.commit_count == 0 {
-                                    // Post-compact: snapshot holds all versions; WAL is delta only.
+                                if delta.is_empty() {
+                                    // No delta: filter snapshot to live-only (backward compat).
                                     build_version_stores_delta(
                                         &delta,
-                                        snap.object_versions,
-                                        snap.edge_versions,
-                                        snap.ov_positions,
-                                        snap.ev_positions,
-                                    )
-                                } else if delta.is_empty() {
-                                    (
                                         snap.object_versions,
                                         snap.edge_versions,
                                         snap.ov_positions,
@@ -150,32 +156,39 @@ impl BinderStore {
                             commits.extend(delta);
                             (wal, commits, ovs, evs, ov_pos, ev_pos)
                         } else {
-                            // Legacy snapshot without commits: full WAL replay,
-                            // but still skip rebuild when delta applies.
+                            // Legacy snapshot without commits: full WAL replay.
                             let (wal, commits) = Wal::open_or_create(&wal_path)?;
-                            let delta = commits.get(cp.commit_count as usize..).unwrap_or(&[]);
-                            let (ovs, evs, ov_pos, ev_pos) = build_version_stores_delta(
-                                delta,
-                                snap.object_versions,
-                                snap.edge_versions,
-                                snap.ov_positions,
-                                snap.ev_positions,
-                            );
+                            let (full_ovs, full_evs, _, _) = build_version_stores(&commits);
+                            let (ovs, evs, ov_pos, ev_pos) =
+                                compact_live_only_from_full(&full_ovs, &full_evs);
+                            full_versions_for_rebuild = Some((full_ovs, full_evs));
                             (wal, commits, ovs, evs, ov_pos, ev_pos)
                         }
                     } else {
+                        // Snapshot/checkpoint mismatch: full WAL replay.
                         let (wal, commits) = Wal::open_or_create(&wal_path)?;
-                        let (ovs, evs, ov_pos, ev_pos) = build_version_stores(&commits);
+                        let (full_ovs, full_evs, _, _) = build_version_stores(&commits);
+                        let (ovs, evs, ov_pos, ev_pos) =
+                            compact_live_only_from_full(&full_ovs, &full_evs);
+                        full_versions_for_rebuild = Some((full_ovs, full_evs));
                         (wal, commits, ovs, evs, ov_pos, ev_pos)
                     }
                 } else {
+                    // No snapshot: full WAL replay.
                     let (wal, commits) = Wal::open_or_create(&wal_path)?;
-                    let (ovs, evs, ov_pos, ev_pos) = build_version_stores(&commits);
+                    let (full_ovs, full_evs, _, _) = build_version_stores(&commits);
+                    let (ovs, evs, ov_pos, ev_pos) =
+                        compact_live_only_from_full(&full_ovs, &full_evs);
+                    full_versions_for_rebuild = Some((full_ovs, full_evs));
                     (wal, commits, ovs, evs, ov_pos, ev_pos)
                 }
             } else {
+                // No checkpoint: full WAL replay.
                 let (wal, commits) = Wal::open_or_create(&wal_path)?;
-                let (ovs, evs, ov_pos, ev_pos) = build_version_stores(&commits);
+                let (full_ovs, full_evs, _, _) = build_version_stores(&commits);
+                let (ovs, evs, ov_pos, ev_pos) =
+                    compact_live_only_from_full(&full_ovs, &full_evs);
+                full_versions_for_rebuild = Some((full_ovs, full_evs));
                 (wal, commits, ovs, evs, ov_pos, ev_pos)
             };
 
@@ -188,19 +201,29 @@ impl BinderStore {
         let graph = GraphIndex::rebuild(edge_versions.iter().filter(|v| !v.is_tombstone()));
         let neighbours =
             GraphIndex::build_neighbour_map(edge_versions.iter().filter(|v| !v.is_tombstone()));
+        // All Vec entries are now live (valid_to=None), so no filter needed.
         let namespace_index =
-            NamespaceObjectIndex::rebuild(object_versions.iter().filter(|v| v.valid_to.is_none()));
+            NamespaceObjectIndex::rebuild(object_versions.iter().filter(|v| !v.is_tombstone()));
 
         // Load vector projection from previous clean close, if present.
         let vector_index = load_vector_projection(store_path);
 
-        // Disk-backed version history: on clean snapshot reopen, defer index
-        // hydration until the first history/as_of/write (keeps open() fast).
-        // Crash recovery and WAL-delta opens still rebuild eagerly.
+        // Disk-backed version history:
+        // - hydrate_ok (clean reopen, no delta): defer index loading until first query.
+        // - full WAL replay paths: rebuild the log from complete history.
+        // - snapshot+delta path with dirty state: hydrate existing log + apply delta.
         let version_log_path = store_path.join("version_log.bin");
         let mut version_store = VersionStore::open_or_create(&version_log_path)?;
         if !hydrate_ok {
-            version_store.rebuild_from_versions(&object_versions, &edge_versions)?;
+            if let Some((ref full_ovs, ref full_evs)) = full_versions_for_rebuild {
+                version_store.rebuild_from_versions(full_ovs, full_evs)?;
+            } else {
+                // Snapshot+delta path: hydrate existing file and apply only the delta commits.
+                version_store.hydrate_index_from_file()?;
+                for commit in &vs_delta_commits {
+                    apply_commit_to_version_store(&mut version_store, commit);
+                }
+            }
         }
 
         Ok(Self {
@@ -471,36 +494,41 @@ impl BinderStore {
         let new_ovs = derive_object_versions_for_commit(&commit);
         let new_evs = derive_edge_versions_for_commit(&commit);
 
-        // Collect retired Vec indices so payloads can be stripped after disk write.
-        let mut retired_ov_indices: Vec<usize> = Vec::new();
-        let mut retired_ev_indices: Vec<usize> = Vec::new();
-
         {
             let mut ovs = self.object_versions.lock().unwrap();
             let mut hobj = self.head_objects.lock().unwrap();
             let mut nsidx = self.namespace_index.lock().unwrap();
             let mut ov_pos = self.head_object_positions.lock().unwrap();
 
-            // Retire superseded versions in O(1) via position index.
+            // Swap-remove retiring entries from the live-only Vec.
             for v in &new_ovs {
-                if let Some(&old_idx) = ov_pos.get(&v.object_id) {
-                    ovs[old_idx].valid_to = Some(commit_id);
+                if let Some(old_idx) = ov_pos.remove(&v.object_id) {
+                    let last = ovs.len() - 1;
+                    if old_idx != last {
+                        ovs.swap(old_idx, last);
+                        let moved = ovs[old_idx].object_id.clone();
+                        ov_pos.insert(moved, old_idx);
+                    }
+                    ovs.pop();
                     nsidx.remove(&v.object_id);
-                    retired_ov_indices.push(old_idx);
                 }
             }
 
-            // Append new versions and update all indexes.
+            // Append live new versions and update indexes.
             let base = ovs.len();
-            ovs.reserve(new_ovs.len());
-            ov_pos.reserve(new_ovs.len());
-            ovs.extend(new_ovs.iter().cloned());
-            for (i, v) in new_ovs.iter().enumerate() {
+            let mut live_i = 0usize;
+            let live_count = new_ovs.iter().filter(|v| !v.is_tombstone()).count();
+            ovs.reserve(live_count);
+            ov_pos.reserve(live_count);
+            for v in &new_ovs {
                 hobj.upsert(v.clone());
-                ov_pos.insert(v.object_id.clone(), base + i);
                 if !v.is_tombstone() {
+                    ovs.push(v.clone());
+                    ov_pos.insert(v.object_id.clone(), base + live_i);
                     nsidx.insert(&v.object_id);
+                    live_i += 1;
                 } else {
+                    // tombstones: upserted into hobj (cache) but not Vec/ov_pos/nsidx
                     nsidx.remove(&v.object_id);
                 }
             }
@@ -512,7 +540,7 @@ impl BinderStore {
             let mut nbrs = self.neighbours.lock().unwrap();
             let mut ev_pos = self.head_edge_positions.lock().unwrap();
 
-            // Clean up graph/neighbour state for edges being superseded.
+            // Clean up graph/neighbour state for superseded edges and swap-remove from Vec.
             for new_ev in &new_evs {
                 if let Some(old) = hedge.get(&new_ev.edge_id) {
                     graph.remove(old);
@@ -522,21 +550,30 @@ impl BinderStore {
                         }
                     }
                 }
-                // O(1) edge version retirement via position index.
-                if let Some(&old_idx) = ev_pos.get(&new_ev.edge_id) {
-                    evs[old_idx].valid_to = Some(commit_id);
-                    retired_ev_indices.push(old_idx);
+                // Swap-remove retiring edge entry from live-only Vec.
+                if let Some(old_idx) = ev_pos.remove(&new_ev.edge_id) {
+                    let last = evs.len() - 1;
+                    if old_idx != last {
+                        evs.swap(old_idx, last);
+                        let moved = evs[old_idx].edge_id.clone();
+                        ev_pos.insert(moved, old_idx);
+                    }
+                    evs.pop();
                 }
             }
 
+            // Append live new edges and update indexes.
             let base = evs.len();
-            evs.reserve(new_evs.len());
-            ev_pos.reserve(new_evs.len());
-            evs.extend(new_evs.iter().cloned());
-            for (i, v) in new_evs.iter().enumerate() {
+            let mut live_i = 0usize;
+            let live_count = new_evs.iter().filter(|v| !v.is_tombstone()).count();
+            evs.reserve(live_count);
+            ev_pos.reserve(live_count);
+            for v in &new_evs {
                 hedge.upsert(v.clone());
-                ev_pos.insert(v.edge_id.clone(), base + i);
                 if !v.is_tombstone() {
+                    evs.push(v.clone());
+                    ev_pos.insert(v.edge_id.clone(), base + live_i);
+                    live_i += 1;
                     graph.insert(v);
                     if let (Some(from), Some(to)) = (&v.from_object, &v.to_object) {
                         nbrs.entry(from.clone()).or_default().push(to.clone());
@@ -563,27 +600,6 @@ impl BinderStore {
             }
             for v in &new_evs {
                 let _ = vs.append_edge(v);
-            }
-        }
-
-        // Compact retired in-memory versions now that disk copy is confirmed.
-        // payload + provenance are the heap-allocated fields; clearing them frees
-        // their heap allocations. payload_stripped=true keeps is_tombstone() correct.
-        // rebuild_from_versions recovers originals from the mmap before truncating.
-        if !retired_ov_indices.is_empty() {
-            let mut ovs = self.object_versions.lock().unwrap();
-            for idx in retired_ov_indices {
-                ovs[idx].payload = None;
-                ovs[idx].provenance = None;
-                ovs[idx].payload_stripped = true;
-            }
-        }
-        if !retired_ev_indices.is_empty() {
-            let mut evs = self.edge_versions.lock().unwrap();
-            for idx in retired_ev_indices {
-                evs[idx].payload = None;
-                evs[idx].provenance = None;
-                evs[idx].payload_stripped = true;
             }
         }
 
@@ -1299,31 +1315,26 @@ impl BinderStore {
         let new_neighbours =
             GraphIndex::build_neighbour_map(evs.iter().filter(|v| !v.is_tombstone()));
 
-        // Rebuild position maps: last index in Vec where valid_to is None per id.
+        // Rebuild position maps: all Vec entries are now live (valid_to=None),
+        // so no filter is needed.
         let new_ov_pos: HashMap<ObjectId, usize> = ovs
             .iter()
             .enumerate()
-            .filter(|(_, v)| v.valid_to.is_none())
             .map(|(i, v)| (v.object_id.clone(), i))
             .collect();
         let new_ev_pos: HashMap<EdgeId, usize> = evs
             .iter()
             .enumerate()
-            .filter(|(_, v)| v.valid_to.is_none())
             .map(|(i, v)| (v.edge_id.clone(), i))
             .collect();
 
-        // Rebuild the disk-backed version store while ovs/evs are still locked.
-        self.version_store
-            .lock()
-            .unwrap()
-            .rebuild_from_versions(&ovs, &evs)?;
+        // Note: rebuild_from_versions is NOT called here — the Vec is already
+        // live-only and the VersionStore on disk is authoritative for history.
+        // The VersionStore is updated incrementally by apply_commit_to_memory.
 
-        // Rebuild namespace index from the authoritative version store, not the
-        // potentially-evicted head cache (which may be incomplete at XL scale).
+        // Rebuild namespace index from live Vec entries.
         let new_namespace_index = NamespaceObjectIndex::rebuild(
-            ovs.iter()
-                .filter(|v| v.valid_to.is_none() && !v.is_tombstone()),
+            ovs.iter().filter(|v| !v.is_tombstone()),
         );
 
         drop(ovs);
@@ -1666,45 +1677,106 @@ fn head_from_versions(ovs: &[BinderObjectVersion], evs: &[BinderEdgeVersion]) ->
 
 /// Snapshot-based open: start from the snapshot's version stores and apply
 /// only the delta commits (WAL frames written after the snapshot offset).
+/// Returns live-only Vecs (retired entries are swap-removed, tombstones excluded).
 fn build_version_stores_delta(
     delta_commits: &[BinderCommit],
-    mut ovs: Vec<BinderObjectVersion>,
-    mut evs: Vec<BinderEdgeVersion>,
-    mut ov_pos: HashMap<ObjectId, usize>,
-    mut ev_pos: HashMap<EdgeId, usize>,
+    ovs: Vec<BinderObjectVersion>,
+    evs: Vec<BinderEdgeVersion>,
+    _ov_pos: HashMap<ObjectId, usize>, // ignored — positions rebuilt from filtered vecs
+    _ev_pos: HashMap<EdgeId, usize>,
 ) -> VersionStores {
+    // Filter incoming snapshot vecs to live-only (backward compat: old snapshots had retired entries).
+    let mut ovs: Vec<BinderObjectVersion> = ovs.into_iter().filter(|v| v.valid_to.is_none()).collect();
+    let mut evs: Vec<BinderEdgeVersion> = evs.into_iter().filter(|v| v.valid_to.is_none()).collect();
+    let mut ov_pos: HashMap<ObjectId, usize> = ovs.iter().enumerate().map(|(i, v)| (v.object_id.clone(), i)).collect();
+    let mut ev_pos: HashMap<EdgeId, usize> = evs.iter().enumerate().map(|(i, v)| (v.edge_id.clone(), i)).collect();
+
     for commit in delta_commits {
         let new_ovs = derive_object_versions_for_commit(commit);
         let new_evs = derive_edge_versions_for_commit(commit);
 
+        // Swap-remove retiring object entries.
         for v in &new_ovs {
-            if let Some(&old_idx) = ov_pos.get(&v.object_id) {
-                ovs[old_idx].valid_to = Some(commit.commit_id);
+            if let Some(old_idx) = ov_pos.remove(&v.object_id) {
+                let last = ovs.len() - 1;
+                if old_idx != last {
+                    ovs.swap(old_idx, last);
+                    let moved = ovs[old_idx].object_id.clone();
+                    ov_pos.insert(moved, old_idx);
+                }
+                ovs.pop();
             }
         }
+        // Append live new versions (skip tombstones).
         let base = ovs.len();
+        let mut live_i = 0usize;
         ovs.reserve(new_ovs.len());
         ov_pos.reserve(new_ovs.len());
-        ovs.extend(new_ovs.iter().cloned());
-        for (i, v) in new_ovs.iter().enumerate() {
-            ov_pos.insert(v.object_id.clone(), base + i);
-        }
-
-        for v in &new_evs {
-            if let Some(&old_idx) = ev_pos.get(&v.edge_id) {
-                evs[old_idx].valid_to = Some(commit.commit_id);
+        for v in &new_ovs {
+            if !v.is_tombstone() {
+                ovs.push(v.clone());
+                ov_pos.insert(v.object_id.clone(), base + live_i);
+                live_i += 1;
             }
         }
+
+        // Swap-remove retiring edge entries.
+        for v in &new_evs {
+            if let Some(old_idx) = ev_pos.remove(&v.edge_id) {
+                let last = evs.len() - 1;
+                if old_idx != last {
+                    evs.swap(old_idx, last);
+                    let moved = evs[old_idx].edge_id.clone();
+                    ev_pos.insert(moved, old_idx);
+                }
+                evs.pop();
+            }
+        }
+        // Append live new edge versions (skip tombstones).
         let base = evs.len();
+        let mut live_i = 0usize;
         evs.reserve(new_evs.len());
         ev_pos.reserve(new_evs.len());
-        evs.extend(new_evs.iter().cloned());
-        for (i, v) in new_evs.iter().enumerate() {
-            ev_pos.insert(v.edge_id.clone(), base + i);
+        for v in &new_evs {
+            if !v.is_tombstone() {
+                evs.push(v.clone());
+                ev_pos.insert(v.edge_id.clone(), base + live_i);
+                live_i += 1;
+            }
         }
     }
 
     (ovs, evs, ov_pos, ev_pos)
+}
+
+/// Compact a full-history Vec (live + retired) to live-only.
+/// Returns the compacted vecs and rebuilt position maps.
+fn compact_live_only_from_full(
+    full_ovs: &[BinderObjectVersion],
+    full_evs: &[BinderEdgeVersion],
+) -> VersionStores {
+    let ovs: Vec<BinderObjectVersion> = full_ovs.iter().filter(|v| v.valid_to.is_none()).cloned().collect();
+    let evs: Vec<BinderEdgeVersion> = full_evs.iter().filter(|v| v.valid_to.is_none()).cloned().collect();
+    let ov_pos: HashMap<ObjectId, usize> = ovs.iter().enumerate().map(|(i, v)| (v.object_id.clone(), i)).collect();
+    let ev_pos: HashMap<EdgeId, usize> = evs.iter().enumerate().map(|(i, v)| (v.edge_id.clone(), i)).collect();
+    (ovs, evs, ov_pos, ev_pos)
+}
+
+/// Apply one commit's changes to a VersionStore idempotently.
+/// Skips versions that are already in the store (by valid_from == commit_id).
+fn apply_commit_to_version_store(vs: &mut VersionStore, commit: &BinderCommit) {
+    for v in derive_object_versions_for_commit(commit) {
+        if !vs.object_has_version_at(&v.object_id, v.valid_from) {
+            let _ = vs.retire_object(&v.object_id, commit.commit_id);
+            let _ = vs.append_object(&v);
+        }
+    }
+    for v in derive_edge_versions_for_commit(commit) {
+        if !vs.edge_has_version_at(&v.edge_id, v.valid_from) {
+            let _ = vs.retire_edge(&v.edge_id, commit.commit_id);
+            let _ = vs.append_edge(&v);
+        }
+    }
 }
 
 fn load_vector_projection(store_path: &Path) -> VectorIndex {

@@ -372,6 +372,8 @@ impl VersionStore {
         }
 
         self.write_pos = pos;
+        // Truncate any partial write at the tail (crash recovery).
+        self.file.set_len(pos)?;
         self.file.seek(SeekFrom::Start(self.write_pos))?;
         self.refresh_mmap()?;
         self.maybe_evict();
@@ -386,6 +388,20 @@ impl VersionStore {
     /// True when the on-disk log has at least one frame.
     pub fn has_data(&self) -> bool {
         self.write_pos > 0 || self.file.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    }
+
+    /// Check whether a specific version (identified by valid_from) exists in the index for an object.
+    pub fn object_has_version_at(&self, id: &ObjectId, valid_from: CommitId) -> bool {
+        self.object_index
+            .get(id)
+            .map_or(false, |entries| entries.iter().any(|e| e.valid_from == valid_from))
+    }
+
+    /// Check whether a specific version (identified by valid_from) exists in the index for an edge.
+    pub fn edge_has_version_at(&self, id: &EdgeId, valid_from: CommitId) -> bool {
+        self.edge_index
+            .get(id)
+            .map_or(false, |entries| entries.iter().any(|e| e.valid_from == valid_from))
     }
 
     /// Current number of IndexEntry records held in RAM (live + historical).
