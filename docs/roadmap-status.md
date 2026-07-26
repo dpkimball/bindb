@@ -10,7 +10,7 @@ Last updated: 2026-07-25. Prefer this over stale issue bodies.
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model; **100K SLA gate** (`knn_search` p99 ≤5ms, recall@10 ≥90%; OKR O3) | — |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation / SQL | Open | Rust DSL + `sql_aggregate()` (COUNT/AVG/SUM/MIN/MAX/P50/P99, PATH_SEGMENT, **WHERE id STARTS WITH**) + **`export_observations_jsonl()`** (DuckDB-compatible JSONL) + **`query_sql_observations(ns, sql)`** (out-of-process DuckDB; rewrites `observations` → `read_ndjson_auto(...)`) | Full SQL; joins |
-| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss); **head-cache LRU** (bounded HeadObjectIndex/HeadEdgeIndex, default 200 K; miss falls back to mmap-backed VersionStore; `open_with_head_cap()`; 6 integration tests) | Payload stripping from in-memory `object_versions` Vec (historical entries still hold payloads in RAM) |
+| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss); **head-cache LRU** (bounded HeadObjectIndex/HeadEdgeIndex, default 200 K; miss falls back to mmap-backed VersionStore; `open_with_head_cap()`; 6 integration tests); **payload stripping** (`payload_stripped` field; retired versions zeroed to None in RAM after disk write; `rebuild_from_versions` recovers payloads from mmap before truncate; 8 integration tests) | Object payload stripping shipped; next: mmap index for large HNSW |
 | [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open | Snapshot fast open; XL get/open-after-compact PASS; **formal XL SLA tests** + **nightly CI job** (02:00 UTC) + **3 new XL SLA tests** (`list` p99 ≤500ms, `commit_buffered` ≥5K/s, `rebuild_indexes` ≤60s at 1M objects); **eviction bug fix** (O(1M) sweep per commit fixed; `commit_buffered` at XL now 260K/s); **nightly watchdog** (`nightly_watchdog.yml` on `ubuntu-latest` at 02:45 UTC; opens GitHub issue on missed/failed run) | — |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
 | [#9](https://github.com/dpkimball/bindb/issues/9) Checkpoint open | Closed | Snapshot fast path on `open()` | Variance / flake control (OKR O4) |
@@ -49,11 +49,18 @@ Cold misses fall back to the mmap-backed VersionStore (~1 µs page-cache read).
 At XL with 1 M live objects only the 200 K most-recently-committed objects stay in
 the HeadObjectIndex; the rest are served from disk on first access.
 
-**Dominant remaining RAM contributor** (not yet addressed): the `object_versions`
-Vec still holds every live + historical version (including payloads) in RAM.
-At XL this is the largest single allocation (~300 MB–1.5 GB).  The next slice of #6
-work is stripping payloads from retired entries in `object_versions` after the payload
-has been persisted to `version_log.bin`.
+**Payload stripping shipped (2026-07-26)**: retired entries in `object_versions` now
+have their payload zeroed to `None` immediately after `version_log.bin` confirms the
+write.  A `payload_stripped: bool` field distinguishes stripped entries from genuine
+delete tombstones.  `rebuild_from_versions` recovers payloads from the mmap before
+truncating so historical queries remain correct.  At XL this removes the
+~300 MB–1.5 GB retired-payload allocation entirely.
+
+**Dominant remaining RAM contributor**: the `object_versions` Vec metadata (version_id,
+object_id, commit_id, valid_from, valid_to, provenance) for all historical versions —
+roughly ~100–200 B × n_versions.  At 5 M versions this is ~500 MB–1 GB.  Next slice:
+trim retired `object_versions` Vec entries to a compact IndexEntry (~40 B) once the
+full struct is no longer needed for any query path.
 
 **Measured XL (1 M objects, 2026-07-23, Apple Silicon, release, after compact):**
 

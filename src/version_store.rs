@@ -46,6 +46,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+// ── type aliases ─────────────────────────────────────────────────────────────
+
+type ObjPayloadMap = HashMap<(ObjectId, CommitId), Option<Vec<u8>>>;
+type EdgePayloadMap = HashMap<(EdgeId, CommitId), Option<Vec<u8>>>;
+
 // ── on-disk record type ───────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -129,11 +134,19 @@ impl VersionStore {
     /// Truncate the file and rebuild it from the given version slices.
     ///
     /// Called during `open()` (after WAL replay) and `rebuild_indexes()`.
+    ///
+    /// If any entries have `payload_stripped = true`, their payloads are
+    /// recovered from the existing mmap before the file is truncated, so the
+    /// rebuilt file always stores the full payload.
     pub fn rebuild_from_versions(
         &mut self,
         objects: &[BinderObjectVersion],
         edges: &[BinderEdgeVersion],
     ) -> io::Result<()> {
+        // Recover payloads for any RAM-stripped entries before truncating.
+        let obj_payloads = self.recover_stripped_obj_payloads(objects)?;
+        let edge_payloads = self.recover_stripped_edge_payloads(edges)?;
+
         self.mmap = None;
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
@@ -145,7 +158,16 @@ impl VersionStore {
         self.evicted_edge_ids.clear();
 
         for v in objects {
-            let offset = self.append_record(&VersionRecord::Object(v.clone()))?;
+            let full_v = if v.payload_stripped {
+                let key = (v.object_id.clone(), v.valid_from);
+                let mut r = v.clone();
+                r.payload = obj_payloads.get(&key).cloned().flatten();
+                r.payload_stripped = false;
+                r
+            } else {
+                v.clone()
+            };
+            let offset = self.append_record(&VersionRecord::Object(full_v))?;
             self.object_index
                 .entry(v.object_id.clone())
                 .or_default()
@@ -160,7 +182,16 @@ impl VersionStore {
         }
 
         for v in edges {
-            let offset = self.append_record(&VersionRecord::Edge(v.clone()))?;
+            let full_v = if v.payload_stripped {
+                let key = (v.edge_id.clone(), v.valid_from);
+                let mut r = v.clone();
+                r.payload = edge_payloads.get(&key).cloned().flatten();
+                r.payload_stripped = false;
+                r
+            } else {
+                v.clone()
+            };
+            let offset = self.append_record(&VersionRecord::Edge(full_v))?;
             self.edge_index
                 .entry(v.edge_id.clone())
                 .or_default()
@@ -178,6 +209,73 @@ impl VersionStore {
         self.refresh_mmap()?;
         self.maybe_evict();
         Ok(())
+    }
+
+    /// Scan the existing mmap to collect payloads for stripped object versions.
+    /// Returns a map of (object_id, valid_from) → payload (may be None for tombstones).
+    fn recover_stripped_obj_payloads(
+        &mut self,
+        objects: &[BinderObjectVersion],
+    ) -> io::Result<ObjPayloadMap> {
+        let mut map = ObjPayloadMap::new();
+        if !objects.iter().any(|v| v.payload_stripped) {
+            return Ok(map);
+        }
+        if self.mmap.is_none() && self.write_pos > 0 {
+            self.refresh_mmap()?;
+        }
+        let Some(ref mmap) = self.mmap else {
+            return Ok(map);
+        };
+        let mut pos = 0usize;
+        while pos + 8 <= mmap.len() {
+            let len = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            let data_start = pos + 8;
+            if data_start + len > mmap.len() {
+                break;
+            }
+            if let Ok(VersionRecord::Object(v)) =
+                bincode::deserialize::<VersionRecord>(&mmap[data_start..data_start + len])
+            {
+                map.entry((v.object_id.clone(), v.valid_from))
+                    .or_insert(v.payload);
+            }
+            pos += 8 + len;
+        }
+        Ok(map)
+    }
+
+    /// Scan the existing mmap to collect payloads for stripped edge versions.
+    fn recover_stripped_edge_payloads(
+        &mut self,
+        edges: &[BinderEdgeVersion],
+    ) -> io::Result<EdgePayloadMap> {
+        let mut map = EdgePayloadMap::new();
+        if !edges.iter().any(|v| v.payload_stripped) {
+            return Ok(map);
+        }
+        if self.mmap.is_none() && self.write_pos > 0 {
+            self.refresh_mmap()?;
+        }
+        let Some(ref mmap) = self.mmap else {
+            return Ok(map);
+        };
+        let mut pos = 0usize;
+        while pos + 8 <= mmap.len() {
+            let len = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            let data_start = pos + 8;
+            if data_start + len > mmap.len() {
+                break;
+            }
+            if let Ok(VersionRecord::Edge(v)) =
+                bincode::deserialize::<VersionRecord>(&mmap[data_start..data_start + len])
+            {
+                map.entry((v.edge_id.clone(), v.valid_from))
+                    .or_insert(v.payload);
+            }
+            pos += 8 + len;
+        }
+        Ok(map)
     }
 
     /// Rebuild in-memory indexes by scanning an existing `version_log.bin`
@@ -719,6 +817,7 @@ mod tests {
             valid_to,
             payload: Some(payload.to_vec()),
             provenance: None,
+            payload_stripped: false,
         }
     }
 
