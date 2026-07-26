@@ -1,4 +1,4 @@
-use bindb::{BinderStore, EdgeId, ObjectId, Transaction};
+use bindb::{BinderStore, EdgeId, ObjectId, Provenance, ProvenanceSource, Transaction};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -234,4 +234,82 @@ fn list_correct_after_many_rewrites() {
 
     let ids = store.list("ns").unwrap();
     assert_eq!(ids.len(), n);
+}
+
+/// Provenance heap strings are cleared from retired entries but recovered
+/// correctly when object_history / rebuild_indexes / compact+reopen is used.
+#[test]
+fn provenance_recovered_after_stripping() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let oid = obj("ns/prov-obj");
+
+    let prov = Provenance {
+        source: ProvenanceSource::Import("health-kit".to_string()),
+        source_ref: "HKQuantityTypeIdentifierHeartRate".to_string(),
+        imported_at_ms: 1_700_000_000_000,
+    };
+
+    let mut tx = Transaction::new();
+    tx.put_object_with_provenance(oid.clone(), b"v1".to_vec(), Some(prov.clone()));
+    let c1 = store.commit(tx, "actor", "v1").unwrap();
+
+    // Overwrite — retires v1, stripping its provenance from RAM.
+    let mut tx2 = Transaction::new();
+    tx2.put_object(oid.clone(), b"v2".to_vec());
+    store.commit(tx2, "actor", "v2").unwrap();
+
+    // Historical query reads provenance from VersionStore (disk), not RAM.
+    let hist = store.object_as_of(&oid, c1).unwrap().expect("hist");
+    assert_eq!(
+        hist.provenance.as_ref().map(|p| p.source_ref.as_str()),
+        Some("HKQuantityTypeIdentifierHeartRate")
+    );
+
+    // rebuild_indexes must recover provenance before rewriting version_log.bin.
+    store.rebuild_indexes().unwrap();
+    let hist2 = store
+        .object_as_of(&oid, c1)
+        .unwrap()
+        .expect("hist after rebuild");
+    assert_eq!(
+        hist2.provenance.as_ref().map(|p| p.source_ref.as_str()),
+        Some("HKQuantityTypeIdentifierHeartRate")
+    );
+}
+
+/// compact() + reopen: provenance on retired versions survives the snapshot cycle.
+#[test]
+fn provenance_survives_compact_reopen() {
+    let dir = tmp();
+    let prov = Provenance {
+        source: ProvenanceSource::Plugin("binder-health".to_string()),
+        source_ref: "steps-2026-01-01".to_string(),
+        imported_at_ms: 1_750_000_000_000,
+    };
+
+    let c1 = {
+        let store = BinderStore::open(dir.path()).unwrap();
+        let oid = obj("ns/prov-compact");
+
+        let mut tx = Transaction::new();
+        tx.put_object_with_provenance(oid.clone(), b"original".to_vec(), Some(prov.clone()));
+        let c1 = store.commit(tx, "actor", "v1").unwrap();
+
+        let mut tx2 = Transaction::new();
+        tx2.put_object(oid.clone(), b"updated".to_vec());
+        store.commit(tx2, "actor", "v2").unwrap();
+
+        store.compact().unwrap();
+        store.close().unwrap();
+        c1
+    };
+
+    let store2 = BinderStore::open(dir.path()).unwrap();
+    let oid = obj("ns/prov-compact");
+    let hist = store2.object_as_of(&oid, c1).unwrap().expect("hist");
+    assert_eq!(
+        hist.provenance.as_ref().map(|p| p.source_ref.as_str()),
+        Some("steps-2026-01-01")
+    );
 }

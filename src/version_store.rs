@@ -48,8 +48,10 @@ use std::path::Path;
 
 // ── type aliases ─────────────────────────────────────────────────────────────
 
-type ObjPayloadMap = HashMap<(ObjectId, CommitId), Option<Vec<u8>>>;
-type EdgePayloadMap = HashMap<(EdgeId, CommitId), Option<Vec<u8>>>;
+/// Full original structs recovered from mmap before rebuild truncates the file.
+/// Keyed by (id, valid_from) which is the stable identity of a version.
+type ObjRecoveryMap = HashMap<(ObjectId, CommitId), BinderObjectVersion>;
+type EdgeRecoveryMap = HashMap<(EdgeId, CommitId), BinderEdgeVersion>;
 
 // ── on-disk record type ───────────────────────────────────────────────────────
 
@@ -135,17 +137,18 @@ impl VersionStore {
     ///
     /// Called during `open()` (after WAL replay) and `rebuild_indexes()`.
     ///
-    /// If any entries have `payload_stripped = true`, their payloads are
-    /// recovered from the existing mmap before the file is truncated, so the
-    /// rebuilt file always stores the full payload.
+    /// Entries with `payload_stripped = true` have had payload, version_id,
+    /// commit_id, and provenance zeroed from RAM.  Their original values are
+    /// recovered from the existing mmap before truncation so the rebuilt file
+    /// is always complete.
     pub fn rebuild_from_versions(
         &mut self,
         objects: &[BinderObjectVersion],
         edges: &[BinderEdgeVersion],
     ) -> io::Result<()> {
-        // Recover payloads for any RAM-stripped entries before truncating.
-        let obj_payloads = self.recover_stripped_obj_payloads(objects)?;
-        let edge_payloads = self.recover_stripped_edge_payloads(edges)?;
+        // Recover full structs for any compacted entries before truncating.
+        let obj_originals = self.recover_stripped_obj_records(objects)?;
+        let edge_originals = self.recover_stripped_edge_records(edges)?;
 
         self.mmap = None;
         self.file.set_len(0)?;
@@ -160,10 +163,15 @@ impl VersionStore {
         for v in objects {
             let full_v = if v.payload_stripped {
                 let key = (v.object_id.clone(), v.valid_from);
-                let mut r = v.clone();
-                r.payload = obj_payloads.get(&key).cloned().flatten();
-                r.payload_stripped = false;
-                r
+                match obj_originals.get(&key) {
+                    Some(original) => original.clone(),
+                    None => {
+                        // No disk record found; write the compacted version as-is.
+                        let mut r = v.clone();
+                        r.payload_stripped = false;
+                        r
+                    }
+                }
             } else {
                 v.clone()
             };
@@ -184,10 +192,14 @@ impl VersionStore {
         for v in edges {
             let full_v = if v.payload_stripped {
                 let key = (v.edge_id.clone(), v.valid_from);
-                let mut r = v.clone();
-                r.payload = edge_payloads.get(&key).cloned().flatten();
-                r.payload_stripped = false;
-                r
+                match edge_originals.get(&key) {
+                    Some(original) => original.clone(),
+                    None => {
+                        let mut r = v.clone();
+                        r.payload_stripped = false;
+                        r
+                    }
+                }
             } else {
                 v.clone()
             };
@@ -211,13 +223,13 @@ impl VersionStore {
         Ok(())
     }
 
-    /// Scan the existing mmap to collect payloads for stripped object versions.
-    /// Returns a map of (object_id, valid_from) → payload (may be None for tombstones).
-    fn recover_stripped_obj_payloads(
+    /// Scan the existing mmap and return the original full structs for any
+    /// compacted (payload_stripped=true) object versions, keyed by (object_id, valid_from).
+    fn recover_stripped_obj_records(
         &mut self,
         objects: &[BinderObjectVersion],
-    ) -> io::Result<ObjPayloadMap> {
-        let mut map = ObjPayloadMap::new();
+    ) -> io::Result<ObjRecoveryMap> {
+        let mut map = ObjRecoveryMap::new();
         if !objects.iter().any(|v| v.payload_stripped) {
             return Ok(map);
         }
@@ -237,20 +249,20 @@ impl VersionStore {
             if let Ok(VersionRecord::Object(v)) =
                 bincode::deserialize::<VersionRecord>(&mmap[data_start..data_start + len])
             {
-                map.entry((v.object_id.clone(), v.valid_from))
-                    .or_insert(v.payload);
+                map.entry((v.object_id.clone(), v.valid_from)).or_insert(v);
             }
             pos += 8 + len;
         }
         Ok(map)
     }
 
-    /// Scan the existing mmap to collect payloads for stripped edge versions.
-    fn recover_stripped_edge_payloads(
+    /// Scan the existing mmap and return the original full structs for any
+    /// compacted edge versions, keyed by (edge_id, valid_from).
+    fn recover_stripped_edge_records(
         &mut self,
         edges: &[BinderEdgeVersion],
-    ) -> io::Result<EdgePayloadMap> {
-        let mut map = EdgePayloadMap::new();
+    ) -> io::Result<EdgeRecoveryMap> {
+        let mut map = EdgeRecoveryMap::new();
         if !edges.iter().any(|v| v.payload_stripped) {
             return Ok(map);
         }
@@ -270,8 +282,7 @@ impl VersionStore {
             if let Ok(VersionRecord::Edge(v)) =
                 bincode::deserialize::<VersionRecord>(&mmap[data_start..data_start + len])
             {
-                map.entry((v.edge_id.clone(), v.valid_from))
-                    .or_insert(v.payload);
+                map.entry((v.edge_id.clone(), v.valid_from)).or_insert(v);
             }
             pos += 8 + len;
         }
