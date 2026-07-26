@@ -1,0 +1,58 @@
+name: Work item (issue doctrine)
+description: Standard DPK/Keepsake work issue with acceptance criteria and four-role Review ledger.
+title: "[work]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Follow the [Issue Doctrine](https://github.com/dpkimball/dpk-workspace/blob/master/docs/development/02-issue-doctrine.md).
+        Thoroughness, maturity, maintainability, and efficiency — not a race. Agents never merge.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong or missing?
+      placeholder: Describe the gap or defect.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checklist definition of done for this issue.
+      value: |
+        - [ ] 
+        - [ ] 
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Spec/plan links, constraints, out of scope.
+      placeholder: Links and constraints…
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: |
+        ## Review ledger
+
+        Agents fill this as reviews complete. **All four** must be reviewed before `agent:approved`.
+
+        | Role | Status | Agent / person | At (ISO8601) | Evidence |
+        |------|--------|----------------|--------------|----------|
+        | Developer | pending | — | — | — |
+        | Architect | pending | — | — | — |
+        | QE | pending | — | — | — |
+        | Security | pending | — | — | — |
+
+        ```html
+        <!-- issue-review-ledger
+        developer: pending
+        architect: pending
+        qe: pending
+        security: pending
+        -->
+        ```
