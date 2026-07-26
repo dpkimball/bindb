@@ -10,7 +10,7 @@ Last updated: 2026-07-25. Prefer this over stale issue bodies.
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model; **100K SLA gate** (`knn_search` p99 ≤5ms, recall@10 ≥90%; OKR O3) | — |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation / SQL | Open | Rust DSL + `sql_aggregate()` (COUNT/AVG/SUM/MIN/MAX/P50/P99, PATH_SEGMENT, **WHERE id STARTS WITH**) + **`export_observations_jsonl()`** (DuckDB-compatible JSONL) + **`query_sql_observations(ns, sql)`** (out-of-process DuckDB; rewrites `observations` → `read_ndjson_auto(...)`) | Full SQL; joins |
-| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss); **head-cache LRU** (bounded HeadObjectIndex/HeadEdgeIndex, default 200 K; miss falls back to mmap-backed VersionStore; `open_with_head_cap()`; 6 integration tests); **payload + provenance stripping** (`payload_stripped` field; retired versions have payload + provenance heap strings freed after disk write; `rebuild_from_versions` recovers full originals from mmap before truncate; 10 integration tests) | Dominant remaining: object_id String heap for historical Vec entries; next slice: drop retired entries from Vec and rely on VersionStore for all historical data |
+| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss); **head-cache LRU** (bounded HeadObjectIndex/HeadEdgeIndex, default 200 K; miss falls back to mmap-backed VersionStore; `open_with_head_cap()`; 6 integration tests); **payload + provenance stripping** (`payload_stripped` field; retired versions have payload + provenance heap strings freed after disk write; `rebuild_from_versions` recovers full originals from mmap before truncate; 10 integration tests); **live-only Vec** (retired entries swap-removed from `object_versions`/`edge_versions` Vecs on commit; Vec holds only live versions; VersionStore is sole source for history; `rebuild_indexes` no longer rewrites disk; `open` compacts to live-only after crash-recovery rebuild; 3 new integration tests) | Historical data after crash relies solely on version_log.bin (cannot rebuild from live-only Vec) |
 | [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | Open | Snapshot fast open; XL get/open-after-compact PASS; **formal XL SLA tests** + **nightly CI job** (02:00 UTC) + **3 new XL SLA tests** (`list` p99 ≤500ms, `commit_buffered` ≥5K/s, `rebuild_indexes` ≤60s at 1M objects); **eviction bug fix** (O(1M) sweep per commit fixed; `commit_buffered` at XL now 260K/s); **nightly watchdog** (`nightly_watchdog.yml` on `ubuntu-latest` at 02:45 UTC; opens GitHub issue on missed/failed run) | — |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
 | [#9](https://github.com/dpkimball/bindb/issues/9) Checkpoint open | Closed | Snapshot fast path on `open()` | Variance / flake control (OKR O4) |
@@ -40,7 +40,7 @@ Rough **process RSS** model for a Binder life-scale store (order-of-magnitude):
 | Observation heads (1 yr health, cached) | min(live, 200 K) × ~100 B | ≤ 20 MB |
 | Version history index (10× churn) | ~1–5 M × ~40 B (index only) | ~40–200 MB |
 | Version history payloads | ~1–5 M records | on disk (version_log.bin) |
-| `object_versions` Vec (all live+hist in RAM) | ~1–5 M × ~300 B | **~300 MB–1.5 GB** |
+| `object_versions` Vec (live entries only) | n_live × ~80 B struct (no heap for retired) | **~8–80 MB** |
 | Graph adjacency | proportional to edges | tens of MB |
 | Vector index (HNSW, if large) | model-dependent | separate |
 
@@ -60,12 +60,16 @@ truncating so historical queries remain correct.  At XL this removes the
 `provenance` field dropped from RAM (heap-allocated strings freed).  For users with
 provenance on every version this saves ~190 MB per 5 M entries.
 
-**Dominant remaining RAM contributor**: the `object_versions` Vec entries themselves —
-each retired entry is a `BinderObjectVersion` struct (~80 B stack with `object_id`
-inline pointer, but `object_id.0 String` still has a heap allocation for the key).
-At 5 M retired entries the String heap alone is ~100 MB.  Next slice: drop retired
-entries from the Vec entirely and rely on the disk-backed VersionStore for all
-historical data, keeping only live entries in the Vec.
+**Live-only Vec shipped (2026-07-25)**: `object_versions` and `edge_versions` Vecs now
+hold only live (valid_to=None) entries.  On commit, retiring an entry does a swap-remove
+(O(1) via position map) rather than nulling its payload in place.  Tombstones are
+upserted into the head cache but never pushed into the Vec.  The VersionStore is the
+sole source for historical queries (`object_history`, `object_as_of`).  Crash recovery
+rebuilds version_log.bin from the full WAL when available; the snapshot+delta path
+hydrates the existing file and applies only the delta idempotently.  `rebuild_indexes`
+now rebuilds in-memory indexes only (does not rewrite version_log.bin).
+At 1 M live objects and 5 M total historical: removes ~100 MB String heap + ~400 MB
+struct overhead from retired Vec entries compared to the pre-stripping baseline.
 
 **Measured XL (1 M objects, 2026-07-23, Apple Silicon, release, after compact):**
 
