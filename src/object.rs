@@ -26,7 +26,8 @@ impl fmt::Display for ObjectVersionId {
 }
 
 /// An immutable point-in-time snapshot of an object within a specific commit.
-/// `payload = None` means this version is a tombstone (the object was deleted).
+/// `payload = None && !payload_stripped` means this version is a tombstone (the object was deleted).
+/// `payload = None && payload_stripped` means payload was evicted from RAM; it lives in version_log.bin.
 /// `valid_to = None` means this is the current live version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinderObjectVersion {
@@ -37,11 +38,15 @@ pub struct BinderObjectVersion {
     pub valid_to: Option<CommitId>,
     pub payload: Option<Vec<u8>>,
     pub provenance: Option<Provenance>,
+    /// True when payload was intentionally evicted from RAM after being persisted to disk.
+    /// Distinguishes a RAM-stripped retired version from a genuine delete tombstone.
+    #[serde(default)]
+    pub payload_stripped: bool,
 }
 
 impl BinderObjectVersion {
     pub fn is_tombstone(&self) -> bool {
-        self.payload.is_none()
+        self.payload.is_none() && !self.payload_stripped
     }
 
     pub fn is_current(&self) -> bool {

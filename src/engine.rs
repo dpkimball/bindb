@@ -471,6 +471,10 @@ impl BinderStore {
         let new_ovs = derive_object_versions_for_commit(&commit);
         let new_evs = derive_edge_versions_for_commit(&commit);
 
+        // Collect retired Vec indices so payloads can be stripped after disk write.
+        let mut retired_ov_indices: Vec<usize> = Vec::new();
+        let mut retired_ev_indices: Vec<usize> = Vec::new();
+
         {
             let mut ovs = self.object_versions.lock().unwrap();
             let mut hobj = self.head_objects.lock().unwrap();
@@ -482,6 +486,7 @@ impl BinderStore {
                 if let Some(&old_idx) = ov_pos.get(&v.object_id) {
                     ovs[old_idx].valid_to = Some(commit_id);
                     nsidx.remove(&v.object_id);
+                    retired_ov_indices.push(old_idx);
                 }
             }
 
@@ -520,6 +525,7 @@ impl BinderStore {
                 // O(1) edge version retirement via position index.
                 if let Some(&old_idx) = ev_pos.get(&new_ev.edge_id) {
                     evs[old_idx].valid_to = Some(commit_id);
+                    retired_ev_indices.push(old_idx);
                 }
             }
 
@@ -557,6 +563,24 @@ impl BinderStore {
             }
             for v in &new_evs {
                 let _ = vs.append_edge(v);
+            }
+        }
+
+        // Strip payloads from retired in-memory versions now that disk copy is confirmed.
+        // This is the primary RAM-reduction mechanism for issue #6 (phase 2).
+        // Retains `payload_stripped = true` so is_tombstone() stays correct.
+        if !retired_ov_indices.is_empty() {
+            let mut ovs = self.object_versions.lock().unwrap();
+            for idx in retired_ov_indices {
+                ovs[idx].payload = None;
+                ovs[idx].payload_stripped = true;
+            }
+        }
+        if !retired_ev_indices.is_empty() {
+            let mut evs = self.edge_versions.lock().unwrap();
+            for idx in retired_ev_indices {
+                evs[idx].payload = None;
+                evs[idx].payload_stripped = true;
             }
         }
 
@@ -1755,6 +1779,7 @@ fn derive_object_versions_for_commit(commit: &BinderCommit) -> Vec<BinderObjectV
             valid_to: None,
             payload: change.payload.clone(),
             provenance: change.provenance.clone(),
+            payload_stripped: false,
         })
         .collect()
 }
@@ -1789,6 +1814,7 @@ fn derive_edge_versions_for_commit(commit: &BinderCommit) -> Vec<BinderEdgeVersi
             relationship_type: change.relationship_type.clone(),
             payload: change.payload.clone(),
             provenance: change.provenance.clone(),
+            payload_stripped: false,
         })
         .collect()
 }

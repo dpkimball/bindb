@@ -41,6 +41,9 @@ pub struct BinderEdgeVersion {
     pub relationship_type: Option<String>,
     pub payload: Option<Vec<u8>>,
     pub provenance: Option<Provenance>,
+    /// True when payload was intentionally evicted from RAM after being persisted to disk.
+    #[serde(default)]
+    pub payload_stripped: bool,
 }
 
 impl BinderEdgeVersion {
