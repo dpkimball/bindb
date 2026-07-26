@@ -566,13 +566,15 @@ impl BinderStore {
             }
         }
 
-        // Strip payloads from retired in-memory versions now that disk copy is confirmed.
-        // This is the primary RAM-reduction mechanism for issue #6 (phase 2).
-        // Retains `payload_stripped = true` so is_tombstone() stays correct.
+        // Compact retired in-memory versions now that disk copy is confirmed.
+        // payload + provenance are the heap-allocated fields; clearing them frees
+        // their heap allocations. payload_stripped=true keeps is_tombstone() correct.
+        // rebuild_from_versions recovers originals from the mmap before truncating.
         if !retired_ov_indices.is_empty() {
             let mut ovs = self.object_versions.lock().unwrap();
             for idx in retired_ov_indices {
                 ovs[idx].payload = None;
+                ovs[idx].provenance = None;
                 ovs[idx].payload_stripped = true;
             }
         }
@@ -580,6 +582,7 @@ impl BinderStore {
             let mut evs = self.edge_versions.lock().unwrap();
             for idx in retired_ev_indices {
                 evs[idx].payload = None;
+                evs[idx].provenance = None;
                 evs[idx].payload_stripped = true;
             }
         }
