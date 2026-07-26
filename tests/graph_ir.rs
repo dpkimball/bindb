@@ -681,3 +681,109 @@ fn limit_without_order_by() {
     assert_eq!(results.len(), 2, "LIMIT 2 must return at most 2 results");
     store.close().unwrap();
 }
+
+// ── multiple AND payload predicates ──────────────────────────────────────────
+
+#[test]
+fn multi_pred_both_must_match() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://a"), b"{}".to_vec());
+    tx.put_object(
+        obj("node://match"),
+        br#"{"sentiment":0.9,"score":5.0}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://low-sentiment"),
+        br#"{"sentiment":0.3,"score":5.0}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://high-score"),
+        br#"{"sentiment":0.9,"score":15.0}"#.to_vec(),
+    );
+    tx.put_edge(eid("e1"), obj("hub://a"), obj("node://match"), "LINK", None);
+    tx.put_edge(
+        eid("e2"),
+        obj("hub://a"),
+        obj("node://low-sentiment"),
+        "LINK",
+        None,
+    );
+    tx.put_edge(
+        eid("e3"),
+        obj("hub://a"),
+        obj("node://high-score"),
+        "LINK",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK]->(b) WHERE id(a) = 'hub://a' \
+             AND b.sentiment > 0.5 AND b.score < 10 RETURN b",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "node://match");
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_pred_none_match_returns_empty() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://a"), b"{}".to_vec());
+    tx.put_object(
+        obj("node://x"),
+        br#"{"sentiment":0.2,"score":5.0}"#.to_vec(),
+    );
+    tx.put_edge(eid("e1"), obj("hub://a"), obj("node://x"), "LINK", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK]->(b) WHERE id(a) = 'hub://a' \
+             AND b.sentiment > 0.5 AND b.score < 10 RETURN b",
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn three_payload_preds_all_required() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://a"), b"{}".to_vec());
+    tx.put_object(obj("node://all"), br#"{"a":1.0,"b":2.0,"c":3.0}"#.to_vec());
+    tx.put_object(obj("node://missing-c"), br#"{"a":1.0,"b":2.0}"#.to_vec());
+    tx.put_edge(eid("e1"), obj("hub://a"), obj("node://all"), "LINK", None);
+    tx.put_edge(
+        eid("e2"),
+        obj("hub://a"),
+        obj("node://missing-c"),
+        "LINK",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:LINK]->(b) WHERE id(a) = 'hub://a' \
+             AND b.a >= 1.0 AND b.b <= 3.0 AND b.c = 3.0 RETURN b",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "node://all");
+    store.close().unwrap();
+}

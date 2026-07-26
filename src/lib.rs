@@ -20,7 +20,7 @@ mod vector_hnsw;
 mod version_store;
 mod wal;
 
-pub use aggregation::{Aggregate, AggregateResult, ObservationAggregation};
+pub use aggregation::{Aggregate, AggregateResult, JoinRow, ObservationAggregation};
 pub use commit::BinderCommit;
 pub use edge::{BinderEdgeVersion, EdgeVersionId};
 pub use engine::BinderStore;
