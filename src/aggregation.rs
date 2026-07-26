@@ -20,6 +20,18 @@ use std::collections::HashMap;
 
 // ── public types ──────────────────────────────────────────────────────────────
 
+/// A pair of matched observations from two namespaces, produced by
+/// [`BinderStore::join_observations`].
+#[derive(Debug, Clone)]
+pub struct JoinRow {
+    /// The key that matched across both namespaces.
+    pub key: String,
+    /// The matching observation from the left namespace.
+    pub left: BinderObjectVersion,
+    /// The matching observation from the right namespace.
+    pub right: BinderObjectVersion,
+}
+
 /// Aggregate function applied across each group of extracted values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aggregate {
