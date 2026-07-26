@@ -109,6 +109,31 @@ pub struct GraphIrRow {
     pub path: Vec<ObjectId>,
 }
 
+/// Field to sort graph query results by.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderByField {
+    /// Sort by the matched node's object ID string (lexicographic).
+    ObjectId,
+    /// Sort by the traversal depth (number of hops from start).
+    Depth,
+    /// Sort by a named field extracted from the matched node's JSON payload.
+    PayloadField(String),
+}
+
+/// Sort direction for ORDER BY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderDirection {
+    Asc,
+    Desc,
+}
+
+/// An ORDER BY clause in a graph IR query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrOrderBy {
+    pub field: OrderByField,
+    pub direction: OrderDirection,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphIrQuery {
     pub start: ObjectId,
@@ -127,6 +152,12 @@ pub struct GraphIrQuery {
     /// When true, `graph_ir_projected` populates `GraphIrRow::path` with the
     /// sequence of node IDs from the start node to each matched node.
     pub return_path: bool,
+    /// Optional ORDER BY clause applied after min-depth filtering.
+    pub order_by: Option<GraphIrOrderBy>,
+    /// Maximum number of results to return (applied after ORDER BY and SKIP).
+    pub limit: Option<usize>,
+    /// Number of results to skip before applying LIMIT (applied after ORDER BY).
+    pub skip: Option<usize>,
 }
 
 impl GraphIrQuery {
@@ -170,7 +201,9 @@ impl GraphIrQuery {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
         let after_return = skip_keyword(after_preds2, "RETURN");
-        let (return_fields, return_path) = parse_return_spec(after_return);
+        let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
+        let (return_fields, return_path) = parse_return_spec(ret_spec);
+        let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
 
         Ok(GraphIrQuery {
             start,
@@ -182,6 +215,9 @@ impl GraphIrQuery {
             payload_pred,
             return_fields,
             return_path,
+            order_by,
+            limit,
+            skip,
         })
     }
 }
@@ -485,6 +521,114 @@ fn parse_quoted(s: &str) -> Result<(String, &str), GraphIrError> {
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
 }
 
+/// Split the RETURN spec from any trailing ORDER BY / SKIP / LIMIT clause.
+/// Advances char by char and stops at the first keyword boundary for those tokens.
+fn split_at_ordering_clause(s: &str) -> (&str, &str) {
+    let mut i = 0;
+    loop {
+        let rest = &s[i..];
+        if starts_with_keyword(rest, "ORDER")
+            || starts_with_keyword(rest, "SKIP")
+            || starts_with_keyword(rest, "LIMIT")
+        {
+            return (&s[..i], rest);
+        }
+        if i == s.len() {
+            break;
+        }
+        i += s[i..].chars().next().map_or(1, |c| c.len_utf8());
+    }
+    (s, "")
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_ordering_tail(
+    s: &str,
+) -> Result<(Option<GraphIrOrderBy>, Option<usize>, Option<usize>), GraphIrError> {
+    let mut s = s.trim_start();
+    let mut order_by = None;
+    let mut limit = None;
+    let mut skip = None;
+
+    if starts_with_keyword(s, "ORDER") {
+        let after_order = skip_keyword(s, "ORDER");
+        if !starts_with_keyword(after_order, "BY") {
+            return Err(GraphIrError::Unsupported("expected ORDER BY".into()));
+        }
+        let after_by = skip_keyword(after_order, "BY");
+        let (field, rest) = parse_order_field(after_by)?;
+        let rest = rest.trim_start();
+        let (direction, rest) = if starts_with_keyword(rest, "DESC") {
+            (OrderDirection::Desc, skip_keyword(rest, "DESC"))
+        } else if starts_with_keyword(rest, "ASC") {
+            (OrderDirection::Asc, skip_keyword(rest, "ASC"))
+        } else {
+            (OrderDirection::Asc, rest)
+        };
+        order_by = Some(GraphIrOrderBy { field, direction });
+        s = rest.trim_start();
+    }
+
+    if starts_with_keyword(s, "SKIP") {
+        let after_skip = skip_keyword(s, "SKIP");
+        let (n, rest) = parse_usize_literal(after_skip)?;
+        skip = Some(n);
+        s = rest.trim_start();
+    }
+
+    if starts_with_keyword(s, "LIMIT") {
+        let after_limit = skip_keyword(s, "LIMIT");
+        let (n, rest) = parse_usize_literal(after_limit)?;
+        limit = Some(n);
+        let _ = rest;
+    }
+
+    Ok((order_by, limit, skip))
+}
+
+fn parse_order_field(s: &str) -> Result<(OrderByField, &str), GraphIrError> {
+    let s = s.trim_start();
+    if s.len() >= 5 && s[..5].eq_ignore_ascii_case("id(b)") {
+        return Ok((OrderByField::ObjectId, &s[5..]));
+    }
+    if starts_with_keyword(s, "depth") {
+        return Ok((OrderByField::Depth, &s[5..]));
+    }
+    if s.starts_with("b.") || s.starts_with("B.") {
+        let rest = &s[2..];
+        let field_end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if field_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "expected field name after ORDER BY b.".into(),
+            ));
+        }
+        return Ok((
+            OrderByField::PayloadField(rest[..field_end].to_string()),
+            &rest[field_end..],
+        ));
+    }
+    Err(GraphIrError::Unsupported(format!(
+        "unknown ORDER BY target near: {}",
+        &s[..s.len().min(20)]
+    )))
+}
+
+fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
+    let s = s.trim_start();
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if end == 0 {
+        return Err(GraphIrError::Unsupported(
+            "expected integer after SKIP/LIMIT".into(),
+        ));
+    }
+    let n: usize = s[..end]
+        .parse()
+        .map_err(|_| GraphIrError::Unsupported("invalid integer after SKIP/LIMIT".into()))?;
+    Ok((n, &s[end..]))
+}
+
 /// Evaluate a payload predicate against raw payload bytes.
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
 fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
@@ -611,6 +755,80 @@ fn parse_return_spec(s: &str) -> (Vec<String>, bool) {
     (fields, return_path)
 }
 
+enum SortKey {
+    Num(f64),
+    Str(String),
+    Missing,
+}
+
+impl PartialEq for SortKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for SortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use SortKey::*;
+        match (self, other) {
+            (Num(a), Num(b)) => a.partial_cmp(b),
+            (Str(a), Str(b)) => Some(a.cmp(b)),
+            (Num(_), Str(_)) => Some(std::cmp::Ordering::Less),
+            (Str(_), Num(_)) => Some(std::cmp::Ordering::Greater),
+            (Missing, Missing) => Some(std::cmp::Ordering::Equal),
+            (_, Missing) => Some(std::cmp::Ordering::Less),
+            (Missing, _) => Some(std::cmp::Ordering::Greater),
+        }
+    }
+}
+
+fn extract_sort_key(payload: Option<&[u8]>, field: &str) -> SortKey {
+    let Some(bytes) = payload else {
+        return SortKey::Missing;
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return SortKey::Missing;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return SortKey::Missing;
+    };
+    match v.get(field) {
+        Some(serde_json::Value::Number(n)) => {
+            n.as_f64().map(SortKey::Num).unwrap_or(SortKey::Missing)
+        }
+        Some(serde_json::Value::String(s)) => SortKey::Str(s.clone()),
+        _ => SortKey::Missing,
+    }
+}
+
+fn apply_order_limit_matches(matches: &mut Vec<GraphQueryMatch>, q: &GraphIrQuery) {
+    if let Some(ob) = &q.order_by {
+        matches.sort_by(|a, b| {
+            let ord = match &ob.field {
+                OrderByField::ObjectId => a.object.object_id.0.cmp(&b.object.object_id.0),
+                OrderByField::Depth => a.depth.cmp(&b.depth),
+                OrderByField::PayloadField(field) => {
+                    let ak = extract_sort_key(a.object.payload.as_deref(), field);
+                    let bk = extract_sort_key(b.object.payload.as_deref(), field);
+                    ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+            if ob.direction == OrderDirection::Desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    }
+    if let Some(n) = q.skip.filter(|&n| n > 0) {
+        let drain_end = n.min(matches.len());
+        matches.drain(..drain_end);
+    }
+    if let Some(limit) = q.limit {
+        matches.truncate(limit);
+    }
+}
+
 impl BinderStore {
     /// Execute a restricted MATCH / WHERE / RETURN graph IR string (issue #2).
     pub fn graph_ir(&self, query: &str) -> Result<Vec<GraphQueryMatch>, StoreError> {
@@ -626,6 +844,7 @@ impl BinderStore {
         if q.min_depth > 1 {
             matches.retain(|m| m.depth >= q.min_depth);
         }
+        apply_order_limit_matches(&mut matches, q);
         Ok(matches)
     }
 
@@ -639,7 +858,12 @@ impl BinderStore {
     /// For plain `RETURN b`, prefer `graph_ir_parsed` which avoids the overhead of path tracking.
     pub fn graph_ir_projected(&self, q: &GraphIrQuery) -> Result<Vec<GraphIrRow>, StoreError> {
         let (matches, parent_map) = if q.return_path {
-            self.execute_graph_query_with_paths(build_graph_query(self, q))?
+            let (mut ms, pm) = self.execute_graph_query_with_paths(build_graph_query(self, q))?;
+            if q.min_depth > 1 {
+                ms.retain(|m| m.depth >= q.min_depth);
+            }
+            apply_order_limit_matches(&mut ms, q);
+            (ms, pm)
         } else {
             (self.graph_ir_parsed(q)?, HashMap::new())
         };
