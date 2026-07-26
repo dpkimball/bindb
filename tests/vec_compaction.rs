@@ -61,9 +61,9 @@ fn live_only_vec_after_overwrites() {
     }
 
     // Historical queries via object_as_of must still return old values.
-    for i in 0..3usize {
+    for (i, &cid) in commit_ids.iter().enumerate().take(3) {
         let old = store
-            .object_as_of(&obj(format!("ns/obj{i}")), commit_ids[i])
+            .object_as_of(&obj(format!("ns/obj{i}")), cid)
             .unwrap()
             .expect("historical version must exist");
         assert_eq!(
