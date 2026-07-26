@@ -17,6 +17,13 @@
 //!   AND b.sentiment > 0.8
 //! RETURN b
 //!
+//! -- Multiple payload predicates (AND-combined):
+//! MATCH (a)-[:RELATES_TO*1..3]->(b)
+//! WHERE id(a) = 'person://alice'
+//!   AND b.sentiment > 0.5
+//!   AND b.score < 10
+//! RETURN b
+//!
 //! -- Field projections (payload must be a UTF-8 JSON object):
 //! MATCH (a)-[:RELATES_TO*1..3]->(b)
 //! WHERE id(a) = 'person://alice'
@@ -119,8 +126,10 @@ pub struct GraphIrQuery {
     pub max_depth: usize,
     pub direction: Direction,
     pub end_pred: NodeIdPred,
-    /// Optional payload field predicate applied to matched end nodes.
-    pub payload_pred: Option<PayloadPred>,
+    /// Payload field predicates applied to matched end nodes (AND-combined).
+    /// All predicates must hold for a node to be included in results.
+    /// Empty = no payload filtering.
+    pub payload_preds: Vec<PayloadPred>,
     /// Fields to project from each matched node's JSON payload (`RETURN b.f1, b.f2`).
     /// Empty = plain node return via `graph_ir` / `graph_ir_parsed`.
     pub return_fields: Vec<String>,
@@ -152,19 +161,21 @@ impl GraphIrQuery {
         let (start, end_pred, after_preds) = parse_where(after_where)?;
         let after_preds = after_preds.trim_start();
 
-        // Optional payload predicate: AND b.FIELD OP VALUE
-        let (payload_pred, after_preds2) = if starts_with_keyword(after_preds, "AND") {
-            let after_and = skip_keyword(after_preds, "AND");
-            if after_and.trim_start().starts_with("b.") || after_and.trim_start().starts_with("B.")
-            {
-                let (pred, rest) = parse_payload_pred(after_and.trim_start())?;
-                (Some(pred), rest.trim_start())
-            } else {
-                (None, after_preds)
+        // Optional payload predicates: AND b.FIELD OP VALUE (may repeat)
+        let mut payload_preds: Vec<PayloadPred> = Vec::new();
+        let mut after_preds2 = after_preds;
+        loop {
+            if starts_with_keyword(after_preds2, "AND") {
+                let after_and = skip_keyword(after_preds2, "AND").trim_start();
+                if after_and.starts_with("b.") || after_and.starts_with("B.") {
+                    let (pred, rest) = parse_payload_pred(after_and)?;
+                    payload_preds.push(pred);
+                    after_preds2 = rest.trim_start();
+                    continue;
+                }
             }
-        } else {
-            (None, after_preds)
-        };
+            break;
+        }
 
         if !starts_with_keyword(after_preds2, "RETURN") {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
@@ -179,7 +190,7 @@ impl GraphIrQuery {
             max_depth,
             direction,
             end_pred,
-            payload_pred,
+            payload_preds,
             return_fields,
             return_path,
         })
@@ -575,10 +586,11 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
         }
     };
 
-    if let Some(pred) = &q.payload_pred {
-        let pred = pred.clone();
+    if !q.payload_preds.is_empty() {
+        let preds = q.payload_preds.clone();
         builder = builder.filter_node(move |obj| {
-            apply_payload_pred(obj.payload.as_deref().unwrap_or(&[]), &pred)
+            let payload = obj.payload.as_deref().unwrap_or(&[]);
+            preds.iter().all(|pred| apply_payload_pred(payload, pred))
         });
     }
 
@@ -964,7 +976,8 @@ mod tests {
             "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'x' AND b.sentiment > 0.8 RETURN b",
         )
         .unwrap();
-        let pred = q.payload_pred.unwrap();
+        assert_eq!(q.payload_preds.len(), 1);
+        let pred = &q.payload_preds[0];
         assert_eq!(pred.field, "sentiment");
         assert_eq!(pred.op, CmpOp::Gt);
         assert_eq!(pred.value, CmpValue::Number(0.8));
@@ -976,7 +989,8 @@ mod tests {
             "MATCH (a)-[]->(b) WHERE id(a) = 'x' AND b.status = 'active' RETURN b",
         )
         .unwrap();
-        let pred = q.payload_pred.unwrap();
+        assert_eq!(q.payload_preds.len(), 1);
+        let pred = &q.payload_preds[0];
         assert_eq!(pred.field, "status");
         assert_eq!(pred.op, CmpOp::Eq);
         assert_eq!(pred.value, CmpValue::Text("active".into()));
@@ -985,8 +999,21 @@ mod tests {
     #[test]
     fn no_payload_pred_when_absent() {
         let q = GraphIrQuery::parse("MATCH (a)-[]->(b) WHERE id(a) = 'x' RETURN b").unwrap();
-        assert!(q.payload_pred.is_none());
+        assert!(q.payload_preds.is_empty());
         assert!(q.return_fields.is_empty());
+    }
+
+    #[test]
+    fn parses_multiple_payload_preds() {
+        let q = GraphIrQuery::parse(
+            "MATCH (a)-[]->(b) WHERE id(a) = 'x' AND b.sentiment > 0.5 AND b.score < 10 RETURN b",
+        )
+        .unwrap();
+        assert_eq!(q.payload_preds.len(), 2);
+        assert_eq!(q.payload_preds[0].field, "sentiment");
+        assert_eq!(q.payload_preds[0].op, CmpOp::Gt);
+        assert_eq!(q.payload_preds[1].field, "score");
+        assert_eq!(q.payload_preds[1].op, CmpOp::Lt);
     }
 
     #[test]
