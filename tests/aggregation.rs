@@ -310,3 +310,155 @@ fn results_are_sorted_by_group_key() {
     assert_eq!(keys, sorted, "results must be in sorted group_key order");
     store.close().unwrap();
 }
+
+// ── join_observations ─────────────────────────────────────────────────────────
+
+fn date_key(v: &bindb::BinderObjectVersion) -> Option<String> {
+    v.object_id.0.rsplit('/').next().map(|s| s.to_owned())
+}
+
+fn build_daily_store(store: &BinderStore) {
+    // sleep: obs://health.sleep/2024-01-01 .. 03
+    // steps: obs://health.steps/2024-01-01 .. 03 + 04 (no matching sleep)
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://health.sleep/2024-01-01"), encode(7.0));
+    tx.put_object(oid("obs://health.sleep/2024-01-02"), encode(8.0));
+    tx.put_object(oid("obs://health.sleep/2024-01-03"), encode(6.5));
+    tx.put_object(oid("obs://health.steps/2024-01-01"), encode(9000.0));
+    tx.put_object(oid("obs://health.steps/2024-01-02"), encode(11000.0));
+    tx.put_object(oid("obs://health.steps/2024-01-03"), encode(7500.0));
+    tx.put_object(oid("obs://health.steps/2024-01-04"), encode(8200.0));
+    store.commit(tx, "test", "daily").unwrap();
+}
+
+#[test]
+fn join_inner_matches_shared_keys() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_daily_store(&store);
+
+    let rows = store
+        .join_observations("obs://health.sleep", "obs://health.steps", date_key)
+        .unwrap();
+
+    // Only 3 dates have both sleep and steps; 2024-01-04 has no sleep entry.
+    assert_eq!(rows.len(), 3);
+    let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(keys, vec!["2024-01-01", "2024-01-02", "2024-01-03"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn join_values_are_correct() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_daily_store(&store);
+
+    let rows = store
+        .join_observations("obs://health.sleep", "obs://health.steps", date_key)
+        .unwrap();
+
+    // Verify left/right payloads decode to the expected f64 values.
+    for row in &rows {
+        let sleep = decode(row.left.payload.as_deref().unwrap_or(&[]));
+        let steps = decode(row.right.payload.as_deref().unwrap_or(&[]));
+        assert!(sleep.is_some(), "sleep payload must decode for {}", row.key);
+        assert!(steps.is_some(), "steps payload must decode for {}", row.key);
+    }
+    let jan1 = rows.iter().find(|r| r.key == "2024-01-01").unwrap();
+    assert_eq!(decode(jan1.left.payload.as_deref().unwrap()), Some(7.0));
+    assert_eq!(decode(jan1.right.payload.as_deref().unwrap()), Some(9000.0));
+    store.close().unwrap();
+}
+
+#[test]
+fn join_returns_empty_when_no_overlap() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://a/2024-01-01"), encode(1.0));
+    tx.put_object(oid("obs://b/2024-01-02"), encode(2.0));
+    store.commit(tx, "test", "no-overlap").unwrap();
+
+    let rows = store
+        .join_observations("obs://a", "obs://b", date_key)
+        .unwrap();
+
+    assert!(rows.is_empty(), "disjoint key sets must produce empty join");
+    store.close().unwrap();
+}
+
+#[test]
+fn join_deduplicates_by_latest_commit() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    // Two sleep observations share the same date key; second commit should win.
+    let mut tx1 = Transaction::new();
+    tx1.put_object(oid("obs://health.sleep/2024-01-01"), encode(7.0));
+    store.commit(tx1, "test", "first").unwrap();
+
+    // Different object_id but same date key — should replace in the join map.
+    let mut tx2 = Transaction::new();
+    tx2.put_object(oid("obs://health.sleep_v2/2024-01-01"), encode(7.5));
+    store.commit(tx2, "test", "second").unwrap();
+
+    let mut tx3 = Transaction::new();
+    tx3.put_object(oid("obs://health.steps/2024-01-01"), encode(9000.0));
+    store.commit(tx3, "test", "steps").unwrap();
+
+    // Join sleep (both variants share key "2024-01-01") with steps.
+    let rows = store
+        .join_observations("obs://health.sleep", "obs://health.steps", date_key)
+        .unwrap();
+
+    // Only 1 row for the date; left comes from the sleep namespace only.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, "2024-01-01");
+    store.close().unwrap();
+}
+
+#[test]
+fn join_excludes_none_keys() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://health.sleep/2024-01-01"), encode(7.0));
+    tx.put_object(oid("obs://health.steps/2024-01-01"), encode(9000.0));
+    store.commit(tx, "test", "seed").unwrap();
+
+    // Key function returns None for everything — join must be empty.
+    let rows = store
+        .join_observations("obs://health.sleep", "obs://health.steps", |_| None)
+        .unwrap();
+
+    assert!(rows.is_empty(), "None key_fn must produce empty join");
+    store.close().unwrap();
+}
+
+#[test]
+fn join_results_are_sorted_by_key() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://health.sleep/2024-01-03"), encode(6.5));
+    tx.put_object(oid("obs://health.sleep/2024-01-01"), encode(7.0));
+    tx.put_object(oid("obs://health.sleep/2024-01-02"), encode(8.0));
+    tx.put_object(oid("obs://health.steps/2024-01-01"), encode(9000.0));
+    tx.put_object(oid("obs://health.steps/2024-01-02"), encode(11000.0));
+    tx.put_object(oid("obs://health.steps/2024-01-03"), encode(7500.0));
+    store.commit(tx, "test", "seed").unwrap();
+
+    let rows = store
+        .join_observations("obs://health.sleep", "obs://health.steps", date_key)
+        .unwrap();
+
+    let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "join results must be sorted by key");
+    store.close().unwrap();
+}

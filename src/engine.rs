@@ -1228,6 +1228,80 @@ impl BinderStore {
         Ok(out)
     }
 
+    /// Inner-join observations from two namespace prefixes on a derived key (issue #5).
+    ///
+    /// `key_fn` is called for each live observation in both namespaces and should
+    /// return a short string (e.g. a date, a device ID) that identifies the join
+    /// key.  Objects for which `key_fn` returns `None` are excluded.  When multiple
+    /// observations in one namespace share the same key, the most recently committed
+    /// one (highest `CommitId`) is used.
+    ///
+    /// Returns one [`JoinRow`] per key present in BOTH namespaces, sorted by key.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Join daily sleep and step counts on the date suffix of the object ID.
+    /// let rows = store.join_observations(
+    ///     "obs://health.sleep",
+    ///     "obs://health.steps",
+    ///     |v| v.object_id.0.rsplit(':').next().map(|s| s.to_owned()),
+    /// )?;
+    /// for row in &rows {
+    ///     let sleep = f64::from_le_bytes(row.left.payload.as_deref().unwrap_or(&[0u8; 8]).try_into().unwrap_or([0u8; 8]));
+    ///     let steps = f64::from_le_bytes(row.right.payload.as_deref().unwrap_or(&[0u8; 8]).try_into().unwrap_or([0u8; 8]));
+    ///     println!("{}: sleep={sleep:.1}h  steps={steps:.0}", row.key);
+    /// }
+    /// ```
+    pub fn join_observations(
+        &self,
+        left_namespace: &str,
+        right_namespace: &str,
+        key_fn: impl Fn(&BinderObjectVersion) -> Option<String>,
+    ) -> Result<Vec<crate::aggregation::JoinRow>, StoreError> {
+        let left_obs = self.list(left_namespace)?;
+        let right_obs = self.list(right_namespace)?;
+
+        let mut left_map: HashMap<String, BinderObjectVersion> = HashMap::new();
+        for v in left_obs {
+            if let Some(key) = key_fn(&v) {
+                left_map
+                    .entry(key)
+                    .and_modify(|existing| {
+                        if v.valid_from > existing.valid_from {
+                            *existing = v.clone();
+                        }
+                    })
+                    .or_insert(v);
+            }
+        }
+
+        let mut right_map: HashMap<String, BinderObjectVersion> = HashMap::new();
+        for v in right_obs {
+            if let Some(key) = key_fn(&v) {
+                right_map
+                    .entry(key)
+                    .and_modify(|existing| {
+                        if v.valid_from > existing.valid_from {
+                            *existing = v.clone();
+                        }
+                    })
+                    .or_insert(v);
+            }
+        }
+
+        let mut rows: Vec<crate::aggregation::JoinRow> = left_map
+            .into_iter()
+            .filter_map(|(key, left)| {
+                right_map
+                    .remove(&key)
+                    .map(|right| crate::aggregation::JoinRow { key, left, right })
+            })
+            .collect();
+
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(rows)
+    }
+
     /// Run an arbitrary SQL query over observations via an out-of-process DuckDB.
     ///
     /// Exports the namespace's observations to a temporary NDJSON file, then
