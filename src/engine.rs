@@ -1298,6 +1298,85 @@ impl BinderStore {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// Run an arbitrary SQL query that can JOIN across multiple observation namespaces.
+    ///
+    /// Each entry in `tables` is `(alias, namespace_prefix)`.  The alias is the
+    /// table name used in the SQL; it is rewritten to `read_ndjson_auto(...)` so
+    /// DuckDB can load it.  One temporary NDJSON file is created per namespace.
+    ///
+    /// ```text
+    /// store.query_sql_multi(
+    ///     &[("sleep", "obs://health.sleep"), ("hr", "obs://health.heart_rate")],
+    ///     "SELECT sleep.object_id, sleep.value AS hours, hr.value AS bpm
+    ///      FROM sleep JOIN hr ON sleep.committed_at = hr.committed_at",
+    /// )?
+    /// ```
+    ///
+    /// Returns `StoreError::InvalidArgument` if `tables` is empty or `duckdb` is
+    /// not installed.
+    pub fn query_sql_multi(
+        &self,
+        tables: &[(&str, &str)],
+        sql: &str,
+    ) -> Result<String, StoreError> {
+        use std::io::Write as _;
+
+        if tables.is_empty() {
+            return Err(StoreError::InvalidArgument {
+                message: "query_sql_multi requires at least one (alias, namespace) pair".into(),
+            });
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+
+        let mut tmp_paths: Vec<std::path::PathBuf> = Vec::with_capacity(tables.len());
+        let mut rewritten = sql.to_owned();
+
+        for (i, (alias, ns_prefix)) in tables.iter().enumerate() {
+            let jsonl = self.export_observations_jsonl(ns_prefix)?;
+            let tmp_path =
+                std::env::temp_dir().join(format!("bindb_multi_{}_{}.ndjson", unique, i));
+            {
+                let mut f = std::fs::File::create(&tmp_path).map_err(StoreError::Io)?;
+                f.write_all(&jsonl).map_err(StoreError::Io)?;
+            }
+            let path_str = tmp_path.to_string_lossy().into_owned();
+            // Replace whole-word alias with DuckDB read call.
+            // Use word-boundary pattern: replace " alias " / "(alias)" etc.
+            rewritten = replace_table_alias(&rewritten, alias, &path_str);
+            tmp_paths.push(tmp_path);
+        }
+
+        let output = std::process::Command::new("duckdb")
+            .args(["-csv", "-c", &rewritten])
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StoreError::InvalidArgument {
+                        message: "duckdb binary not found on $PATH; install DuckDB to use query_sql_multi".to_string(),
+                    }
+                } else {
+                    StoreError::Io(e)
+                }
+            })?;
+
+        for p in &tmp_paths {
+            let _ = std::fs::remove_file(p);
+        }
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(StoreError::InvalidArgument {
+                message: format!("duckdb exited with error: {stderr}"),
+            });
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     // ── maintenance ───────────────────────────────────────────────────────────
 
     /// Explicitly rebuild all indexes from the commit log.
@@ -1667,6 +1746,43 @@ type VersionStores = (
     HashMap<ObjectId, usize>,
     HashMap<EdgeId, usize>,
 );
+
+/// Replace a SQL table alias with a DuckDB `read_ndjson_auto(path)` call.
+///
+/// Matches the alias as a whole SQL token — surrounded by whitespace, commas,
+/// parentheses, or at string boundaries — so a short alias like "hr" does not
+/// accidentally replace substrings inside longer identifiers.
+fn replace_table_alias(sql: &str, alias: &str, path: &str) -> String {
+    let replacement = format!("read_ndjson_auto('{path}', ignore_errors=true)");
+    let mut out = String::with_capacity(sql.len() + replacement.len());
+    let mut remaining = sql;
+    while let Some(pos) = remaining.find(alias) {
+        let before = &remaining[..pos];
+        let after = &remaining[pos + alias.len()..];
+        let left_ok = before
+            .chars()
+            .last()
+            .map(|c| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(true);
+        let right_ok = after
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(true);
+        if left_ok && right_ok {
+            out.push_str(before);
+            out.push_str(&replacement);
+            remaining = after;
+        } else {
+            // Not a token boundary — keep searching past this occurrence.
+            out.push_str(before);
+            out.push_str(alias);
+            remaining = after;
+        }
+    }
+    out.push_str(remaining);
+    out
+}
 
 fn head_from_versions(ovs: &[BinderObjectVersion], evs: &[BinderEdgeVersion]) -> Option<CommitId> {
     ovs.iter()
