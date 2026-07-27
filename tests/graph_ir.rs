@@ -787,3 +787,496 @@ fn three_payload_preds_all_required() {
     assert_eq!(results[0].object.object_id.0, "node://all");
     store.close().unwrap();
 }
+
+// ── OPTIONAL MATCH (issue #2) ─────────────────────────────────────────────────
+
+/// Build a graph for OPTIONAL MATCH tests:
+///
+/// ```text
+/// person://alice --KNOWS--> person://bob   --HAS_TAG--> tag://rust
+///                                          --HAS_TAG--> tag://databases
+///                --KNOWS--> person://carol              (no tags)
+///                --KNOWS--> person://dave  --HAS_TAG--> tag://rust
+///                                          (dave also has a numeric payload)
+/// ```
+///
+/// Payloads:
+/// - person://alice: `{"name":"Alice"}`
+/// - person://bob:   `{"name":"Bob","score":10}`
+/// - person://carol: `{"name":"Carol","score":5}`
+/// - person://dave:  `{"name":"Dave","score":20}`
+/// - tag://rust:     `{"label":"rust","weight":0.9}`
+/// - tag://databases:`{"label":"databases","weight":0.4}`
+fn build_optional_graph(store: &BinderStore) {
+    let mut tx = Transaction::new();
+
+    // People
+    tx.put_object(obj("person://alice"), br#"{"name":"Alice"}"#.to_vec());
+    tx.put_object(
+        obj("person://bob"),
+        br#"{"name":"Bob","score":10}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("person://carol"),
+        br#"{"name":"Carol","score":5}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("person://dave"),
+        br#"{"name":"Dave","score":20}"#.to_vec(),
+    );
+
+    // Tags
+    tx.put_object(
+        obj("tag://rust"),
+        br#"{"label":"rust","weight":0.9}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("tag://databases"),
+        br#"{"label":"databases","weight":0.4}"#.to_vec(),
+    );
+
+    store.commit(tx, "test", "nodes").unwrap();
+
+    let mut tx2 = Transaction::new();
+    // alice KNOWS bob, carol, dave
+    tx2.put_edge(
+        eid("e-a-bob"),
+        obj("person://alice"),
+        obj("person://bob"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e-a-carol"),
+        obj("person://alice"),
+        obj("person://carol"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e-a-dave"),
+        obj("person://alice"),
+        obj("person://dave"),
+        "KNOWS",
+        None,
+    );
+    // bob HAS_TAG rust, databases
+    tx2.put_edge(
+        eid("e-bob-rust"),
+        obj("person://bob"),
+        obj("tag://rust"),
+        "HAS_TAG",
+        None,
+    );
+    tx2.put_edge(
+        eid("e-bob-db"),
+        obj("person://bob"),
+        obj("tag://databases"),
+        "HAS_TAG",
+        None,
+    );
+    // dave HAS_TAG rust
+    tx2.put_edge(
+        eid("e-dave-rust"),
+        obj("person://dave"),
+        obj("tag://rust"),
+        "HAS_TAG",
+        None,
+    );
+    // carol has no HAS_TAG edges
+    store.commit(tx2, "test", "edges").unwrap();
+}
+
+#[test]
+fn optional_match_no_match_emits_null_row() {
+    // carol has no HAS_TAG edges; OPTIONAL MATCH must still emit carol with optional=None.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://carol' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         RETURN b, c",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1, "one mandatory result (carol), no expansion");
+    assert_eq!(rows[0].object_id.0, "person://carol");
+    assert!(
+        rows[0].optional.is_none(),
+        "carol has no tags → optional=None"
+    );
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_single_c_produces_one_row() {
+    // dave has exactly one tag: rust
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://dave' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         RETURN b, c",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1, "dave has one tag → one expanded row");
+    assert_eq!(rows[0].object_id.0, "person://dave");
+    let opt = rows[0].optional.as_ref().expect("optional must be Some");
+    assert_eq!(opt.object_id.0, "tag://rust");
+    assert_eq!(opt.depth, 1);
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_multiple_c_expands_rows() {
+    // bob has two tags: rust + databases → two output rows for bob
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://bob' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         RETURN b, c",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 2, "bob has two tags → two rows");
+    // Both rows have the same b (bob)
+    assert!(rows.iter().all(|r| r.object_id.0 == "person://bob"));
+    // Both rows have a non-None optional
+    assert!(rows.iter().all(|r| r.optional.is_some()));
+
+    let c_ids: Vec<&str> = rows
+        .iter()
+        .map(|r| r.optional.as_ref().unwrap().object_id.0.as_str())
+        .collect();
+    assert!(c_ids.contains(&"tag://rust"), "expected rust tag");
+    assert!(c_ids.contains(&"tag://databases"), "expected databases tag");
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_mixed_mandatory_results() {
+    // alice KNOWS: bob (2 tags), carol (0 tags), dave (1 tag)
+    // → total rows: 2 + 1 + 1 = 4 (carol emits one null-padded row)
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         RETURN b, c",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    let bob_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.object_id.0 == "person://bob")
+        .collect();
+    let carol_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.object_id.0 == "person://carol")
+        .collect();
+    let dave_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.object_id.0 == "person://dave")
+        .collect();
+
+    assert_eq!(bob_rows.len(), 2, "bob has 2 tags");
+    assert_eq!(carol_rows.len(), 1, "carol has 0 tags → one null row");
+    assert_eq!(dave_rows.len(), 1, "dave has 1 tag");
+
+    assert!(
+        carol_rows[0].optional.is_none(),
+        "carol optional must be None"
+    );
+    assert!(bob_rows.iter().all(|r| r.optional.is_some()));
+    assert!(dave_rows[0].optional.is_some());
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_c_payload_predicate_filters() {
+    // bob has rust (weight=0.9) and databases (weight=0.4)
+    // WHERE c.weight > 0.5 should keep only rust
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://bob' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         WHERE c.weight > 0.5 \
+         RETURN b, c",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    // Only rust matches c.weight > 0.5; databases doesn't.
+    // But bob IS matched by mandatory → bob is always emitted.
+    // Since rust matches optional: one row with optional=Some(rust).
+    // databases doesn't match optional: that sub-result is filtered out.
+    // Result: one row (bob + rust) — databases sub-match excluded.
+    assert_eq!(rows.len(), 1, "only rust passes weight>0.5 filter");
+    assert_eq!(rows[0].object_id.0, "person://bob");
+    let opt = rows[0].optional.as_ref().expect("rust must match");
+    assert_eq!(opt.object_id.0, "tag://rust");
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_c_payload_pred_excludes_all_leaves_null_row() {
+    // carol has no tags, so OPTIONAL MATCH with a predicate that would never match
+    // should still emit carol with optional=None
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://carol' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         WHERE c.weight > 0.99 \
+         RETURN b, c",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "person://carol");
+    assert!(rows[0].optional.is_none());
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_field_projection_b_and_c() {
+    // Project b.name and c.label
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://dave' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         RETURN b.name, c.label",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name").and_then(|v| v.as_str()),
+        Some("Dave")
+    );
+    let opt = rows[0].optional.as_ref().expect("dave has rust tag");
+    assert_eq!(
+        opt.fields.get("label").and_then(|v| v.as_str()),
+        Some("rust")
+    );
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_c_field_projection_absent_for_null_row() {
+    // carol has no tags → optional=None → c fields inaccessible, no panic
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://carol' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         RETURN b.name, c.label",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name").and_then(|v| v.as_str()),
+        Some("Carol")
+    );
+    assert!(
+        rows[0].optional.is_none(),
+        "no tags → null optional, no field panic"
+    );
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_c_id_predicate_filters_by_prefix() {
+    // bob has rust + databases; WHERE id(c) STARTS WITH 'tag://r' should keep only rust
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://bob' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         WHERE id(c) STARTS WITH 'tag://r' \
+         RETURN b, c",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1, "only rust starts with tag://r");
+    assert_eq!(rows[0].optional.as_ref().unwrap().object_id.0, "tag://rust");
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_c_id_and_payload_pred_combined() {
+    // WHERE id(c) STARTS WITH 'tag://' AND c.weight > 0.5
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' AND id(b) = 'person://bob' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         WHERE id(c) STARTS WITH 'tag://' AND c.weight > 0.5 \
+         RETURN b.name, c.label",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    // rust passes both; databases fails weight>0.5; one row with rust
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]
+            .optional
+            .as_ref()
+            .unwrap()
+            .fields
+            .get("label")
+            .and_then(|v| v.as_str()),
+        Some("rust")
+    );
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_with_order_by_and_limit_on_mandatory() {
+    // ORDER BY b.score DESC LIMIT 2 → dave(20), bob(10); then expand with optional
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) \
+         WHERE id(a) = 'person://alice' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         RETURN b.name, c.label \
+         ORDER BY b.score DESC LIMIT 2",
+    )
+    .unwrap();
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    // LIMIT 2 mandatory results: dave(score=20), bob(score=10)
+    // dave has 1 tag → 1 row; bob has 2 tags → 2 rows; total 3 rows
+    assert_eq!(rows.len(), 3, "dave×1 + bob×2");
+
+    // First row should be dave (highest score, first after ORDER BY DESC)
+    // Dave has one tag (rust)
+    let dave_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.fields.get("name").and_then(|v| v.as_str()) == Some("Dave"))
+        .collect();
+    let bob_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.fields.get("name").and_then(|v| v.as_str()) == Some("Bob"))
+        .collect();
+
+    assert_eq!(dave_rows.len(), 1);
+    assert_eq!(bob_rows.len(), 2);
+
+    store.close().unwrap();
+}
+
+#[test]
+fn optional_match_parse_captures_clause() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..2]->(b) \
+         WHERE id(a) = 'person://alice' \
+         OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+         WHERE id(c) STARTS WITH 'tag://' AND c.weight > 0.5 \
+         RETURN b.name, c.label",
+    )
+    .unwrap();
+
+    let opt = q
+        .optional_clause
+        .as_ref()
+        .expect("optional clause must be parsed");
+    assert_eq!(opt.edge_types, vec!["HAS_TAG"]);
+    assert_eq!(opt.min_depth, 1);
+    assert_eq!(opt.max_depth, 1);
+    assert!(matches!(opt.end_pred, bindb::NodeIdPred::StartsWith(ref s) if s == "tag://"));
+    assert_eq!(opt.payload_preds.len(), 1);
+    assert_eq!(opt.payload_preds[0].field, "weight");
+    assert_eq!(opt.return_fields, vec!["label"]);
+    assert_eq!(q.return_fields, vec!["name"]);
+}
+
+#[test]
+fn optional_match_query_without_optional_clause_unchanged() {
+    // Existing non-optional queries must still work identically — no regression
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' RETURN b")
+            .unwrap();
+    assert!(q.optional_clause.is_none());
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 3, "alice KNOWS 3 people");
+    assert!(
+        rows.iter().all(|r| r.optional.is_none()),
+        "no optional clause → all None"
+    );
+
+    store.close().unwrap();
+}
