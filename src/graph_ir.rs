@@ -33,6 +33,19 @@
 //! WHERE id(a) = 'person://alice'
 //! RETURN b.sentiment, b.label
 //!
+//! -- WITH clause: filter / order / page mandatory results before optional expansion:
+//! MATCH (a)-[:KNOWS*1..3]->(b)
+//! WHERE id(a) = 'person://alice'
+//! WITH b WHERE b.score > 0.5 ORDER BY b.score DESC LIMIT 5
+//! OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c)
+//! RETURN b.name, c.label
+//!
+//! -- WITH without OPTIONAL MATCH (standalone filter + page):
+//! MATCH (a)-[:KNOWS*1..3]->(b)
+//! WHERE id(a) = 'person://alice'
+//! WITH b ORDER BY b.score DESC SKIP 10 LIMIT 5
+//! RETURN b.name, b.score
+//!
 //! -- OPTIONAL MATCH: emit b even when no c is reachable (left-outer-join):
 //! MATCH (a)-[:KNOWS*1..2]->(b)
 //! WHERE id(a) = 'person://alice'
@@ -55,11 +68,18 @@
 //! `RETURN b.field …` returns projected rows via `graph_ir_projected`.
 //! OPTIONAL MATCH results are only available through `graph_ir_projected`.
 //!
-//! Notes:
+//! ## Ordering semantics
+//!
+//! - **Without WITH**: `ORDER BY / LIMIT / SKIP` in RETURN apply to mandatory `b`
+//!   results before optional expansion (backward compatible).
+//! - **With WITH**: `WITH … ORDER BY / LIMIT / SKIP` apply to mandatory `b` results
+//!   before optional expansion; `RETURN … ORDER BY / LIMIT / SKIP` apply to the
+//!   final expanded rows after optional expansion.
+//!
+//! Other notes:
 //! - `*min..max` / `*n` set max_depth and filter results to `depth >= min`.
 //! - Node filters apply to **results**, not traversal.
 //! - Undirected `-[]-` → [`Direction::Both`]; `<-[]-` → Incoming; `-[]->` → Outgoing.
-//! - ORDER BY / LIMIT / SKIP apply to mandatory `b` results before optional expansion.
 
 use crate::engine::BinderStore;
 use crate::error::StoreError;
@@ -149,6 +169,27 @@ pub struct GraphIrOptionalMatch {
     pub fields: HashMap<String, serde_json::Value>,
 }
 
+/// The `WITH b` clause between a mandatory MATCH and a subsequent OPTIONAL MATCH
+/// or RETURN.
+///
+/// Filters, sorts, and pages mandatory `b` results before they fan out into
+/// optional expansion. When a WITH clause is present, `RETURN ORDER BY / LIMIT /
+/// SKIP` apply to the final expanded rows; when absent, they apply pre-expansion
+/// (backward compatible with queries that have no WITH clause).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrWithClause {
+    /// Additional id predicate on matched `b` nodes, applied after the MATCH.
+    pub end_pred: NodeIdPred,
+    /// Additional payload predicates on `b` nodes (AND-combined), applied after the MATCH.
+    pub payload_preds: Vec<PayloadPred>,
+    /// Sort mandatory `b` results before optional expansion.
+    pub order_by: Option<GraphIrOrderBy>,
+    /// Limit applied to mandatory results after ordering (before optional expansion).
+    pub limit: Option<usize>,
+    /// Skip applied to mandatory results after ordering (before optional expansion).
+    pub skip: Option<usize>,
+}
+
 /// One row returned by `graph_ir_projected`.
 ///
 /// `fields` contains only the keys requested in `RETURN b.field1, b.field2`.
@@ -225,9 +266,14 @@ pub struct GraphIrQuery {
     /// used as the start node for this clause. Results with no optional match
     /// are emitted with `GraphIrRow::optional = None`.
     ///
-    /// ORDER BY / LIMIT / SKIP are applied to mandatory results before the
-    /// optional expansion.
+    /// When `with_clause` is absent: ORDER BY / LIMIT / SKIP are applied to
+    /// mandatory results before optional expansion (backward compatible).
+    /// When `with_clause` is present: ORDER BY / LIMIT / SKIP are applied to
+    /// the final expanded rows after optional expansion.
     pub optional_clause: Option<GraphIrOptionalClause>,
+    /// Optional WITH clause. Filters and pages mandatory `b` results before
+    /// they enter optional expansion or RETURN. See [`GraphIrWithClause`].
+    pub with_clause: Option<GraphIrWithClause>,
 }
 
 impl GraphIrQuery {
@@ -269,9 +315,33 @@ impl GraphIrQuery {
             break;
         }
 
+        // Optional WITH clause: WITH b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]
+        let (with_clause, after_with) = if starts_with_keyword(after_preds2, "WITH") {
+            let after_with_kw = skip_keyword(after_preds2, "WITH");
+            if !starts_with_keyword(after_with_kw, "b") {
+                return Err(GraphIrError::Unsupported(
+                    "WITH must project variable 'b'".into(),
+                ));
+            }
+            let after_b = skip_keyword(after_with_kw, "b").trim_start();
+            let (wc_end_pred, wc_preds, after_wc_where) = parse_with_where(after_b)?;
+            let (wc_ob, wc_limit, wc_skip, after_wc_ordering) =
+                parse_ordering_tail_rest(after_wc_where)?;
+            let wc = GraphIrWithClause {
+                end_pred: wc_end_pred,
+                payload_preds: wc_preds,
+                order_by: wc_ob,
+                limit: wc_limit,
+                skip: wc_skip,
+            };
+            (Some(wc), after_wc_ordering.trim_start())
+        } else {
+            (None, after_preds2)
+        };
+
         // Optional MATCH clause (OPTIONAL MATCH (b)-[…]->(c) [WHERE …])
-        let (optional_clause_raw, after_preds3) = if starts_with_keyword(after_preds2, "OPTIONAL") {
-            let after_opt = skip_keyword(after_preds2, "OPTIONAL");
+        let (optional_clause_raw, after_preds3) = if starts_with_keyword(after_with, "OPTIONAL") {
+            let after_opt = skip_keyword(after_with, "OPTIONAL");
             if !starts_with_keyword(after_opt, "MATCH") {
                 return Err(GraphIrError::Unsupported(
                     "expected MATCH after OPTIONAL".into(),
@@ -293,7 +363,7 @@ impl GraphIrQuery {
             };
             (Some(oc), after_opt_where.trim_start())
         } else {
-            (None, after_preds2)
+            (None, after_with)
         };
 
         if !starts_with_keyword(after_preds3, "RETURN") {
@@ -323,6 +393,7 @@ impl GraphIrQuery {
             limit,
             skip,
             optional_clause,
+            with_clause,
         })
     }
 }
@@ -701,6 +772,90 @@ fn parse_optional_where(s: &str) -> Result<(NodeIdPred, Vec<PayloadPred>, &str),
     Ok((end_pred, payload_preds, rest))
 }
 
+/// Parse the optional WHERE predicates that follow `WITH b`.
+///
+/// Supports: `id(b) STARTS WITH '…'`, `id(b) = '…'`, `b.field OP value`, `AND`-connected.
+/// Returns `(end_pred, payload_preds, remaining)`.
+fn parse_with_where(s: &str) -> Result<(NodeIdPred, Vec<PayloadPred>, &str), GraphIrError> {
+    let s = s.trim_start();
+    if !starts_with_keyword(s, "WHERE") {
+        return Ok((NodeIdPred::Any, vec![], s));
+    }
+    let mut rest = skip_keyword(s, "WHERE").trim_start();
+    let mut end_pred = NodeIdPred::Any;
+    let mut payload_preds: Vec<PayloadPred> = Vec::new();
+
+    loop {
+        let t = rest.trim_start();
+        if t.len() >= 5 && t[..5].eq_ignore_ascii_case("id(b)") {
+            let (pred, next) = parse_end_pred_for_var(t, "b")?;
+            end_pred = pred;
+            rest = next.trim_start();
+        } else if t.starts_with("b.") || t.starts_with("B.") {
+            let (pred, next) = parse_payload_pred_for_var(t, "b")?;
+            payload_preds.push(pred);
+            rest = next.trim_start();
+        } else {
+            break;
+        }
+        if starts_with_keyword(rest, "AND") {
+            rest = skip_keyword(rest, "AND").trim_start();
+        } else {
+            break;
+        }
+    }
+
+    Ok((end_pred, payload_preds, rest))
+}
+
+/// Like `parse_ordering_tail` but returns the remaining unparsed string as the
+/// fourth element.  Used when ORDER BY / SKIP / LIMIT must be followed by more
+/// clauses (e.g. WITH followed by OPTIONAL MATCH or RETURN).
+#[allow(clippy::type_complexity)]
+fn parse_ordering_tail_rest(
+    s: &str,
+) -> Result<(Option<GraphIrOrderBy>, Option<usize>, Option<usize>, &str), GraphIrError> {
+    let mut s = s.trim_start();
+    let mut order_by = None;
+    let mut limit = None;
+    let mut skip = None;
+
+    if starts_with_keyword(s, "ORDER") {
+        let after_order = skip_keyword(s, "ORDER");
+        if !starts_with_keyword(after_order, "BY") {
+            return Err(GraphIrError::Unsupported("expected ORDER BY".into()));
+        }
+        let after_by = skip_keyword(after_order, "BY");
+        let (field, rest) = parse_order_field(after_by)?;
+        let rest = rest.trim_start();
+        let (direction, rest) = if starts_with_keyword(rest, "DESC") {
+            (OrderDirection::Desc, skip_keyword(rest, "DESC"))
+        } else if starts_with_keyword(rest, "ASC") {
+            (OrderDirection::Asc, skip_keyword(rest, "ASC"))
+        } else {
+            (OrderDirection::Asc, rest)
+        };
+        order_by = Some(GraphIrOrderBy { field, direction });
+        s = rest.trim_start();
+    }
+
+    if starts_with_keyword(s, "SKIP") {
+        let after_skip = skip_keyword(s, "SKIP");
+        let (n, rest) = parse_usize_literal(after_skip)?;
+        skip = Some(n);
+        s = rest.trim_start();
+    }
+
+    if starts_with_keyword(s, "LIMIT") {
+        let after_limit = skip_keyword(s, "LIMIT");
+        let (n, rest) = parse_usize_literal(after_limit)?;
+        limit = Some(n);
+        s = rest.trim_start();
+    }
+
+    Ok((order_by, limit, skip, s))
+}
+
 fn parse_quoted(s: &str) -> Result<(String, &str), GraphIrError> {
     let s = s.trim_start();
     let quote = s
@@ -741,45 +896,8 @@ fn split_at_ordering_clause(s: &str) -> (&str, &str) {
 fn parse_ordering_tail(
     s: &str,
 ) -> Result<(Option<GraphIrOrderBy>, Option<usize>, Option<usize>), GraphIrError> {
-    let mut s = s.trim_start();
-    let mut order_by = None;
-    let mut limit = None;
-    let mut skip = None;
-
-    if starts_with_keyword(s, "ORDER") {
-        let after_order = skip_keyword(s, "ORDER");
-        if !starts_with_keyword(after_order, "BY") {
-            return Err(GraphIrError::Unsupported("expected ORDER BY".into()));
-        }
-        let after_by = skip_keyword(after_order, "BY");
-        let (field, rest) = parse_order_field(after_by)?;
-        let rest = rest.trim_start();
-        let (direction, rest) = if starts_with_keyword(rest, "DESC") {
-            (OrderDirection::Desc, skip_keyword(rest, "DESC"))
-        } else if starts_with_keyword(rest, "ASC") {
-            (OrderDirection::Asc, skip_keyword(rest, "ASC"))
-        } else {
-            (OrderDirection::Asc, rest)
-        };
-        order_by = Some(GraphIrOrderBy { field, direction });
-        s = rest.trim_start();
-    }
-
-    if starts_with_keyword(s, "SKIP") {
-        let after_skip = skip_keyword(s, "SKIP");
-        let (n, rest) = parse_usize_literal(after_skip)?;
-        skip = Some(n);
-        s = rest.trim_start();
-    }
-
-    if starts_with_keyword(s, "LIMIT") {
-        let after_limit = skip_keyword(s, "LIMIT");
-        let (n, rest) = parse_usize_literal(after_limit)?;
-        limit = Some(n);
-        let _ = rest;
-    }
-
-    Ok((order_by, limit, skip))
+    let (ob, limit, skip, _rest) = parse_ordering_tail_rest(s)?;
+    Ok((ob, limit, skip))
 }
 
 fn parse_order_field(s: &str) -> Result<(OrderByField, &str), GraphIrError> {
@@ -1066,16 +1184,27 @@ impl BinderStore {
     /// Fields absent from the payload or non-JSON payloads produce no entry for that key.
     /// For plain `RETURN b` with no optional clause, prefer `graph_ir_parsed`.
     pub fn graph_ir_projected(&self, q: &GraphIrQuery) -> Result<Vec<GraphIrRow>, StoreError> {
-        let (matches, parent_map) = if q.return_path {
+        let (mut matches, parent_map) = if q.return_path {
             let (mut ms, pm) = self.execute_graph_query_with_paths(build_graph_query(self, q))?;
             if q.min_depth > 1 {
                 ms.retain(|m| m.depth >= q.min_depth);
             }
-            apply_order_limit_matches(&mut ms, q);
             (ms, pm)
         } else {
-            (self.graph_ir_parsed(q)?, HashMap::new())
+            let mut ms = build_graph_query(self, q).execute()?;
+            if q.min_depth > 1 {
+                ms.retain(|m| m.depth >= q.min_depth);
+            }
+            (ms, HashMap::new())
         };
+
+        // Pre-expansion ordering: WITH clause controls mandatory results.
+        // When no WITH clause, q.order_by/limit/skip apply pre-expansion (backward compat).
+        if let Some(wc) = &q.with_clause {
+            apply_with_clause(&mut matches, wc);
+        } else {
+            apply_order_limit_matches(&mut matches, q);
+        }
 
         let start = &q.start;
         let mut rows: Vec<GraphIrRow> = Vec::with_capacity(matches.len());
@@ -1133,7 +1262,98 @@ impl BinderStore {
             }
         }
 
+        // Post-expansion ordering: applied to final rows only when a WITH clause
+        // was present (WITH owns the pre-expansion pass; RETURN owns the post-expansion pass).
+        if q.with_clause.is_some() {
+            apply_order_limit_rows(&mut rows, q);
+        }
+
         Ok(rows)
+    }
+}
+
+/// Apply WITH clause predicates, ordering, and paging to mandatory `b` results.
+fn apply_with_clause(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause) {
+    match &wc.end_pred {
+        NodeIdPred::Any => {}
+        NodeIdPred::StartsWith(pfx) => {
+            matches.retain(|m| m.object.object_id.0.starts_with(pfx.as_str()));
+        }
+        NodeIdPred::Equals(id) => {
+            matches.retain(|m| m.object.object_id.0 == id.as_str());
+        }
+    }
+    if !wc.payload_preds.is_empty() {
+        matches.retain(|m| {
+            let payload = m.object.payload.as_deref().unwrap_or(&[]);
+            wc.payload_preds
+                .iter()
+                .all(|pred| apply_payload_pred(payload, pred))
+        });
+    }
+    if let Some(ob) = &wc.order_by {
+        matches.sort_by(|a, b| {
+            let ord = match &ob.field {
+                OrderByField::ObjectId => a.object.object_id.0.cmp(&b.object.object_id.0),
+                OrderByField::Depth => a.depth.cmp(&b.depth),
+                OrderByField::PayloadField(field) => {
+                    let ak = extract_sort_key(a.object.payload.as_deref(), field);
+                    let bk = extract_sort_key(b.object.payload.as_deref(), field);
+                    ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+            if ob.direction == OrderDirection::Desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    }
+    if let Some(n) = wc.skip.filter(|&n| n > 0) {
+        matches.drain(..n.min(matches.len()));
+    }
+    if let Some(limit) = wc.limit {
+        matches.truncate(limit);
+    }
+}
+
+fn sort_key_from_value(v: Option<&serde_json::Value>) -> SortKey {
+    match v {
+        None => SortKey::Missing,
+        Some(serde_json::Value::Number(n)) => {
+            n.as_f64().map(SortKey::Num).unwrap_or(SortKey::Missing)
+        }
+        Some(serde_json::Value::String(s)) => SortKey::Str(s.clone()),
+        _ => SortKey::Missing,
+    }
+}
+
+/// Apply ORDER BY / SKIP / LIMIT to final expanded `GraphIrRow` results.
+/// Used post-optional-expansion when a WITH clause controls pre-expansion ordering.
+fn apply_order_limit_rows(rows: &mut Vec<GraphIrRow>, q: &GraphIrQuery) {
+    if let Some(ob) = &q.order_by {
+        rows.sort_by(|a, b| {
+            let ord = match &ob.field {
+                OrderByField::ObjectId => a.object_id.0.cmp(&b.object_id.0),
+                OrderByField::Depth => a.depth.cmp(&b.depth),
+                OrderByField::PayloadField(field) => {
+                    let ak = sort_key_from_value(a.fields.get(field));
+                    let bk = sort_key_from_value(b.fields.get(field));
+                    ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+            if ob.direction == OrderDirection::Desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    }
+    if let Some(n) = q.skip.filter(|&n| n > 0) {
+        rows.drain(..n.min(rows.len()));
+    }
+    if let Some(limit) = q.limit {
+        rows.truncate(limit);
     }
 }
 
