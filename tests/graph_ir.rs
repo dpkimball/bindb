@@ -1,6 +1,6 @@
 use bindb::{
-    BinderStore, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError, ObjectId, OrderByField,
-    OrderDirection, Transaction,
+    BinderStore, CmpOp, CmpValue, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError,
+    NodeIdPred, ObjectId, OrderByField, OrderDirection, Transaction,
 };
 use tempfile::TempDir;
 
@@ -1278,5 +1278,331 @@ fn optional_match_query_without_optional_clause_unchanged() {
         "no optional clause → all None"
     );
 
+    store.close().unwrap();
+}
+
+// ── WITH clause tests (issue #2) ──────────────────────────────────────────────
+//
+// Graph: alice -[KNOWS]-> bob (score:10), carol (score:5), dave (score:20)
+//        bob -[HAS_TAG]-> tag://rust (weight:0.9), tag://databases (weight:0.4)
+//        dave -[HAS_TAG]-> tag://rust
+//        carol has no HAS_TAG edges
+
+#[test]
+fn with_no_where_passes_all_mandatory_through() {
+    // WITH b with no predicate or ordering is a no-op; all mandatory results pass through.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3, "all three KNOWS targets pass through");
+    store.close().unwrap();
+}
+
+#[test]
+fn with_where_payload_pred_filters_mandatory() {
+    // WITH b WHERE b.score > 8 keeps only bob (10) and dave (20); carol (5) is excluded.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b WHERE b.score > 8 RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r.fields.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(names.contains(&"Bob"), "bob (score:10) must pass");
+    assert!(names.contains(&"Dave"), "dave (score:20) must pass");
+    assert!(
+        !names.contains(&"Carol"),
+        "carol (score:5) must be excluded"
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn with_where_id_pred_filters_by_exact_id() {
+    // WITH b WHERE id(b) = 'person://dave' keeps only dave.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b WHERE id(b) = 'person://dave' RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name").and_then(|v| v.as_str()),
+        Some("Dave")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn with_order_by_desc_sorts_mandatory_results() {
+    // WITH b ORDER BY b.score DESC sorts highest-score first (dave=20, bob=10, carol=5).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b ORDER BY b.score DESC RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r.fields.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert_eq!(names[0], "Dave", "highest score first");
+    assert_eq!(names[1], "Bob");
+    store.close().unwrap();
+}
+
+#[test]
+fn with_limit_caps_mandatory_set() {
+    // WITH b LIMIT 2 emits at most 2 rows regardless of match count.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b LIMIT 2 RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 2, "WITH LIMIT 2 caps at 2");
+    store.close().unwrap();
+}
+
+#[test]
+fn with_skip_offsets_mandatory_results() {
+    // WITH b ORDER BY b.score ASC SKIP 1 skips carol (lowest score=5).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b ORDER BY b.score ASC SKIP 1 RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 2, "skip 1 of 3 → 2 remaining");
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r.fields.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(!names.contains(&"Carol"), "carol (lowest) was skipped");
+    store.close().unwrap();
+}
+
+#[test]
+fn with_order_limit_then_optional_expands_only_top_n() {
+    // WITH b ORDER BY b.score DESC LIMIT 2 → top-2 are dave (20) and bob (10).
+    // OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c):
+    //   dave has 1 tag (rust), bob has 2 tags (rust, databases) → 3 expanded rows.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b ORDER BY b.score DESC LIMIT 2 \
+                 OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+                 RETURN b.name, c.label",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let b_names: Vec<&str> = rows
+        .iter()
+        .map(|r| r.fields.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(
+        !b_names.contains(&"Carol"),
+        "carol was excluded by WITH LIMIT 2"
+    );
+    // dave has 1 tag, bob has 2 → 3 rows total
+    assert_eq!(rows.len(), 3, "dave(1 tag) + bob(2 tags) = 3 rows");
+    store.close().unwrap();
+}
+
+#[test]
+fn with_where_combined_with_optional_and_c_pred() {
+    // WITH b WHERE b.score >= 10: keeps bob (10) and dave (20).
+    // OPTIONAL MATCH WHERE c.weight > 0.5: keeps tag://rust (0.9), excludes databases (0.4).
+    // bob has rust → 1 row; dave has rust → 1 row.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b WHERE b.score >= 10 \
+                 OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) WHERE c.weight > 0.5 \
+                 RETURN b.name, c.label",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 2, "bob→rust + dave→rust; databases excluded");
+    for row in &rows {
+        assert_eq!(
+            row.optional
+                .as_ref()
+                .and_then(|o| o.fields.get("label"))
+                .and_then(|v| v.as_str()),
+            Some("rust"),
+            "only the rust tag passes the weight > 0.5 predicate"
+        );
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn with_return_order_by_sorts_post_expansion() {
+    // WITH b ORDER BY b.score DESC LIMIT 2 → dave, bob (pre-expansion)
+    // OPTIONAL MATCH → dave→rust, bob→rust, bob→databases (3 expanded rows)
+    // RETURN ORDER BY id(b) ASC → sort by b.object_id lexicographically:
+    //   person://bob < person://dave, so bob's 2 rows come first.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 WITH b ORDER BY b.score DESC LIMIT 2 \
+                 OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+                 RETURN b.name, c.label ORDER BY id(b) ASC",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    // First two rows must be bob (id "person://bob" < "person://dave").
+    assert_eq!(rows[0].object_id.0, "person://bob");
+    assert_eq!(rows[1].object_id.0, "person://bob");
+    assert_eq!(rows[2].object_id.0, "person://dave");
+    store.close().unwrap();
+}
+
+#[test]
+fn with_parse_captures_clause_fields() {
+    // Parser test: with_clause populated with WHERE pred, ORDER BY DESC, SKIP, LIMIT.
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+         WITH b WHERE b.score > 5 ORDER BY b.score DESC SKIP 1 LIMIT 3 \
+         RETURN b.name",
+    )
+    .unwrap();
+
+    let wc = q.with_clause.as_ref().expect("with_clause must be Some");
+    assert_eq!(wc.payload_preds.len(), 1);
+    assert_eq!(wc.payload_preds[0].field, "score");
+    assert_eq!(wc.payload_preds[0].op, CmpOp::Gt);
+    assert_eq!(wc.payload_preds[0].value, CmpValue::Number(5.0));
+    assert!(wc.order_by.is_some());
+    assert_eq!(
+        wc.order_by.as_ref().unwrap().direction,
+        OrderDirection::Desc
+    );
+    assert_eq!(wc.skip, Some(1));
+    assert_eq!(wc.limit, Some(3));
+    assert!(q.optional_clause.is_none());
+}
+
+#[test]
+fn with_parse_id_pred_in_where() {
+    // WITH b WHERE id(b) STARTS WITH 'person://d' populates wc.end_pred.
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+         WITH b WHERE id(b) STARTS WITH 'person://d' RETURN b",
+    )
+    .unwrap();
+
+    let wc = q.with_clause.as_ref().unwrap();
+    assert_eq!(wc.end_pred, NodeIdPred::StartsWith("person://d".into()));
+    assert!(wc.payload_preds.is_empty());
+    assert!(wc.order_by.is_none());
+}
+
+#[test]
+fn without_with_optional_match_order_by_still_pre_expansion() {
+    // Backward compat: when no WITH clause, ORDER BY/LIMIT applies to mandatory
+    // results before optional expansion.  LIMIT 1 with ORDER BY b.score DESC
+    // keeps only dave (score=20); OPTIONAL MATCH gives dave→rust (1 row).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+                 OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c) \
+                 RETURN b.name, c.label ORDER BY b.score DESC LIMIT 1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "LIMIT 1 pre-expansion → 1 mandatory → 1 tag row"
+    );
+    assert_eq!(rows[0].object_id.0, "person://dave");
     store.close().unwrap();
 }
