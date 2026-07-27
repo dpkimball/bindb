@@ -467,3 +467,129 @@ fn commit_many_parent_chain_is_correct() {
     assert_eq!(commits[2].parent_commit, Some(ids[1]));
     store.close().unwrap();
 }
+
+// ─── version_log.bin crash recovery (issue #6) ───────────────────────────────
+//
+// After the live-only Vec change (PR #22) retired versions are no longer held
+// in `object_versions`. `version_log.bin` is the sole source for historical
+// queries. These tests verify that a wiped or truncated version_log.bin is
+// rebuilt from the WAL commit log on the next open(), not silently dropped.
+
+/// Write multiple versions of the same object (creates retired entries), then
+/// crash (dirty marker left), wipe version_log.bin, and verify that reopening
+/// rebuilds history from the full commit log.
+#[test]
+fn version_log_wiped_after_crash_history_survives() {
+    let dir = tmp();
+    let path = dir.path().to_path_buf();
+    let oid = ObjectId::new("a://versioned");
+
+    // Write 3 versions — commits 1-3, so v1 and v2 become retired.
+    {
+        let store = BinderStore::open(&path).unwrap();
+        for i in 1u8..=3 {
+            let mut tx = Transaction::new();
+            tx.put_object(oid.clone(), vec![i; 8]);
+            store.commit(tx, "test", format!("v{i}")).unwrap();
+        }
+        drop(store); // crash — dirty marker remains
+    }
+
+    // Wipe version_log.bin while the dirty marker is still present.
+    fs::write(path.join("version_log.bin"), b"").unwrap();
+
+    // Reopen: dirty open → !was_clean → rebuild from full commit log.
+    let store2 = BinderStore::open(&path).unwrap();
+    let history = store2.object_history(&oid).unwrap();
+    assert_eq!(
+        history.len(),
+        3,
+        "all 3 versions must survive version_log wipe"
+    );
+    // Most recent version has payload [3u8; 8].
+    let live = history.iter().find(|v| v.valid_to.is_none()).unwrap();
+    assert_eq!(live.payload.as_deref(), Some([3u8; 8].as_slice()));
+    store2.close().unwrap();
+}
+
+/// Same as above but with a clean close before the wipe (hydrate_ok path).
+/// The final guard (`!has_data() && !commits.is_empty()`) must fire.
+#[test]
+fn version_log_wiped_after_clean_close_history_survives() {
+    let dir = tmp();
+    let path = dir.path().to_path_buf();
+    let oid = ObjectId::new("b://versioned");
+
+    {
+        let store = BinderStore::open(&path).unwrap();
+        for i in 1u8..=3 {
+            let mut tx = Transaction::new();
+            tx.put_object(oid.clone(), vec![i; 8]);
+            store.commit(tx, "test", format!("v{i}")).unwrap();
+        }
+        store.close().unwrap(); // clean close
+    }
+
+    // Wipe version_log.bin after clean close.
+    fs::write(path.join("version_log.bin"), b"").unwrap();
+
+    // Reopen: clean, no delta → would defer hydration; guard fires instead.
+    let store2 = BinderStore::open(&path).unwrap();
+    let history = store2.object_history(&oid).unwrap();
+    assert_eq!(
+        history.len(),
+        3,
+        "all 3 versions must survive version_log wipe"
+    );
+    store2.close().unwrap();
+}
+
+/// Truncate version_log.bin to a partial frame on a dirty open; the dirty-open
+/// branch rebuilds from commits rather than hydrating the corrupt file.
+#[test]
+fn version_log_truncated_dirty_open_history_survives() {
+    let dir = tmp();
+    let path = dir.path().to_path_buf();
+    let oid = ObjectId::new("c://versioned");
+
+    {
+        let store = BinderStore::open(&path).unwrap();
+        for i in 1u8..=4 {
+            let mut tx = Transaction::new();
+            tx.put_object(oid.clone(), vec![i; 8]);
+            store.commit(tx, "test", format!("v{i}")).unwrap();
+        }
+        drop(store); // crash
+    }
+
+    // Truncate version_log.bin to 1 byte — no valid frames.
+    {
+        let vl_path = path.join("version_log.bin");
+        let file = fs::OpenOptions::new().write(true).open(&vl_path).unwrap();
+        file.set_len(1).unwrap();
+    }
+
+    // Reopen: dirty open → rebuild branch fires; truncated bytes are overwritten.
+    let store2 = BinderStore::open(&path).unwrap();
+    let history = store2.object_history(&oid).unwrap();
+    assert_eq!(
+        history.len(),
+        4,
+        "all 4 versions must survive version_log truncation"
+    );
+    store2.close().unwrap();
+}
+
+/// A fresh store (no commits) with an empty version_log.bin must NOT trigger a
+/// spurious rebuild — the guard `!commits.is_empty()` keeps it silent.
+#[test]
+fn fresh_store_empty_version_log_no_rebuild_needed() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    // No commits written; version_log.bin is empty. This must not error.
+    let history = store
+        .object_history(&ObjectId::new("never://existed"))
+        .unwrap();
+    assert!(history.is_empty());
+    store.close().unwrap();
+}

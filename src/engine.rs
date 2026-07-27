@@ -212,19 +212,37 @@ impl BinderStore {
         // Disk-backed version history:
         // - hydrate_ok (clean reopen, no delta): defer index loading until first query.
         // - full WAL replay paths: rebuild the log from complete history.
-        // - snapshot+delta path with dirty state: hydrate existing log + apply delta.
+        // - snapshot+delta, clean open: hydrate existing file + apply delta.
+        // - snapshot+delta, dirty open: rebuild from full commit log to cover any
+        //   partial truncation of version_log.bin that occurred during the crash.
         let version_log_path = store_path.join("version_log.bin");
         let mut version_store = VersionStore::open_or_create(&version_log_path)?;
         if !hydrate_ok {
             if let Some((ref full_ovs, ref full_evs)) = full_versions_for_rebuild {
+                // Full WAL replay path: complete history is already available.
                 version_store.rebuild_from_versions(full_ovs, full_evs)?;
+            } else if !was_clean {
+                // Dirty open on snapshot+delta path: version_log.bin may have been
+                // partially truncated during the crash. Rebuild from the full commit
+                // log (already loaded into `commits`) to guarantee correctness.
+                let (full_ovs, full_evs, _, _) = build_version_stores(&commits);
+                version_store.rebuild_from_versions(&full_ovs, &full_evs)?;
             } else {
-                // Snapshot+delta path: hydrate existing file and apply only the delta commits.
+                // Clean open with WAL delta: version_log.bin is intact; safe to hydrate.
                 version_store.hydrate_index_from_file()?;
                 for commit in &vs_delta_commits {
                     apply_commit_to_version_store(&mut version_store, commit);
                 }
             }
+        }
+
+        // Final guard: if version_log.bin was completely wiped (e.g. the OS
+        // crashed while creating/truncating the file), rebuild from the full
+        // commit log now.  This covers the hydrate_ok path where deferred
+        // hydration would otherwise silently return empty history results.
+        if !version_store.has_data() && !commits.is_empty() {
+            let (full_ovs, full_evs, _, _) = build_version_stores(&commits);
+            version_store.rebuild_from_versions(&full_ovs, &full_evs)?;
         }
 
         Ok(Self {
