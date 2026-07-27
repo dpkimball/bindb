@@ -13,9 +13,9 @@ All SLAs are defined at one or more scale tiers:
 | Tier | Objects in store | Edges | CI enforcement |
 |------|-----------------|-------|----------------|
 | **S** | 1 K | 1 K | — |
-| **M** | 10 K | 10 K | Per-PR (`perf` job, `--test-threads=1`) |
-| **L** | 100 K | 50 K | Nightly / manual (`scale:L` tests) |
-| **XL** | 1 M | — | Manual: `PERF_REPORT_XL=1` on `perf_report` ([#7](https://github.com/dpkimball/bindb/issues/7)); not CI-gated |
+| **M** | 10 K | 10 K | Per-push + labeled PRs (`perf` job; `sla_` tests, excluding `sla_l_` and `sla_xl_`) |
+| **L** | 100 K | 50 K | Nightly (`nightly.yml`; `sla_l_` tests) |
+| **XL** | 1 M | — | Nightly (`nightly.yml`; `sla_xl_` tests); manual: `PERF_REPORT_XL=1` on `perf_report` ([#7](https://github.com/dpkimball/bindb/issues/7)) |
 
 Life-scale context: a single user accumulates ~500 K health observations per year,
 ~50 K memories over 10 years, and ~10 K–100 K financial records.
@@ -153,18 +153,28 @@ must return results within a single UI round-trip budget.  90% recall ensures fe
 ### CI SLA gate (`perf` job)
 
 `tests/perf_sla.rs` contains `#[ignore]` tests that assert on percentile timings.
-The `perf` CI job runs them with:
+The per-push and labeled-PR SLA gate runs M-scale tests only:
 
 ```bash
-cargo test --release -- --ignored --test-threads=1
+cargo test --release --test perf_sla -- --ignored --test-threads=1 \
+  --skip sla_l_ --skip sla_xl_
 ```
 
-These tests run at **M** scale (10 K objects) with enough iterations (1 K+) to produce
-stable percentile estimates.  They fail the PR if any SLA is violated.
+L-scale and XL-scale tests run nightly via `nightly.yml`.  Separating scale tiers
+prevents long-running XL builds from consuming the 20-minute per-push timeout and
+from adding I/O contention that destabilises M-scale fsync measurements.
 
-All SLA thresholds in the test file are calibrated for the project's self-hosted CI runner.
-If the runner changes, re-calibrate by running the suite locally on the new hardware and
-adjusting the constants at the top of `tests/perf_sla.rs`.
+**Measurement methodology for fsync-bound tests:**
+The durable `commit()` throughput test and `flush()` wall-time test use median-of-N
+measurements rather than a single wall-clock sample.  fsync latency on a shared
+self-hosted runner can spike transiently due to concurrent I/O from other CI jobs;
+a single slow fsync inflates total wall-clock but leaves the p50 (median) unaffected.
+The gate fails only when the _majority_ of samples are slow — which indicates a genuine
+throughput regression rather than transient runner contention.
+
+All SLA thresholds are calibrated for the project's self-hosted CI runner (Apple M-series,
+NVMe SSD).  If the runner changes, re-calibrate by running the suite locally on the new
+hardware and adjusting the constants at the top of `tests/perf_sla.rs`.
 
 ### Trend tracking (`bench` job)
 
