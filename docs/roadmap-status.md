@@ -1,6 +1,6 @@
 # bindb — Issue / roadmap status
 
-Last updated: 2026-07-27. Prefer this over stale issue bodies.
+Last updated: 2026-07-27 (PR #30). Prefer this over stale issue bodies.
 
 
 | Issue | State | Shipped | Remaining / follow-up |
@@ -10,7 +10,7 @@ Last updated: 2026-07-27. Prefer this over stale issue bodies.
 | [#3](https://github.com/dpkimball/bindb/issues/3) HNSW | Closed | HNSW ≥1k live vectors/model; **100K SLA gate** (`knn_search` p99 ≤5ms, recall@10 ≥90%; OKR O3) | — |
 | [#4](https://github.com/dpkimball/bindb/issues/4) Full-text | Closed (narrow) | Manual `index_text` / `text_search` | Real FTS (tokenize, persist, rank) |
 | [#5](https://github.com/dpkimball/bindb/issues/5) Aggregation / SQL | Open | Rust DSL + `sql_aggregate()` (COUNT/AVG/SUM/MIN/MAX/P50/P99, PATH_SEGMENT, **WHERE id STARTS WITH**) + **`export_observations_jsonl()`** (DuckDB-compatible JSONL) + **`join_observations(left, right, key_fn)`** (pure-Rust inner join across two namespace prefixes; deduplicates by `CommitId`; `Vec<JoinRow>`; 6 integration tests); _removed_: `query_sql_observations` (DuckDB subprocess — wrong dep model) | Full SQL; window functions; arbitrary GROUP BY expressions; columnar projection |
-| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss); **head-cache LRU** (bounded HeadObjectIndex/HeadEdgeIndex, default 200 K; miss falls back to mmap-backed VersionStore; `open_with_head_cap()`; 6 integration tests); **payload + provenance stripping** (`payload_stripped` field; retired versions have payload + provenance heap strings freed after disk write; `rebuild_from_versions` recovers full originals from mmap before truncate; 10 integration tests); **live-only Vec** (retired entries swap-removed from `object_versions`/`edge_versions` Vecs on commit; Vec holds only live versions; VersionStore is sole source for history; `rebuild_indexes` no longer rewrites disk; `open` compacts to live-only after crash-recovery rebuild; 3 new integration tests) | Historical data after crash relies solely on version_log.bin (cannot rebuild from live-only Vec) |
+| [#6](https://github.com/dpkimball/bindb/issues/6) mmap / >RAM | Open | Disk-backed `VersionStore` (version_log.bin, ~40 B/version in RAM); **mmap read path** (memmap2, zero seek/read syscalls after initial map); **cold-version eviction** (sweep non-live IndexEntries when cap exceeded; mmap rescan on miss); **head-cache LRU** (bounded HeadObjectIndex/HeadEdgeIndex, default 200 K; miss falls back to mmap-backed VersionStore; `open_with_head_cap()`; 6 integration tests); **payload + provenance stripping** (`payload_stripped` field; retired versions have payload + provenance heap strings freed after disk write; `rebuild_from_versions` recovers full originals from mmap before truncate; 10 integration tests); **live-only Vec** (retired entries swap-removed from `object_versions`/`edge_versions` Vecs on commit; Vec holds only live versions; VersionStore is sole source for history; `rebuild_indexes` no longer rewrites disk; `open` compacts to live-only after crash-recovery rebuild; 3 new integration tests); **crash recovery** (dirty open or empty version_log.bin triggers rebuild from full commit log; final guard fires on any path when file has no data but commits exist; 4 integration tests) | Aspirational: true mmap-backed head index for >200 K distinct live objects without LRU eviction latency |
 | [#7](https://github.com/dpkimball/bindb/issues/7) XL 1M | **Closed** | Snapshot fast open; XL get/open-after-compact PASS; **formal XL SLA tests** + **nightly CI job** (02:00 UTC) + **3 new XL SLA tests** (`list` p99 ≤500ms, `commit_buffered` ≥5K/s, `rebuild_indexes` ≤60s at 1M objects); **eviction bug fix** (O(1M) sweep per commit fixed; `commit_buffered` at XL now 260K/s); **nightly watchdog** (`nightly_watchdog.yml` on `ubuntu-latest` at 02:45 UTC; opens GitHub issue on missed/failed run) | — |
 | [#8](https://github.com/dpkimball/bindb/issues/8) Bulk vs SQLite | Closed (mitigated) | `commit_many`, O(1) retirement | Still far from SQLite COPY (OKR O2) |
 | [#9](https://github.com/dpkimball/bindb/issues/9) Checkpoint open | Closed | Snapshot fast path on `open()` | Variance / flake control (OKR O4) |
@@ -70,6 +70,14 @@ hydrates the existing file and applies only the delta idempotently.  `rebuild_in
 now rebuilds in-memory indexes only (does not rewrite version_log.bin).
 At 1 M live objects and 5 M total historical: removes ~100 MB String heap + ~400 MB
 struct overhead from retired Vec entries compared to the pre-stripping baseline.
+
+**Crash recovery shipped (2026-07-27)**: `open_inner` now handles two failure modes
+that would otherwise cause silent history loss.  On a dirty open where `version_log.bin`
+is missing or truncated, the snapshot+delta path rebuilds from the full in-memory commit
+log via `build_version_stores` + `rebuild_from_versions` rather than calling
+`hydrate_index_from_file`.  A final guard fires on any open path: if the file has no
+data but commits exist, rebuild unconditionally.  4 new integration tests cover the
+wiped-file, truncated-file, clean-open, and fresh-store cases.
 
 **Measured XL (1 M objects, 2026-07-23, Apple Silicon, release, after compact):**
 
