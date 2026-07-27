@@ -32,6 +32,19 @@
 //! MATCH (a)-[:RELATES_TO*1..3]->(b)
 //! WHERE id(a) = 'person://alice'
 //! RETURN b.sentiment, b.label
+//!
+//! -- OPTIONAL MATCH: emit b even when no c is reachable (left-outer-join):
+//! MATCH (a)-[:KNOWS*1..2]->(b)
+//! WHERE id(a) = 'person://alice'
+//! OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c)
+//! RETURN b, c
+//!
+//! -- OPTIONAL MATCH with predicate on c and field projection:
+//! MATCH (a)-[:KNOWS*1..2]->(b)
+//! WHERE id(a) = 'person://alice'
+//! OPTIONAL MATCH (b)-[:HAS_TAG*1..1]->(c)
+//! WHERE id(c) STARTS WITH 'tag://' AND c.weight > 0.5
+//! RETURN b.name, c.label
 //! ```
 //!
 //! Payload predicate operators: `>`, `<`, `>=`, `<=`, `=`, `!=`.
@@ -40,11 +53,13 @@
 //!
 //! `RETURN b` returns matched node ids (`graph_ir` / `graph_ir_parsed`).
 //! `RETURN b.field …` returns projected rows via `graph_ir_projected`.
+//! OPTIONAL MATCH results are only available through `graph_ir_projected`.
 //!
 //! Notes:
 //! - `*min..max` / `*n` set max_depth and filter results to `depth >= min`.
 //! - Node filters apply to **results**, not traversal.
 //! - Undirected `-[]-` → [`Direction::Both`]; `<-[]-` → Incoming; `-[]->` → Outgoing.
+//! - ORDER BY / LIMIT / SKIP apply to mandatory `b` results before optional expansion.
 
 use crate::engine::BinderStore;
 use crate::error::StoreError;
@@ -101,6 +116,39 @@ pub struct PayloadPred {
     pub value: CmpValue,
 }
 
+/// The `OPTIONAL MATCH` clause in a two-clause query.
+///
+/// Traversal starts from each matched `b` node in the mandatory clause and
+/// tries to reach `c` nodes. When no `c` nodes are reachable, `GraphIrRow::optional`
+/// is set to `None` so the mandatory row is still emitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrOptionalClause {
+    pub edge_types: Vec<String>,
+    /// Minimum hop depth from `b` included in optional results.
+    pub min_depth: usize,
+    /// Maximum hop depth from `b`.
+    pub max_depth: usize,
+    pub direction: Direction,
+    pub end_pred: NodeIdPred,
+    /// Payload field predicates applied to matched `c` nodes (AND-combined).
+    pub payload_preds: Vec<PayloadPred>,
+    /// Fields to project from each `c` node's JSON payload (`RETURN c.f1, c.f2`).
+    pub return_fields: Vec<String>,
+}
+
+/// One result from an `OPTIONAL MATCH` clause.
+///
+/// Absent (`None` in [`GraphIrRow::optional`]) when no `c` node was reachable
+/// from the mandatory `b` node under the optional clause's constraints.
+#[derive(Debug, Clone)]
+pub struct GraphIrOptionalMatch {
+    pub object_id: ObjectId,
+    /// Hop depth from the mandatory `b` node to this `c` node.
+    pub depth: usize,
+    /// Projected fields from `RETURN c.f1, c.f2`. Empty when no fields were requested.
+    pub fields: HashMap<String, serde_json::Value>,
+}
+
 /// One row returned by `graph_ir_projected`.
 ///
 /// `fields` contains only the keys requested in `RETURN b.field1, b.field2`.
@@ -108,12 +156,18 @@ pub struct PayloadPred {
 ///
 /// `path` is the sequence of node IDs from the start node to `object_id`
 /// (inclusive of both endpoints) when `RETURN path` was requested; otherwise empty.
+///
+/// `optional` is populated when the query contains an `OPTIONAL MATCH` clause.
+/// It is `None` when the optional pattern found no matches for this mandatory row,
+/// and `Some` for each individually matched optional node.
 #[derive(Debug, Clone)]
 pub struct GraphIrRow {
     pub object_id: ObjectId,
     pub depth: usize,
     pub fields: HashMap<String, serde_json::Value>,
     pub path: Vec<ObjectId>,
+    /// Result of the `OPTIONAL MATCH` clause, if present in the query.
+    pub optional: Option<GraphIrOptionalMatch>,
 }
 
 /// Field to sort graph query results by.
@@ -167,6 +221,13 @@ pub struct GraphIrQuery {
     pub limit: Option<usize>,
     /// Number of results to skip before applying LIMIT (applied after ORDER BY).
     pub skip: Option<usize>,
+    /// Optional second traversal clause. When present, each mandatory result is
+    /// used as the start node for this clause. Results with no optional match
+    /// are emitted with `GraphIrRow::optional = None`.
+    ///
+    /// ORDER BY / LIMIT / SKIP are applied to mandatory results before the
+    /// optional expansion.
+    pub optional_clause: Option<GraphIrOptionalClause>,
 }
 
 impl GraphIrQuery {
@@ -208,13 +269,45 @@ impl GraphIrQuery {
             break;
         }
 
-        if !starts_with_keyword(after_preds2, "RETURN") {
+        // Optional MATCH clause (OPTIONAL MATCH (b)-[…]->(c) [WHERE …])
+        let (optional_clause_raw, after_preds3) = if starts_with_keyword(after_preds2, "OPTIONAL") {
+            let after_opt = skip_keyword(after_preds2, "OPTIONAL");
+            if !starts_with_keyword(after_opt, "MATCH") {
+                return Err(GraphIrError::Unsupported(
+                    "expected MATCH after OPTIONAL".into(),
+                ));
+            }
+            let after_opt_match = skip_keyword(after_opt, "MATCH");
+            let (opt_dir, opt_types, opt_min, opt_max, after_opt_pat) =
+                parse_pattern(after_opt_match)?;
+            let after_opt_pat = after_opt_pat.trim_start();
+            let (opt_end_pred, opt_preds, after_opt_where) = parse_optional_where(after_opt_pat)?;
+            let oc = GraphIrOptionalClause {
+                edge_types: opt_types,
+                min_depth: opt_min,
+                max_depth: opt_max,
+                direction: opt_dir,
+                end_pred: opt_end_pred,
+                payload_preds: opt_preds,
+                return_fields: vec![], // filled in after RETURN is parsed
+            };
+            (Some(oc), after_opt_where.trim_start())
+        } else {
+            (None, after_preds2)
+        };
+
+        if !starts_with_keyword(after_preds3, "RETURN") {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
-        let after_return = skip_keyword(after_preds2, "RETURN");
+        let after_return = skip_keyword(after_preds3, "RETURN");
         let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
-        let (return_fields, return_path) = parse_return_spec(ret_spec);
+        let (return_fields, c_return_fields, return_path) = parse_return_spec(ret_spec);
         let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
+
+        let optional_clause = optional_clause_raw.map(|mut oc| {
+            oc.return_fields = c_return_fields;
+            oc
+        });
 
         Ok(GraphIrQuery {
             start,
@@ -229,6 +322,7 @@ impl GraphIrQuery {
             order_by,
             limit,
             skip,
+            optional_clause,
         })
     }
 }
@@ -419,17 +513,33 @@ fn parse_where(s: &str) -> Result<(ObjectId, NodeIdPred, &str), GraphIrError> {
     }
 }
 
+/// Parse `VAR.field OP value` for an arbitrary lowercase variable name.
+/// `s` must start with `VAR.` (case-insensitive prefix already verified by caller).
+fn parse_payload_pred_for_var<'a>(
+    s: &'a str,
+    var: &str,
+) -> Result<(PayloadPred, &'a str), GraphIrError> {
+    let prefix_len = var.len() + 1; // "c."
+    parse_payload_pred_inner(&s[prefix_len..], var)
+}
+
 fn parse_payload_pred(s: &str) -> Result<(PayloadPred, &str), GraphIrError> {
     // s starts with "b." or "B."
-    let s = &s[2..]; // skip "b."
-                     // field name: alphanumeric + underscore
+    parse_payload_pred_inner(&s[2..], "b")
+}
+
+fn parse_payload_pred_inner<'a>(
+    s: &'a str,
+    var: &str,
+) -> Result<(PayloadPred, &'a str), GraphIrError> {
+    // s starts after "VAR." — field name: alphanumeric + underscore
     let field_end = s
         .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .unwrap_or(s.len());
     if field_end == 0 {
-        return Err(GraphIrError::Unsupported(
-            "expected field name after b.".into(),
-        ));
+        return Err(GraphIrError::Unsupported(format!(
+            "expected field name after {var}."
+        )));
     }
     let field = s[..field_end].to_string();
     let rest = s[field_end..].trim_start();
@@ -448,7 +558,7 @@ fn parse_payload_pred(s: &str) -> Result<(PayloadPred, &str), GraphIrError> {
         (CmpOp::Eq, r.trim_start())
     } else {
         return Err(GraphIrError::Unsupported(format!(
-            "expected comparison operator after b.{field}"
+            "expected comparison operator after {var}.{field}"
         )));
     };
 
@@ -514,6 +624,81 @@ fn parse_end_pred(s: &str) -> Result<(NodeIdPred, &str), GraphIrError> {
             "expected id(b) STARTS WITH or id(b) =".into(),
         ))
     }
+}
+
+/// Parse `id(VAR) STARTS WITH '…'` or `id(VAR) = '…'` for a named variable.
+fn parse_end_pred_for_var<'a>(
+    s: &'a str,
+    var: &str,
+) -> Result<(NodeIdPred, &'a str), GraphIrError> {
+    let prefix = format!("id({var})");
+    if s.len() < prefix.len() || !s[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+        return Err(GraphIrError::Unsupported(format!(
+            "expected id({var}) STARTS WITH or id({var}) ="
+        )));
+    }
+    let after = s[prefix.len()..].trim_start();
+    if starts_with_keyword(after, "STARTS") {
+        let after_starts = skip_keyword(after, "STARTS");
+        if !starts_with_keyword(after_starts, "WITH") {
+            return Err(GraphIrError::Unsupported("expected STARTS WITH".into()));
+        }
+        let after_with = skip_keyword(after_starts, "WITH");
+        let (val, rest) = parse_quoted(after_with)?;
+        Ok((NodeIdPred::StartsWith(val), rest))
+    } else if let Some(after_eq) = after.strip_prefix('=') {
+        let (val, rest) = parse_quoted(after_eq.trim_start())?;
+        Ok((NodeIdPred::Equals(val), rest))
+    } else {
+        Err(GraphIrError::Unsupported(format!(
+            "expected id({var}) STARTS WITH or id({var}) ="
+        )))
+    }
+}
+
+/// Parse the optional WHERE clause that follows `OPTIONAL MATCH (b)-[…]->(c)`.
+///
+/// Supported predicates (all on variable `c`):
+/// - `id(c) STARTS WITH '…'` / `id(c) = '…'`  — end-node ID constraint
+/// - `c.field OP value`                         — JSON payload predicates
+/// - Combinations connected by AND
+///
+/// Returns `(end_pred, payload_preds, remaining)`.
+fn parse_optional_where(s: &str) -> Result<(NodeIdPred, Vec<PayloadPred>, &str), GraphIrError> {
+    let s = s.trim_start();
+    if !starts_with_keyword(s, "WHERE") {
+        return Ok((NodeIdPred::Any, vec![], s));
+    }
+    let mut rest = skip_keyword(s, "WHERE").trim_start();
+
+    let mut end_pred = NodeIdPred::Any;
+    let mut payload_preds: Vec<PayloadPred> = Vec::new();
+
+    // Parse predicates until we hit something that isn't id(c) or c.field
+    loop {
+        let t = rest.trim_start();
+        if (t.len() >= 5 && t[..5].eq_ignore_ascii_case("id(c)"))
+            || (t.len() >= 5 && t[..5].eq_ignore_ascii_case("id(C)"))
+        {
+            let (pred, next) = parse_end_pred_for_var(t, "c")?;
+            end_pred = pred;
+            rest = next.trim_start();
+        } else if t.starts_with("c.") || t.starts_with("C.") {
+            let (pred, next) = parse_payload_pred_for_var(t, "c")?;
+            payload_preds.push(pred);
+            rest = next.trim_start();
+        } else {
+            break;
+        }
+        // Consume AND before the next predicate (if present)
+        if starts_with_keyword(rest, "AND") {
+            rest = skip_keyword(rest, "AND").trim_start();
+        } else {
+            break;
+        }
+    }
+
+    Ok((end_pred, payload_preds, rest))
 }
 
 fn parse_quoted(s: &str) -> Result<(String, &str), GraphIrError> {
@@ -741,16 +926,21 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
     builder
 }
 
-/// Parse `RETURN b` → `([], false)`,
-/// `RETURN b.f1, b.f2` → `(["f1", "f2"], false)`,
-/// `RETURN path` → `([], true)`,
-/// `RETURN b.sentiment, path` → `(["sentiment"], true)`.
-fn parse_return_spec(s: &str) -> (Vec<String>, bool) {
+/// Parse the RETURN spec.
+///
+/// Returns `(b_fields, c_fields, return_path)` where:
+/// - `b_fields`: fields projected from the mandatory `b` node (`RETURN b.f1, b.f2`)
+/// - `c_fields`: fields projected from the optional `c` node (`RETURN c.f1`)
+/// - `return_path`: true when `path` appears in the RETURN list
+///
+/// Plain `RETURN b` and `RETURN c` (variable name only) are valid but produce no fields.
+fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, bool) {
     let s = s.trim();
     if s.is_empty() {
-        return (vec![], false);
+        return (vec![], vec![], false);
     }
-    let mut fields = Vec::new();
+    let mut b_fields = Vec::new();
+    let mut c_fields = Vec::new();
     let mut return_path = false;
     for part in s.split(',') {
         let p = part.trim();
@@ -759,12 +949,17 @@ fn parse_return_spec(s: &str) -> (Vec<String>, bool) {
         } else if let Some(field) = p.strip_prefix("b.").or_else(|| p.strip_prefix("B.")) {
             let f = field.trim().to_string();
             if !f.is_empty() {
-                fields.push(f);
+                b_fields.push(f);
+            }
+        } else if let Some(field) = p.strip_prefix("c.").or_else(|| p.strip_prefix("C.")) {
+            let f = field.trim().to_string();
+            if !f.is_empty() {
+                c_fields.push(f);
             }
         }
-        // "b" alone → plain return; ignore
+        // "b", "c" alone → plain return; ignore
     }
-    (fields, return_path)
+    (b_fields, c_fields, return_path)
 }
 
 enum SortKey {
@@ -865,9 +1060,11 @@ impl BinderStore {
     /// - `RETURN b.f1, b.f2` → `GraphIrRow::fields` contains the projected JSON fields.
     /// - `RETURN path` → `GraphIrRow::path` contains the node-id sequence from start to match.
     /// - Both may be combined: `RETURN b.sentiment, path`.
+    /// - `OPTIONAL MATCH` → each mandatory result is expanded with optional results; rows with
+    ///   no optional match have `GraphIrRow::optional = None`.
     ///
     /// Fields absent from the payload or non-JSON payloads produce no entry for that key.
-    /// For plain `RETURN b`, prefer `graph_ir_parsed` which avoids the overhead of path tracking.
+    /// For plain `RETURN b` with no optional clause, prefer `graph_ir_parsed`.
     pub fn graph_ir_projected(&self, q: &GraphIrQuery) -> Result<Vec<GraphIrRow>, StoreError> {
         let (matches, parent_map) = if q.return_path {
             let (mut ms, pm) = self.execute_graph_query_with_paths(build_graph_query(self, q))?;
@@ -881,38 +1078,134 @@ impl BinderStore {
         };
 
         let start = &q.start;
-        let rows = matches
-            .into_iter()
-            .map(|m| {
-                let mut fields = HashMap::new();
-                if !q.return_fields.is_empty() {
-                    if let Some(payload) = m.object.payload.as_deref() {
-                        if let Ok(text) = std::str::from_utf8(payload) {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-                                for key in &q.return_fields {
-                                    if let Some(val) = v.get(key) {
-                                        fields.insert(key.clone(), val.clone());
-                                    }
+        let mut rows: Vec<GraphIrRow> = Vec::with_capacity(matches.len());
+
+        for m in matches {
+            let mut b_fields = HashMap::new();
+            if !q.return_fields.is_empty() {
+                if let Some(payload) = m.object.payload.as_deref() {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                            for key in &q.return_fields {
+                                if let Some(val) = v.get(key) {
+                                    b_fields.insert(key.clone(), val.clone());
                                 }
                             }
                         }
                     }
                 }
-                let path = if q.return_path {
-                    reconstruct_path(start, &m.object.object_id, &parent_map)
+            }
+            let path = if q.return_path {
+                reconstruct_path(start, &m.object.object_id, &parent_map)
+            } else {
+                vec![]
+            };
+
+            if let Some(opt_clause) = &q.optional_clause {
+                let opt_results = execute_optional_clause(self, &m.object.object_id, opt_clause)?;
+                if opt_results.is_empty() {
+                    rows.push(GraphIrRow {
+                        object_id: m.object.object_id,
+                        depth: m.depth,
+                        fields: b_fields,
+                        path,
+                        optional: None,
+                    });
                 } else {
-                    vec![]
-                };
-                GraphIrRow {
-                    object_id: m.object.object_id.clone(),
-                    depth: m.depth,
-                    fields,
-                    path,
+                    for opt in opt_results {
+                        rows.push(GraphIrRow {
+                            object_id: m.object.object_id.clone(),
+                            depth: m.depth,
+                            fields: b_fields.clone(),
+                            path: path.clone(),
+                            optional: Some(opt),
+                        });
+                    }
                 }
-            })
-            .collect();
+            } else {
+                rows.push(GraphIrRow {
+                    object_id: m.object.object_id,
+                    depth: m.depth,
+                    fields: b_fields,
+                    path,
+                    optional: None,
+                });
+            }
+        }
+
         Ok(rows)
     }
+}
+
+/// Execute an OPTIONAL MATCH clause starting from `start`, returning all matched
+/// `c` nodes with projected fields. Returns an empty Vec when no c nodes are
+/// reachable — the caller emits a null-padded row in that case.
+fn execute_optional_clause(
+    store: &BinderStore,
+    start: &ObjectId,
+    clause: &GraphIrOptionalClause,
+) -> Result<Vec<GraphIrOptionalMatch>, StoreError> {
+    let mut builder = store
+        .graph_query()
+        .from(start)
+        .max_depth(clause.max_depth)
+        .direction(clause.direction);
+
+    if !clause.edge_types.is_empty() {
+        builder = builder.edge_types(clause.edge_types.clone());
+    }
+
+    builder = match &clause.end_pred {
+        NodeIdPred::Any => builder,
+        NodeIdPred::StartsWith(pfx) => {
+            let pfx = pfx.clone();
+            builder.filter_node(move |obj| obj.object_id.0.starts_with(&pfx))
+        }
+        NodeIdPred::Equals(id) => {
+            let id = id.clone();
+            builder.filter_node(move |obj| obj.object_id.0 == id)
+        }
+    };
+
+    if !clause.payload_preds.is_empty() {
+        let preds = clause.payload_preds.clone();
+        builder = builder.filter_node(move |obj| {
+            let payload = obj.payload.as_deref().unwrap_or(&[]);
+            preds.iter().all(|pred| apply_payload_pred(payload, pred))
+        });
+    }
+
+    let mut matches = builder.execute()?;
+    if clause.min_depth > 1 {
+        matches.retain(|m| m.depth >= clause.min_depth);
+    }
+
+    let results = matches
+        .into_iter()
+        .map(|m| {
+            let mut fields = HashMap::new();
+            if !clause.return_fields.is_empty() {
+                if let Some(payload) = m.object.payload.as_deref() {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                            for key in &clause.return_fields {
+                                if let Some(val) = v.get(key) {
+                                    fields.insert(key.clone(), val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            GraphIrOptionalMatch {
+                object_id: m.object.object_id,
+                depth: m.depth,
+                fields,
+            }
+        })
+        .collect();
+
+    Ok(results)
 }
 
 // ── write IR (issue #2 — write clauses) ──────────────────────────────────────
