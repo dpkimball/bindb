@@ -31,7 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: XL SLA tests (--release, scale:XL)
-        run: >
-          cargo test --release --test perf_sla
-          -- --ignored --test-threads=1 scale:XL
+      - name: L SLA tests (scale:L)
+        run: |
+          cargo test --release --test perf_sla \
+            -- --ignored --test-threads=1 sla_l_
+
+      - name: XL SLA tests (scale:XL)
+        run: |
+          cargo test --release --test perf_sla \
+            -- --ignored --test-threads=1 sla_xl_
