@@ -3029,3 +3029,136 @@ fn null_check_parse_op_variants() {
     .unwrap();
     assert_eq!(q2.payload_preds[0].op, CmpOp::IsNotNull);
 }
+
+// ── IN / NOT IN predicate tests ───────────────────────────────────────────────
+
+fn build_in_pred_graph() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        obj("in://alice"),
+        br#"{"role":"admin","dept":"eng"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("in://bob"),
+        br#"{"role":"editor","dept":"eng"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("in://carol"),
+        br#"{"role":"viewer","dept":"hr"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("in://dave"),
+        br#"{"role":"admin","dept":"hr"}"#.to_vec(),
+    );
+    tx.put_object(obj("in://root"), b"{}".to_vec());
+    tx.put_edge(
+        eid("in_e1"),
+        obj("in://root"),
+        obj("in://alice"),
+        "MEMBER",
+        None,
+    );
+    tx.put_edge(
+        eid("in_e2"),
+        obj("in://root"),
+        obj("in://bob"),
+        "MEMBER",
+        None,
+    );
+    tx.put_edge(
+        eid("in_e3"),
+        obj("in://root"),
+        obj("in://carol"),
+        "MEMBER",
+        None,
+    );
+    tx.put_edge(
+        eid("in_e4"),
+        obj("in://root"),
+        obj("in://dave"),
+        "MEMBER",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn in_pred_filters_by_list() {
+    // b.role IN ['admin', 'editor'] → alice + bob + dave
+    let (store, _dir) = build_in_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:MEMBER]->(b) WHERE id(a) = 'in://root' AND b.role IN ['admin', 'editor'] RETURN b",
+    )
+    .unwrap();
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].object_id.0, "in://alice");
+    assert_eq!(rows[1].object_id.0, "in://bob");
+    assert_eq!(rows[2].object_id.0, "in://dave");
+    store.close().unwrap();
+}
+
+#[test]
+fn not_in_pred_excludes_list() {
+    // b.dept NOT IN ['eng'] → carol + dave
+    let (store, _dir) = build_in_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:MEMBER]->(b) WHERE id(a) = 'in://root' AND b.dept NOT IN ['eng'] RETURN b",
+    )
+    .unwrap();
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].object_id.0, "in://carol");
+    assert_eq!(rows[1].object_id.0, "in://dave");
+    store.close().unwrap();
+}
+
+#[test]
+fn in_pred_empty_list_matches_nothing() {
+    let (store, _dir) = build_in_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:MEMBER]->(b) WHERE id(a) = 'in://root' AND b.role IN [] RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn in_pred_combined_with_eq() {
+    // dept = 'hr' AND role IN ['admin'] → dave only
+    let (store, _dir) = build_in_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:MEMBER]->(b) WHERE id(a) = 'in://root' AND b.dept = 'hr' AND b.role IN ['admin'] RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "in://dave");
+    store.close().unwrap();
+}
+
+#[test]
+fn in_pred_parse_op_variant() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' AND b.role IN ['a', 'b'] RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q.payload_preds[0].op, CmpOp::In);
+    assert_eq!(
+        q.payload_preds[0].value,
+        CmpValue::StringList(vec!["a".into(), "b".into()])
+    );
+
+    let q2 = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' AND b.role NOT IN ['a'] RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q2.payload_preds[0].op, CmpOp::NotIn);
+}

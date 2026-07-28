@@ -130,6 +130,10 @@ pub enum CmpOp {
     IsNull,
     /// `b.field IS NOT NULL` — field present in the JSON payload
     IsNotNull,
+    /// `b.field IN ['v1', 'v2']` — field value is in the list
+    In,
+    /// `b.field NOT IN ['v1', 'v2']` — field value is not in the list
+    NotIn,
 }
 
 /// Right-hand side of a payload predicate.
@@ -139,6 +143,8 @@ pub enum CmpValue {
     Text(String),
     /// Placeholder for IS NULL / IS NOT NULL (no RHS value).
     Null,
+    /// List of string values for IN / NOT IN.
+    StringList(Vec<String>),
 }
 
 /// Predicate on a JSON field of the matched end node's payload.
@@ -739,6 +745,32 @@ fn parse_payload_pred_inner<'a>(
         ));
     }
 
+    // NOT IN [...] before IN [...] to avoid ambiguity
+    if starts_with_keyword(rest, "NOT IN") {
+        let after_kw = skip_keyword(rest, "NOT IN").trim_start();
+        let (items, rest) = parse_string_list(after_kw)?;
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::NotIn,
+                value: CmpValue::StringList(items),
+            },
+            rest,
+        ));
+    }
+    if starts_with_keyword(rest, "IN") {
+        let after_kw = skip_keyword(rest, "IN").trim_start();
+        let (items, rest) = parse_string_list(after_kw)?;
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::In,
+                value: CmpValue::StringList(items),
+            },
+            rest,
+        ));
+    }
+
     // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS) before symbols
     let (op, rest) = if starts_with_keyword(rest, "STARTS WITH") {
         (
@@ -1162,6 +1194,28 @@ fn parse_quoted(s: &str) -> Result<(String, &str), GraphIrError> {
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
 }
 
+/// Parse a `['v1', 'v2', ...]` string list literal.
+fn parse_string_list(s: &str) -> Result<(Vec<String>, &str), GraphIrError> {
+    let s = s.trim_start();
+    let Some(s) = s.strip_prefix('[') else {
+        return Err(GraphIrError::Unsupported("expected '[' for IN list".into()));
+    };
+    let mut items = Vec::new();
+    let mut rest = s.trim_start();
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix(']') {
+            return Ok((items, after.trim_start()));
+        }
+        let (item, after_item) = parse_quoted(rest)?;
+        items.push(item);
+        rest = after_item.trim_start();
+        if let Some(after_comma) = rest.strip_prefix(',') {
+            rest = after_comma;
+        }
+    }
+}
+
 /// Split the RETURN spec from any trailing ORDER BY / SKIP / LIMIT clause.
 /// Advances char by char and stops at the first keyword boundary for those tokens.
 fn split_at_ordering_clause(s: &str) -> (&str, &str) {
@@ -1274,6 +1328,8 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
                 // Already handled above
                 CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
+                // IN/NOT IN handled via StringList arm
+                CmpOp::In | CmpOp::NotIn => false,
             }
         }
         CmpValue::Text(rhs) => {
@@ -1293,9 +1349,23 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::Contains => lhs.contains(rhs.as_str()),
                 // Already handled above
                 CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
+                // IN/NOT IN with a single Text value: treat as 1-element list
+                CmpOp::In => lhs == rhs.as_str(),
+                CmpOp::NotIn => lhs != rhs.as_str(),
             }
         }
-        CmpValue::Null => false, // IS NULL/IS NOT NULL already dispatched; Null value otherwise invalid
+        CmpValue::Null => false,
+        CmpValue::StringList(list) => {
+            let lhs = match field_val.as_str() {
+                Some(s) => s,
+                None => return false,
+            };
+            match pred.op {
+                CmpOp::In => list.iter().any(|v| v == lhs),
+                CmpOp::NotIn => list.iter().all(|v| v != lhs),
+                _ => false, // StringList only valid for In/NotIn
+            }
+        }
     }
 }
 
