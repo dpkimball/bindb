@@ -265,7 +265,7 @@ fn project_parse_single_field() {
     let q = SqlProjectQuery::parse("SELECT PAYLOAD_FIELD('name') FROM 'obs://proj'").unwrap();
     assert_eq!(q.fields, vec!["name"]);
     assert_eq!(q.namespace, "obs://proj");
-    assert_eq!(q.id_prefix, None);
+    assert_eq!(q.id_filter, None);
     assert_eq!(q.limit, None);
 }
 
@@ -281,10 +281,13 @@ fn project_parse_multi_field() {
 #[test]
 fn project_parse_with_where_and_limit() {
     let q = SqlProjectQuery::parse(
-        "SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id STARTS WITH ':a' LIMIT 5",
+        "SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id STARTS WITH 'a' LIMIT 5",
     )
     .unwrap();
-    assert_eq!(q.id_prefix, Some(":a".into()));
+    assert_eq!(
+        q.id_filter,
+        Some(bindb::SqlIdFilter::StartsWith("a".into()))
+    );
     assert_eq!(q.limit, Some(5));
 }
 
@@ -370,9 +373,67 @@ fn project_where_filter_narrows_results() {
     build_projection_store(&store);
 
     let rows = store
-        .sql_project("SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id STARTS WITH ':a'")
+        .sql_project("SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id STARTS WITH 'a'")
         .unwrap();
 
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("alice"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_where_id_ends_with() {
+    // IDs: obs://proj:a, :b, :c — ENDS WITH 'c' → only carol
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id ENDS WITH 'c'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_where_id_contains() {
+    // IDs: obs://proj:a, :b, :c — CONTAINS 'b' → only bob
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id CONTAINS 'b'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("bob"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_where_id_equals() {
+    // Exact match — id = 'a' → only alice
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id = 'a'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("alice"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_where_id_and_payload_filter() {
+    // WHERE id STARTS WITH 'a' AND PAYLOAD_FIELD('score') > 5 → alice only
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://proj' WHERE id STARTS WITH 'a' AND PAYLOAD_FIELD('score') > 5",
+        )
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("alice"));
     store.close().unwrap();
@@ -913,7 +974,7 @@ fn project_payload_filter_parse_roundtrip() {
             value: SqlPayloadValue::Num(10.0),
         })
     );
-    assert_eq!(q.id_prefix, None);
+    assert_eq!(q.id_filter, None);
 }
 
 // ── WHERE PAYLOAD_FIELD filter for sql_aggregate (issue #5) ──────────────────
@@ -1161,5 +1222,5 @@ fn project_order_by_parse_roundtrip() {
         })
     );
     assert_eq!(q.limit, Some(10));
-    assert_eq!(q.id_prefix, None);
+    assert_eq!(q.id_filter, None);
 }

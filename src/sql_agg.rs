@@ -907,7 +907,8 @@ pub struct SqlProjectQuery {
     /// Field names to extract from each observation's JSON payload.
     pub fields: Vec<String>,
     pub namespace: String,
-    pub id_prefix: Option<String>,
+    /// Optional `WHERE id ...` filter applied to object_id suffix after namespace prefix.
+    pub id_filter: Option<SqlIdFilter>,
     /// Optional `WHERE PAYLOAD_FIELD('f') OP value` filter.
     pub payload_filter: Option<SqlPayloadFilter>,
     /// Optional `ORDER BY PAYLOAD_FIELD('f') [ASC|DESC]` sort.
@@ -964,7 +965,7 @@ impl SqlProjectQuery {
         let (namespace, rest) = parse_quoted(s)?;
         s = rest.trim_start();
 
-        let (id_prefix, payload_filter) = if starts_with_keyword(s, "WHERE") {
+        let (id_filter, payload_filter) = if starts_with_keyword(s, "WHERE") {
             let after_where = skip_keyword(s, "WHERE").trim_start();
             let su = after_where.to_ascii_uppercase();
             if su.starts_with("PAYLOAD_FIELD(") {
@@ -973,14 +974,23 @@ impl SqlProjectQuery {
                 (None, Some(pf))
             } else {
                 let (filter, rest2) = parse_where_id_filter(after_where)?;
-                s = rest2.trim_start();
-                let prefix = match filter {
-                    SqlIdFilter::StartsWith(p) => p,
-                    SqlIdFilter::Equals(p) => p,
-                    SqlIdFilter::EndsWith(p) => p,
-                    SqlIdFilter::Contains(p) => p,
-                };
-                (Some(prefix), None)
+                let rest2 = rest2.trim_start();
+                // Optional AND PAYLOAD_FIELD(...) after the id filter
+                if starts_with_keyword(rest2, "AND") {
+                    let after_and = skip_keyword(rest2, "AND").trim_start();
+                    let su2 = after_and.to_ascii_uppercase();
+                    if su2.starts_with("PAYLOAD_FIELD(") {
+                        let (pf, rem2) = parse_payload_filter(after_and)?;
+                        s = rem2.trim_start();
+                        (Some(filter), Some(pf))
+                    } else {
+                        s = rest2;
+                        (Some(filter), None)
+                    }
+                } else {
+                    s = rest2;
+                    (Some(filter), None)
+                }
             }
         } else {
             (None, None)
@@ -1043,7 +1053,7 @@ impl SqlProjectQuery {
         Ok(SqlProjectQuery {
             fields,
             namespace,
-            id_prefix,
+            id_filter,
             payload_filter,
             order_by,
             limit,
@@ -1086,9 +1096,21 @@ impl BinderStore {
     ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError> {
         let versions = self.list(&q.namespace)?;
 
+        let ns_prefix = format!("{}:", q.namespace);
         let iter = versions.iter().filter(|v| {
-            if let Some(prefix) = &q.id_prefix {
-                if !v.object_id.0.contains(prefix.as_str()) {
+            if let Some(ref f) = q.id_filter {
+                let id = v
+                    .object_id
+                    .0
+                    .strip_prefix(ns_prefix.as_str())
+                    .unwrap_or(&v.object_id.0);
+                let ok = match f {
+                    SqlIdFilter::StartsWith(s) => id.starts_with(s.as_str()),
+                    SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
+                    SqlIdFilter::Contains(s) => id.contains(s.as_str()),
+                    SqlIdFilter::Equals(s) => id == s.as_str(),
+                };
+                if !ok {
                     return false;
                 }
             }
