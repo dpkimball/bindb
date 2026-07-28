@@ -1357,3 +1357,80 @@ fn project_select_id_only_parse() {
     assert!(q.return_id);
     assert!(q.fields.is_empty());
 }
+
+// ── LIKE for sql_project and sql_aggregate (issue #5) ────────────────────────
+
+#[test]
+fn project_like_prefix() {
+    // LIKE 'alice%' → only alice row
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('name') LIKE 'alice%'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("alice"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_like_suffix() {
+    // LIKE '%ol' → carol
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('name') LIKE '%ol'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_like_both_percent() {
+    // LIKE '%o%' → bob, carol (both contain 'o')
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('name') LIKE '%o%'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let names: std::collections::HashSet<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
+    assert!(names.contains("bob") && names.contains("carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_like_parse_roundtrip() {
+    use bindb::{SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' WHERE PAYLOAD_FIELD('name') LIKE 'a%'",
+    )
+    .unwrap();
+    assert_eq!(
+        q.payload_filter,
+        Some(SqlPayloadFilter {
+            field: "name".into(),
+            op: SqlPayloadOp::Like,
+            value: SqlPayloadValue::Str("a%".into()),
+        })
+    );
+}
+
+#[test]
+fn agg_like_counts_matching() {
+    // COUNT(*) WHERE PAYLOAD_FIELD('name') LIKE '%o%' → 2 (bob, carol)
+    let (store, _dir) = build_payload_filter_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://users' WHERE PAYLOAD_FIELD('name') LIKE '%o%'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 2);
+    store.close().unwrap();
+}

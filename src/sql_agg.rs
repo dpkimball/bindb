@@ -536,6 +536,8 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
             SqlPayloadOp::Contains,
             skip_keyword(after_close, "CONTAINS"),
         )
+    } else if starts_with_keyword(after_close, "LIKE") {
+        (SqlPayloadOp::Like, skip_keyword(after_close, "LIKE"))
     } else if starts_with_keyword(after_close, "IS NOT NULL") {
         return Ok((
             SqlPayloadFilter {
@@ -607,6 +609,30 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
     ))
 }
 
+/// SQL LIKE pattern matching: `%` = any char sequence, `_` = exactly one char.
+fn sql_like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (tn, pn) = (t.len(), p.len());
+    let mut dp = vec![vec![false; pn + 1]; tn + 1];
+    dp[0][0] = true;
+    for j in 1..=pn {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
+    }
+    for i in 1..=tn {
+        for j in 1..=pn {
+            dp[i][j] = match p[j - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && t[i - 1] == c,
+            };
+        }
+    }
+    dp[tn][pn]
+}
+
 /// Apply a `SqlPayloadFilter` to a raw observation payload. Returns `true` if the
 /// observation passes the filter, `false` if it should be excluded.
 fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bool {
@@ -652,6 +678,7 @@ fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bo
                         SqlPayloadOp::StartsWith => field_str.starts_with(s.as_str()),
                         SqlPayloadOp::EndsWith => field_str.ends_with(s.as_str()),
                         SqlPayloadOp::Contains => field_str.contains(s.as_str()),
+                        SqlPayloadOp::Like => sql_like_match(field_str, s.as_str()),
                         _ => false,
                     }
                 }
@@ -863,6 +890,8 @@ pub enum SqlPayloadOp {
     Contains,
     IsNull,
     IsNotNull,
+    /// `LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
+    Like,
 }
 
 /// A value to compare against in a `WHERE PAYLOAD_FIELD` filter.
