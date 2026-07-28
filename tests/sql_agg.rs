@@ -1022,3 +1022,144 @@ fn agg_payload_filter_parse_roundtrip() {
     );
     assert_eq!(q.id_filter, None);
 }
+
+// ── ORDER BY PAYLOAD_FIELD for sql_project (issue #5) ────────────────────────
+
+fn build_order_by_store() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://items:1"),
+        br#"{"name":"banana","price":1.5}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://items:2"),
+        br#"{"name":"apple","price":3.0}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://items:3"),
+        br#"{"name":"cherry","price":0.5}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://items:4"),
+        br#"{"name":"date","price":2.0}"#.to_vec(),
+    );
+    store.commit(tx, "test", "seed").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn project_order_by_numeric_asc() {
+    let (store, _dir) = build_order_by_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('price') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('price') ASC",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["cherry", "banana", "date", "apple"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_order_by_numeric_desc() {
+    let (store, _dir) = build_order_by_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('price') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('price') DESC",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["apple", "date", "banana", "cherry"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_order_by_string_asc() {
+    let (store, _dir) = build_order_by_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('name') ASC",
+        )
+        .unwrap();
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["apple", "banana", "cherry", "date"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_order_by_with_limit() {
+    // Order by price DESC then take top 2 → apple (3.0), date (2.0)
+    let (store, _dir) = build_order_by_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('price') DESC LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["apple", "date"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_order_by_null_sorts_last() {
+    // One item has no price; nulls should sort after all real values when ASC.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://things:1"),
+        br#"{"name":"z","price":5.0}"#.to_vec(),
+    );
+    tx.put_object(oid("obs://things:2"), br#"{"name":"a"}"#.to_vec()); // no price
+    tx.put_object(
+        oid("obs://things:3"),
+        br#"{"name":"m","price":2.0}"#.to_vec(),
+    );
+    store.commit(tx, "test", "seed").unwrap();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('price') FROM 'obs://things' ORDER BY PAYLOAD_FIELD('price') ASC",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    // null price should be last
+    let last = rows.last().unwrap();
+    assert_eq!(last.get("price"), Some(&serde_json::Value::Null));
+    assert_eq!(last.get("name").and_then(|v| v.as_str()), Some("a"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_order_by_parse_roundtrip() {
+    use bindb::{AggOrderDirection, SqlProjectOrderBy, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' ORDER BY PAYLOAD_FIELD('score') DESC LIMIT 10",
+    )
+    .unwrap();
+    assert_eq!(
+        q.order_by,
+        Some(SqlProjectOrderBy {
+            field: "score".into(),
+            direction: AggOrderDirection::Desc,
+        })
+    );
+    assert_eq!(q.limit, Some(10));
+    assert_eq!(q.id_prefix, None);
+}

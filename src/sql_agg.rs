@@ -881,7 +881,17 @@ pub struct SqlPayloadFilter {
     pub value: SqlPayloadValue,
 }
 
-/// A parsed `SELECT PAYLOAD_FIELD(…) [, …] FROM … [WHERE …] [LIMIT n]` query.
+/// Sort direction for `ORDER BY` in a projection query.
+pub use AggOrderDirection as SqlProjectDirection;
+
+/// `ORDER BY PAYLOAD_FIELD('field') [ASC|DESC]` sort clause for `SqlProjectQuery`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlProjectOrderBy {
+    pub field: String,
+    pub direction: AggOrderDirection,
+}
+
+/// A parsed `SELECT PAYLOAD_FIELD(…) [, …] FROM … [WHERE …] [ORDER BY …] [LIMIT n]` query.
 ///
 /// Returns one row per matching observation; each row holds the projected field
 /// values as JSON. Missing or non-JSON fields become `null`.
@@ -890,7 +900,7 @@ pub struct SqlPayloadFilter {
 /// SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('score') FROM 'obs://activities'
 /// SELECT PAYLOAD_FIELD('category') FROM 'obs://items' WHERE id STARTS WITH '2024' LIMIT 100
 /// SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('status') = 'active'
-/// SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('score') FROM 'obs://items' WHERE PAYLOAD_FIELD('score') >= 10 LIMIT 5
+/// SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('score') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('score') DESC LIMIT 5
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlProjectQuery {
@@ -900,6 +910,8 @@ pub struct SqlProjectQuery {
     pub id_prefix: Option<String>,
     /// Optional `WHERE PAYLOAD_FIELD('f') OP value` filter.
     pub payload_filter: Option<SqlPayloadFilter>,
+    /// Optional `ORDER BY PAYLOAD_FIELD('f') [ASC|DESC]` sort.
+    pub order_by: Option<SqlProjectOrderBy>,
     pub limit: Option<usize>,
 }
 
@@ -974,6 +986,40 @@ impl SqlProjectQuery {
             (None, None)
         };
 
+        let order_by = if starts_with_keyword(s, "ORDER") {
+            let after_order = skip_keyword(s, "ORDER").trim_start();
+            if !starts_with_keyword(after_order, "BY") {
+                return Err(SqlAggError::Unsupported("expected ORDER BY".into()));
+            }
+            let after_by = skip_keyword(after_order, "BY").trim_start();
+            let su = after_by.to_ascii_uppercase();
+            if !su.starts_with("PAYLOAD_FIELD(") {
+                return Err(SqlAggError::Unsupported(
+                    "ORDER BY must be PAYLOAD_FIELD('field')".into(),
+                ));
+            }
+            let after_pf = &after_by["PAYLOAD_FIELD(".len()..];
+            let (field, rest2) = parse_quoted_sql(after_pf)?;
+            let rest2 = rest2.trim_start();
+            if !rest2.starts_with(')') {
+                return Err(SqlAggError::Unsupported(
+                    "expected ')' after PAYLOAD_FIELD in ORDER BY".into(),
+                ));
+            }
+            let rest2 = rest2[1..].trim_start();
+            let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
+                (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
+            } else if starts_with_keyword(rest2, "ASC") {
+                (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+            } else {
+                (AggOrderDirection::Asc, rest2)
+            };
+            s = rest2.trim_start();
+            Some(SqlProjectOrderBy { field, direction })
+        } else {
+            None
+        };
+
         let limit = if starts_with_keyword(s, "LIMIT") {
             let after_limit = skip_keyword(s, "LIMIT").trim_start();
             let end = after_limit
@@ -999,6 +1045,7 @@ impl SqlProjectQuery {
             namespace,
             id_prefix,
             payload_filter,
+            order_by,
             limit,
         })
     }
@@ -1053,23 +1100,73 @@ impl BinderStore {
             true
         });
 
+        // When ORDER BY references a field not in SELECT, we need to project it
+        // temporarily for sorting, then strip it from the output rows.
+        let sort_key_extra = q
+            .order_by
+            .as_ref()
+            .filter(|ob| !q.fields.contains(&ob.field))
+            .map(|ob| ob.field.clone());
+
         let mut rows: Vec<std::collections::HashMap<String, serde_json::Value>> = iter
             .map(|v| {
-                q.fields
+                let mut row: std::collections::HashMap<String, serde_json::Value> = q
+                    .fields
                     .iter()
                     .map(|field| {
                         let val = project_payload_field(v.payload.as_deref(), field);
                         (field.clone(), val)
                     })
-                    .collect()
+                    .collect();
+                if let Some(ref sk) = sort_key_extra {
+                    row.insert(sk.clone(), project_payload_field(v.payload.as_deref(), sk));
+                }
+                row
             })
             .collect();
+
+        if let Some(ob) = &q.order_by {
+            let field = ob.field.clone();
+            let desc = ob.direction == AggOrderDirection::Desc;
+            rows.sort_by(|a, b| {
+                let av = a.get(&field).cloned().unwrap_or(serde_json::Value::Null);
+                let bv = b.get(&field).cloned().unwrap_or(serde_json::Value::Null);
+                let ord = compare_json_for_sort(&av, &bv);
+                if desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+        }
+
+        // Remove the temporary sort key if it wasn't in the original SELECT list.
+        if let Some(ref sk) = sort_key_extra {
+            for row in &mut rows {
+                row.remove(sk);
+            }
+        }
 
         if let Some(limit) = q.limit {
             rows.truncate(limit);
         }
 
         Ok(rows)
+    }
+}
+
+fn compare_json_for_sort(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (serde_json::Value::Number(na), serde_json::Value::Number(nb)) => {
+            let fa = na.as_f64().unwrap_or(f64::NAN);
+            let fb = nb.as_f64().unwrap_or(f64::NAN);
+            fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (serde_json::Value::String(sa), serde_json::Value::String(sb)) => sa.cmp(sb),
+        (serde_json::Value::Null, serde_json::Value::Null) => std::cmp::Ordering::Equal,
+        (serde_json::Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, serde_json::Value::Null) => std::cmp::Ordering::Less,
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
