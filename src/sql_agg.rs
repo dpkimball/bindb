@@ -246,9 +246,9 @@ fn parse_quoted_sql(s: &str) -> Result<(String, &str), SqlAggError> {
         ));
     }
     let rest = &s[quote.len_utf8()..];
-    let end = rest.find(quote).ok_or_else(|| {
-        SqlAggError::Unsupported("unclosed string in PAYLOAD_FIELD".into())
-    })?;
+    let end = rest
+        .find(quote)
+        .ok_or_else(|| SqlAggError::Unsupported("unclosed string in PAYLOAD_FIELD".into()))?;
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
 }
 
@@ -323,9 +323,7 @@ impl BinderStore {
             }
             SqlGroupBy::PayloadField(field) => {
                 let field = field.clone();
-                builder.group_by(move |v| {
-                    payload_field_group_key(v.payload.as_deref(), &field)
-                })
+                builder.group_by(move |v| payload_field_group_key(v.payload.as_deref(), &field))
             }
         };
 

@@ -352,8 +352,7 @@ impl GraphIrQuery {
             let after_with_kw = skip_keyword(after_preds2, "WITH");
             if is_agg_func_start(after_with_kw) {
                 // Aggregating: WITH count(b) AS cnt [, …] [GROUP BY b.f1 [, b.f2 …]]
-                let (aggs, group_by_fields, after_aggs) =
-                    parse_with_aggregations(after_with_kw)?;
+                let (aggs, group_by_fields, after_aggs) = parse_with_aggregations(after_with_kw)?;
                 let wc = GraphIrWithClause {
                     end_pred: NodeIdPred::Any,
                     payload_preds: vec![],
@@ -954,25 +953,24 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
     let after_paren = after_paren.trim_start();
 
     // Parse argument: b.field (for sum/avg/min/max) or b (for count).
-    let (field, after_arg) =
-        if after_paren.starts_with("b.") || after_paren.starts_with("B.") {
-            let rest = &after_paren[2..];
-            let field_end = rest
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(rest.len());
-            if field_end == 0 {
-                return Err(GraphIrError::Unsupported(
-                    "expected field name after b. in aggregation argument".into(),
-                ));
-            }
-            (Some(rest[..field_end].to_string()), &rest[field_end..])
-        } else if after_paren.starts_with('b') || after_paren.starts_with('B') {
-            (None, &after_paren[1..])
-        } else {
+    let (field, after_arg) = if after_paren.starts_with("b.") || after_paren.starts_with("B.") {
+        let rest = &after_paren[2..];
+        let field_end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if field_end == 0 {
             return Err(GraphIrError::Unsupported(
-                "aggregation argument must be 'b' or 'b.field'".into(),
+                "expected field name after b. in aggregation argument".into(),
             ));
-        };
+        }
+        (Some(rest[..field_end].to_string()), &rest[field_end..])
+    } else if after_paren.starts_with('b') || after_paren.starts_with('B') {
+        (None, &after_paren[1..])
+    } else {
+        return Err(GraphIrError::Unsupported(
+            "aggregation argument must be 'b' or 'b.field'".into(),
+        ));
+    };
 
     let after_arg = after_arg.trim_start();
     if !after_arg.starts_with(')') {
@@ -983,7 +981,10 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
     let after_close = after_arg[1..].trim_start();
 
     // Require field for sum/avg/min/max.
-    if matches!(func, AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max) && field.is_none()
+    if matches!(
+        func,
+        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
+    ) && field.is_none()
     {
         return Err(GraphIrError::Unsupported(
             "sum/avg/min/max require a field argument, e.g. sum(b.score)".into(),
@@ -1666,9 +1667,7 @@ fn extract_numeric_field(payload: Option<&[u8]>, field: &str) -> Option<f64> {
 /// Compute a single aggregation over the matched nodes.
 fn compute_aggregation(matches: &[GraphQueryMatch], agg: &WithAggregation) -> serde_json::Value {
     match &agg.func {
-        AggFunc::Count => {
-            serde_json::Value::Number(serde_json::Number::from(matches.len() as u64))
-        }
+        AggFunc::Count => serde_json::Value::Number(serde_json::Number::from(matches.len() as u64)),
         AggFunc::Sum => {
             let field = agg.field.as_deref().unwrap_or("");
             let sum: f64 = matches
@@ -1753,9 +1752,7 @@ fn compute_aggregation_slice(
     agg: &WithAggregation,
 ) -> serde_json::Value {
     match &agg.func {
-        AggFunc::Count => {
-            serde_json::Value::Number(serde_json::Number::from(group.len() as u64))
-        }
+        AggFunc::Count => serde_json::Value::Number(serde_json::Number::from(group.len() as u64)),
         AggFunc::Sum => {
             let field = agg.field.as_deref().unwrap_or("");
             let sum: f64 = group
@@ -2064,9 +2061,12 @@ impl BinderStore {
             message: e.to_string(),
         })?;
 
-        let with_clause = q.with_clause.as_ref().ok_or_else(|| StoreError::InvalidArgument {
-            message: GraphIrError::NoAggregation.to_string(),
-        })?;
+        let with_clause = q
+            .with_clause
+            .as_ref()
+            .ok_or_else(|| StoreError::InvalidArgument {
+                message: GraphIrError::NoAggregation.to_string(),
+            })?;
 
         if with_clause.aggregations.is_empty() {
             return Err(StoreError::InvalidArgument {
@@ -2099,8 +2099,7 @@ impl BinderStore {
             let mut rows = Vec::with_capacity(group_keys.len());
             for key in &group_keys {
                 let indices = &group_indices[key];
-                let group: Vec<&GraphQueryMatch> =
-                    indices.iter().map(|&i| &matches[i]).collect();
+                let group: Vec<&GraphQueryMatch> = indices.iter().map(|&i| &matches[i]).collect();
 
                 let mut row = std::collections::HashMap::new();
                 // Re-extract each individual field value from the first member of
@@ -2113,10 +2112,7 @@ impl BinderStore {
                     }
                 }
                 for agg in &with_clause.aggregations {
-                    row.insert(
-                        agg.alias.clone(),
-                        compute_aggregation_slice(&group, agg),
-                    );
+                    row.insert(agg.alias.clone(), compute_aggregation_slice(&group, agg));
                 }
                 rows.push(row);
             }

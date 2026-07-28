@@ -1677,7 +1677,10 @@ fn agg_parse_existing_with_still_works() {
     .unwrap();
 
     let wc = q.with_clause.as_ref().unwrap();
-    assert!(wc.aggregations.is_empty(), "pass-through WITH has no aggregations");
+    assert!(
+        wc.aggregations.is_empty(),
+        "pass-through WITH has no aggregations"
+    );
     assert_eq!(wc.payload_preds.len(), 1);
     assert_eq!(wc.limit, Some(2));
 }
@@ -1875,9 +1878,18 @@ fn agg_avg_min_max_null_when_no_valid_field() {
         .unwrap();
 
     let row = &result[0];
-    assert!(row.get("a").map(|v| v.is_null()).unwrap_or(false), "avg of missing field is null");
-    assert!(row.get("lo").map(|v| v.is_null()).unwrap_or(false), "min of missing field is null");
-    assert!(row.get("hi").map(|v| v.is_null()).unwrap_or(false), "max of missing field is null");
+    assert!(
+        row.get("a").map(|v| v.is_null()).unwrap_or(false),
+        "avg of missing field is null"
+    );
+    assert!(
+        row.get("lo").map(|v| v.is_null()).unwrap_or(false),
+        "min of missing field is null"
+    );
+    assert!(
+        row.get("hi").map(|v| v.is_null()).unwrap_or(false),
+        "max of missing field is null"
+    );
     store.close().unwrap();
 }
 
@@ -1889,12 +1901,13 @@ fn agg_no_aggregating_with_returns_error() {
     build_optional_graph(&store);
 
     let err = store
-        .graph_ir_aggregated(
-            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' RETURN b",
-        )
+        .graph_ir_aggregated("MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' RETURN b")
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("aggregat"), "error should mention aggregation, got: {msg}");
+    assert!(
+        msg.contains("aggregat"),
+        "error should mention aggregation, got: {msg}"
+    );
     store.close().unwrap();
 }
 
@@ -1936,13 +1949,13 @@ fn build_grouped_graph(store: &BinderStore) {
     //   other:  rock (score=1)
     let mut tx = Transaction::new();
     tx.put_object(obj("h://root"), b"{}".to_vec());
-    tx.put_object(obj("n://cat"),  br#"{"type":"animal","score":2}"#.to_vec());
-    tx.put_object(obj("n://dog"),  br#"{"type":"animal","score":4}"#.to_vec());
+    tx.put_object(obj("n://cat"), br#"{"type":"animal","score":2}"#.to_vec());
+    tx.put_object(obj("n://dog"), br#"{"type":"animal","score":4}"#.to_vec());
     tx.put_object(obj("n://rose"), br#"{"type":"plant","score":6}"#.to_vec());
     tx.put_object(obj("n://fern"), br#"{"type":"plant","score":8}"#.to_vec());
     tx.put_object(obj("n://rock"), br#"{"type":"other","score":1}"#.to_vec());
-    tx.put_edge(eid("e1"), obj("h://root"), obj("n://cat"),  "LINKS", None);
-    tx.put_edge(eid("e2"), obj("h://root"), obj("n://dog"),  "LINKS", None);
+    tx.put_edge(eid("e1"), obj("h://root"), obj("n://cat"), "LINKS", None);
+    tx.put_edge(eid("e2"), obj("h://root"), obj("n://dog"), "LINKS", None);
     tx.put_edge(eid("e3"), obj("h://root"), obj("n://rose"), "LINKS", None);
     tx.put_edge(eid("e4"), obj("h://root"), obj("n://fern"), "LINKS", None);
     tx.put_edge(eid("e5"), obj("h://root"), obj("n://rock"), "LINKS", None);
@@ -2047,8 +2060,13 @@ fn agg_grouped_null_group_for_missing_field() {
         .unwrap();
 
     assert_eq!(rows.len(), 2, "X group + null group");
-    let null_row = rows.iter().find(|r| r.get("type").map(|v| v.is_null()).unwrap_or(false));
-    assert!(null_row.is_some(), "null group exists for nodes without type field");
+    let null_row = rows
+        .iter()
+        .find(|r| r.get("type").map(|v| v.is_null()).unwrap_or(false));
+    assert!(
+        null_row.is_some(),
+        "null group exists for nodes without type field"
+    );
     assert_eq!(null_row.unwrap().get("n").and_then(|v| v.as_u64()), Some(1));
     store.close().unwrap();
 }
@@ -2083,18 +2101,72 @@ fn build_multikey_graph(store: &BinderStore) {
     //   (null, active): rock (score=1) — missing type field
     let mut tx = Transaction::new();
     tx.put_object(obj("h://mk_root"), b"{}".to_vec());
-    tx.put_object(obj("n://mk/cat"),  br#"{"type":"animal","status":"active","score":2}"#.to_vec());
-    tx.put_object(obj("n://mk/dog"),  br#"{"type":"animal","status":"active","score":4}"#.to_vec());
-    tx.put_object(obj("n://mk/wolf"), br#"{"type":"animal","status":"retired","score":3}"#.to_vec());
-    tx.put_object(obj("n://mk/rose"), br#"{"type":"plant","status":"active","score":6}"#.to_vec());
-    tx.put_object(obj("n://mk/fern"), br#"{"type":"plant","status":"retired","score":8}"#.to_vec());
-    tx.put_object(obj("n://mk/rock"), br#"{"status":"active","score":1}"#.to_vec());
-    tx.put_edge(eid("ek1"), obj("h://mk_root"), obj("n://mk/cat"),  "MK", None);
-    tx.put_edge(eid("ek2"), obj("h://mk_root"), obj("n://mk/dog"),  "MK", None);
-    tx.put_edge(eid("ek3"), obj("h://mk_root"), obj("n://mk/wolf"), "MK", None);
-    tx.put_edge(eid("ek4"), obj("h://mk_root"), obj("n://mk/rose"), "MK", None);
-    tx.put_edge(eid("ek5"), obj("h://mk_root"), obj("n://mk/fern"), "MK", None);
-    tx.put_edge(eid("ek6"), obj("h://mk_root"), obj("n://mk/rock"), "MK", None);
+    tx.put_object(
+        obj("n://mk/cat"),
+        br#"{"type":"animal","status":"active","score":2}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("n://mk/dog"),
+        br#"{"type":"animal","status":"active","score":4}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("n://mk/wolf"),
+        br#"{"type":"animal","status":"retired","score":3}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("n://mk/rose"),
+        br#"{"type":"plant","status":"active","score":6}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("n://mk/fern"),
+        br#"{"type":"plant","status":"retired","score":8}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("n://mk/rock"),
+        br#"{"status":"active","score":1}"#.to_vec(),
+    );
+    tx.put_edge(
+        eid("ek1"),
+        obj("h://mk_root"),
+        obj("n://mk/cat"),
+        "MK",
+        None,
+    );
+    tx.put_edge(
+        eid("ek2"),
+        obj("h://mk_root"),
+        obj("n://mk/dog"),
+        "MK",
+        None,
+    );
+    tx.put_edge(
+        eid("ek3"),
+        obj("h://mk_root"),
+        obj("n://mk/wolf"),
+        "MK",
+        None,
+    );
+    tx.put_edge(
+        eid("ek4"),
+        obj("h://mk_root"),
+        obj("n://mk/rose"),
+        "MK",
+        None,
+    );
+    tx.put_edge(
+        eid("ek5"),
+        obj("h://mk_root"),
+        obj("n://mk/fern"),
+        "MK",
+        None,
+    );
+    tx.put_edge(
+        eid("ek6"),
+        obj("h://mk_root"),
+        obj("n://mk/rock"),
+        "MK",
+        None,
+    );
     store.commit(tx, "test", "").unwrap();
 }
 
@@ -2137,24 +2209,34 @@ fn agg_multikey_count_per_type_status() {
         })
     };
     assert_eq!(
-        find(Some("animal"), "active").and_then(|r| r.get("n")).and_then(|v| v.as_u64()),
+        find(Some("animal"), "active")
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64()),
         Some(2)
     );
     assert_eq!(
-        find(Some("animal"), "retired").and_then(|r| r.get("n")).and_then(|v| v.as_u64()),
+        find(Some("animal"), "retired")
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64()),
         Some(1)
     );
     assert_eq!(
-        find(Some("plant"), "active").and_then(|r| r.get("n")).and_then(|v| v.as_u64()),
+        find(Some("plant"), "active")
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64()),
         Some(1)
     );
     assert_eq!(
-        find(Some("plant"), "retired").and_then(|r| r.get("n")).and_then(|v| v.as_u64()),
+        find(Some("plant"), "retired")
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64()),
         Some(1)
     );
     // rock has no type → null group
     assert_eq!(
-        find(None, "active").and_then(|r| r.get("n")).and_then(|v| v.as_u64()),
+        find(None, "active")
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64()),
         Some(1)
     );
     store.close().unwrap();
@@ -2184,11 +2266,26 @@ fn agg_multikey_sum_per_type_status() {
             .and_then(|r| r.get("s"))
             .and_then(|v| v.as_f64())
     };
-    assert!((get_sum(Some("animal"), "active").unwrap() - 6.0).abs() < 1e-9, "cat+dog");
-    assert!((get_sum(Some("animal"), "retired").unwrap() - 3.0).abs() < 1e-9, "wolf");
-    assert!((get_sum(Some("plant"), "active").unwrap() - 6.0).abs() < 1e-9, "rose");
-    assert!((get_sum(Some("plant"), "retired").unwrap() - 8.0).abs() < 1e-9, "fern");
-    assert!((get_sum(None, "active").unwrap() - 1.0).abs() < 1e-9, "rock");
+    assert!(
+        (get_sum(Some("animal"), "active").unwrap() - 6.0).abs() < 1e-9,
+        "cat+dog"
+    );
+    assert!(
+        (get_sum(Some("animal"), "retired").unwrap() - 3.0).abs() < 1e-9,
+        "wolf"
+    );
+    assert!(
+        (get_sum(Some("plant"), "active").unwrap() - 6.0).abs() < 1e-9,
+        "rose"
+    );
+    assert!(
+        (get_sum(Some("plant"), "retired").unwrap() - 8.0).abs() < 1e-9,
+        "fern"
+    );
+    assert!(
+        (get_sum(None, "active").unwrap() - 1.0).abs() < 1e-9,
+        "rock"
+    );
     store.close().unwrap();
 }
 
@@ -2227,7 +2324,10 @@ fn agg_multikey_both_fields_null_group() {
 
     let mut tx = Transaction::new();
     tx.put_object(obj("h://mk2"), b"{}".to_vec());
-    tx.put_object(obj("n://mk2/a"), br#"{"type":"X","status":"Y","score":10}"#.to_vec());
+    tx.put_object(
+        obj("n://mk2/a"),
+        br#"{"type":"X","status":"Y","score":10}"#.to_vec(),
+    );
     tx.put_object(obj("n://mk2/b"), br#"{"score":5}"#.to_vec()); // missing both
     tx.put_edge(eid("ek_a"), obj("h://mk2"), obj("n://mk2/a"), "MK2", None);
     tx.put_edge(eid("ek_b"), obj("h://mk2"), obj("n://mk2/b"), "MK2", None);
@@ -2247,6 +2347,9 @@ fn agg_multikey_both_fields_null_group() {
         .find(|r| r.get("type").map(|v| v.is_null()).unwrap_or(false))
         .expect("null,null group");
     assert_eq!(null_group.get("n").and_then(|v| v.as_u64()), Some(1));
-    assert!(null_group.get("status").map(|v| v.is_null()).unwrap_or(false));
+    assert!(null_group
+        .get("status")
+        .map(|v| v.is_null())
+        .unwrap_or(false));
     store.close().unwrap();
 }

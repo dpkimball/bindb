@@ -131,9 +131,7 @@ fn payload_field_count_per_category() {
     build_activity_store(&store);
 
     let results = store
-        .sql_aggregate(
-            "SELECT COUNT(*) FROM 'obs://activity' GROUP BY PAYLOAD_FIELD('category')",
-        )
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://activity' GROUP BY PAYLOAD_FIELD('category')")
         .unwrap();
 
     let find = |key: Option<&str>| {
@@ -145,7 +143,11 @@ fn payload_field_count_per_category() {
     assert_eq!(find(Some("run")), Some(2));
     assert_eq!(find(Some("bike")), Some(1));
     assert_eq!(find(Some("swim")), Some(1));
-    assert_eq!(find(None), Some(1), "missing-field observations in None group");
+    assert_eq!(
+        find(None),
+        Some(1),
+        "missing-field observations in None group"
+    );
     store.close().unwrap();
 }
 
@@ -162,7 +164,9 @@ fn payload_field_double_quoted_field_name() {
         )
         .unwrap();
 
-    assert!(results.iter().any(|r| r.group_key.as_deref() == Some("run")));
+    assert!(results
+        .iter()
+        .any(|r| r.group_key.as_deref() == Some("run")));
     store.close().unwrap();
 }
 
@@ -295,7 +299,10 @@ fn project_single_field_returns_all_rows() {
         .unwrap();
 
     assert_eq!(rows.len(), 3);
-    let names: Vec<_> = rows.iter().filter_map(|r| r.get("name")?.as_str()).collect();
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
     assert!(names.contains(&"alice"), "alice in results");
     assert!(names.contains(&"bob"), "bob in results");
     assert!(names.contains(&"carol"), "carol in results");
@@ -367,10 +374,7 @@ fn project_where_filter_narrows_results() {
         .unwrap();
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].get("name").and_then(|v| v.as_str()),
-        Some("alice")
-    );
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("alice"));
     store.close().unwrap();
 }
 
