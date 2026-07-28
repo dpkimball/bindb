@@ -1611,7 +1611,7 @@ fn parse_return_spec(
     let mut return_id = false;
     for part in s.split(',') {
         let p = part.trim();
-        let is_path_var = path_var.map_or(false, |v| p.eq_ignore_ascii_case(v));
+        let is_path_var = path_var.is_some_and(|v| p.eq_ignore_ascii_case(v));
         if p.eq_ignore_ascii_case("path") || is_path_var {
             return_path = true;
         } else if p.eq_ignore_ascii_case("id(b)") || p.eq_ignore_ascii_case("id(a)") {
