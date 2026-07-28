@@ -1548,3 +1548,193 @@ fn project_chained_payload_filter_parse_roundtrip() {
         }
     );
 }
+
+// ── BETWEEN for sql_project and sql_aggregate (issue #5) ─────────────────────
+
+fn build_between_sql_store() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (id, score) in [("a", 10), ("b", 20), ("c", 30), ("d", 40), ("e", 50)] {
+        tx.put_object(
+            oid(&format!("obs://scores:{id}")),
+            format!(r#"{{"score":{score}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "seed").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn project_between_filters_range() {
+    let (store, _dir) = build_between_sql_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://scores' WHERE PAYLOAD_FIELD('score') BETWEEN 20 AND 40",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let scores: Vec<i64> = rows
+        .iter()
+        .map(|r| r["score"].as_f64().unwrap() as i64)
+        .collect();
+    assert!(scores.contains(&20) && scores.contains(&30) && scores.contains(&40));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_between_boundary_inclusive() {
+    let (store, _dir) = build_between_sql_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://scores' WHERE PAYLOAD_FIELD('score') BETWEEN 10 AND 10",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["score"].as_f64().unwrap() as i64, 10);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_between_no_match() {
+    let (store, _dir) = build_between_sql_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://scores' WHERE PAYLOAD_FIELD('score') BETWEEN 60 AND 100",
+        )
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_between_count() {
+    let (store, _dir) = build_between_sql_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://scores' WHERE PAYLOAD_FIELD('score') BETWEEN 20 AND 40",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn between_parse_roundtrip_sql() {
+    use bindb::{SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('score') FROM 'obs://x' WHERE PAYLOAD_FIELD('score') BETWEEN 10 AND 50",
+    )
+    .unwrap();
+    assert_eq!(q.payload_filters.len(), 1);
+    assert_eq!(
+        q.payload_filters[0],
+        SqlPayloadFilter {
+            field: "score".into(),
+            op: SqlPayloadOp::Between,
+            value: SqlPayloadValue::NumRange(10.0, 50.0),
+        }
+    );
+}
+
+#[test]
+fn between_chained_with_and_filter() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (id, score, kind) in [
+        ("a", 10u32, "x"),
+        ("b", 20, "y"),
+        ("c", 30, "y"),
+        ("d", 40, "x"),
+        ("e", 50, "x"),
+    ] {
+        tx.put_object(
+            oid(&format!("obs://items:{id}")),
+            format!(r#"{{"score":{score},"kind":"{kind}"}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "seed").unwrap();
+    // BETWEEN 15 AND 45 AND kind = 'y' → b(20) and c(30)
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://items' WHERE PAYLOAD_FIELD('score') BETWEEN 15 AND 45 AND PAYLOAD_FIELD('kind') = 'y'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+// ── OR disjunction for sql_project and sql_aggregate (issue #5) ──────────────
+
+#[test]
+fn project_or_filter_selects_either() {
+    // type='cpu' OR type='memory' → all 5
+    let (store, _dir) = build_agg_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('type') FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu' OR PAYLOAD_FIELD('type') = 'memory'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_or_filter_partial_match() {
+    // type='cpu' OR region='eu' → 4 unique (3 cpu + eu-memory; h2:c1 is both → counted once)
+    let (store, _dir) = build_agg_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('type') FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu' OR PAYLOAD_FIELD('region') = 'eu'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_or_filter_count() {
+    let (store, _dir) = build_agg_payload_filter_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu' OR PAYLOAD_FIELD('type') = 'memory'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 5);
+    store.close().unwrap();
+}
+
+#[test]
+fn or_parse_roundtrip() {
+    use bindb::{
+        SqlFilterCombinator, SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue, SqlProjectQuery,
+    };
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('type') FROM 'obs://x' WHERE PAYLOAD_FIELD('type') = 'a' OR PAYLOAD_FIELD('type') = 'b'",
+    )
+    .unwrap();
+    assert_eq!(q.payload_filters.len(), 2);
+    assert_eq!(q.payload_combinator, SqlFilterCombinator::Or);
+    assert_eq!(
+        q.payload_filters[0],
+        SqlPayloadFilter {
+            field: "type".into(),
+            op: SqlPayloadOp::Eq,
+            value: SqlPayloadValue::Str("a".into()),
+        }
+    );
+}
+
+#[test]
+fn and_parse_preserves_combinator() {
+    use bindb::{SqlFilterCombinator, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('type') FROM 'obs://x' WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'us'",
+    )
+    .unwrap();
+    assert_eq!(q.payload_combinator, SqlFilterCombinator::And);
+    assert_eq!(q.payload_filters.len(), 2);
+}

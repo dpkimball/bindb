@@ -3768,3 +3768,83 @@ fn like_no_match_returns_empty() {
     assert!(results.is_empty());
     store.close().unwrap();
 }
+
+// ── Named path variable `p = (a)-[r]->(b)` (issue #2) ───────────────────────
+
+#[test]
+fn named_path_var_return_path_equivalent() {
+    // `MATCH p = (a)-[:STEP*1..3]->(b) WHERE … RETURN p` must be identical to `RETURN path`
+    use bindb::{BinderStore, GraphIrQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = bindb::Transaction::new();
+    tx.put_object(obj("pv://a"), b"{}".to_vec());
+    tx.put_object(obj("pv://b"), b"{}".to_vec());
+    tx.put_object(obj("pv://c"), b"{}".to_vec());
+    tx.put_edge(eid("pv_e1"), obj("pv://a"), obj("pv://b"), "LINK", None);
+    tx.put_edge(eid("pv_e2"), obj("pv://b"), obj("pv://c"), "LINK", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q_named =
+        GraphIrQuery::parse("MATCH p = (a)-[:LINK*1..3]->(b) WHERE id(a) = 'pv://a' RETURN p")
+            .unwrap();
+    let q_plain =
+        GraphIrQuery::parse("MATCH (a)-[:LINK*1..3]->(b) WHERE id(a) = 'pv://a' RETURN path")
+            .unwrap();
+
+    assert!(q_named.return_path, "named var should set return_path");
+    assert_eq!(q_named.path_var, Some("p".to_string()));
+    assert!(q_plain.path_var.is_none());
+
+    let rows_named = store.graph_ir_projected(&q_named).unwrap();
+    let rows_plain = store.graph_ir_projected(&q_plain).unwrap();
+    assert_eq!(rows_named.len(), rows_plain.len());
+    for (rn, rp) in rows_named.iter().zip(rows_plain.iter()) {
+        assert_eq!(rn.path, rp.path);
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn named_path_var_stored_in_query() {
+    let q =
+        GraphIrQuery::parse("MATCH route = (a)-[:ROAD]->(b) WHERE id(a) = 'x://a' RETURN route")
+            .unwrap();
+    assert_eq!(q.path_var, Some("route".to_string()));
+    assert!(q.return_path);
+}
+
+#[test]
+fn no_named_path_var_when_absent() {
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:ROAD]->(b) WHERE id(a) = 'x://a' RETURN path").unwrap();
+    assert!(q.path_var.is_none());
+    assert!(q.return_path);
+}
+
+#[test]
+fn named_path_var_with_field_projection() {
+    // `MATCH p = (a)-[r]->(b) WHERE … RETURN p, b.name` — path AND field combined
+    use bindb::{BinderStore, GraphIrQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = bindb::Transaction::new();
+    tx.put_object(obj("pv2://a"), b"{}".to_vec());
+    tx.put_object(obj("pv2://b"), br#"{"name":"beta"}"#.to_vec());
+    tx.put_edge(eid("pv2_e1"), obj("pv2://a"), obj("pv2://b"), "E", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse("MATCH p = (a)-[:E]->(b) WHERE id(a) = 'pv2://a' RETURN p, b.name")
+        .unwrap();
+    assert!(q.return_path);
+    assert_eq!(q.return_fields, vec!["name"]);
+
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].path.is_empty());
+    assert_eq!(
+        rows[0].fields.get("name"),
+        Some(&serde_json::Value::String("beta".into()))
+    );
+    store.close().unwrap();
+}
