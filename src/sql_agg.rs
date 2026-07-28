@@ -127,8 +127,10 @@ pub struct SqlAggregateQuery {
     pub needs_value: bool,
     /// Optional `WHERE id ...` filter applied to observation `object_id`.
     pub id_filter: Option<SqlIdFilter>,
-    /// `WHERE PAYLOAD_FIELD('f') OP value` pre-aggregation filters (AND-combined).
+    /// `WHERE PAYLOAD_FIELD('f') OP value` pre-aggregation filters.
     pub payload_filters: Vec<SqlPayloadFilter>,
+    /// How `payload_filters` are combined (AND or OR). Defaults to `And`.
+    pub payload_combinator: SqlFilterCombinator,
     /// Optional post-aggregation filter.
     pub having: Option<HavingClause>,
     /// Optional post-aggregation sort (applied after HAVING).
@@ -161,32 +163,33 @@ impl SqlAggregateQuery {
         let (namespace, rest) = parse_quoted(after_from)?;
         let rest = rest.trim_start();
 
-        // Optional WHERE clause: id filter, payload filter, or both joined with AND.
-        let (id_filter, payload_filters, rest) = if starts_with_keyword(rest, "WHERE") {
-            let after_where = skip_keyword(rest, "WHERE").trim_start();
-            let su = after_where.to_ascii_uppercase();
-            if su.starts_with("PAYLOAD_FIELD(") {
-                let (pfs, remaining) = parse_payload_filter_chain(after_where)?;
-                (None, pfs, remaining)
-            } else {
-                let (filter, remaining) = parse_where_id_filter(after_where)?;
-                let remaining = remaining.trim_start();
-                // Optional AND PAYLOAD_FIELD(...) chain after the id filter
-                if starts_with_keyword(remaining, "AND") {
-                    let after_and = skip_keyword(remaining, "AND").trim_start();
-                    if after_and.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
-                        let (pfs, rem2) = parse_payload_filter_chain(after_and)?;
-                        (Some(filter), pfs, rem2)
-                    } else {
-                        (Some(filter), vec![], remaining)
-                    }
+        // Optional WHERE clause: id filter, payload filter, or both joined with AND/OR.
+        let (id_filter, payload_filters, payload_combinator, rest) =
+            if starts_with_keyword(rest, "WHERE") {
+                let after_where = skip_keyword(rest, "WHERE").trim_start();
+                let su = after_where.to_ascii_uppercase();
+                if su.starts_with("PAYLOAD_FIELD(") {
+                    let (pfs, comb, remaining) = parse_payload_filter_chain(after_where)?;
+                    (None, pfs, comb, remaining)
                 } else {
-                    (Some(filter), vec![], remaining)
+                    let (filter, remaining) = parse_where_id_filter(after_where)?;
+                    let remaining = remaining.trim_start();
+                    // Optional AND PAYLOAD_FIELD(...) chain after the id filter
+                    if starts_with_keyword(remaining, "AND") {
+                        let after_and = skip_keyword(remaining, "AND").trim_start();
+                        if after_and.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
+                            let (pfs, comb, rem2) = parse_payload_filter_chain(after_and)?;
+                            (Some(filter), pfs, comb, rem2)
+                        } else {
+                            (Some(filter), vec![], SqlFilterCombinator::And, remaining)
+                        }
+                    } else {
+                        (Some(filter), vec![], SqlFilterCombinator::And, remaining)
+                    }
                 }
-            }
-        } else {
-            (None, vec![], rest)
-        };
+            } else {
+                (None, vec![], SqlFilterCombinator::And, rest)
+            };
 
         let mut rest = rest.trim_start();
 
@@ -261,6 +264,7 @@ impl SqlAggregateQuery {
             needs_value,
             id_filter,
             payload_filters,
+            payload_combinator,
             having,
             order_by,
             limit,
@@ -537,6 +541,45 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
         )
     } else if starts_with_keyword(after_close, "LIKE") {
         (SqlPayloadOp::Like, skip_keyword(after_close, "LIKE"))
+    } else if starts_with_keyword(after_close, "BETWEEN") {
+        let after_between = skip_keyword(after_close, "BETWEEN").trim_start();
+        let lo_end = after_between
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_between.len());
+        if lo_end == 0 {
+            return Err(SqlAggError::Unsupported(
+                "BETWEEN requires a numeric lower bound".into(),
+            ));
+        }
+        let lo: f64 = after_between[..lo_end]
+            .parse()
+            .map_err(|_| SqlAggError::Unsupported("invalid lower bound in BETWEEN".into()))?;
+        let after_lo = after_between[lo_end..].trim_start();
+        if !starts_with_keyword(after_lo, "AND") {
+            return Err(SqlAggError::Unsupported(
+                "BETWEEN requires AND between bounds".into(),
+            ));
+        }
+        let after_and = skip_keyword(after_lo, "AND").trim_start();
+        let hi_end = after_and
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_and.len());
+        if hi_end == 0 {
+            return Err(SqlAggError::Unsupported(
+                "BETWEEN requires a numeric upper bound".into(),
+            ));
+        }
+        let hi: f64 = after_and[..hi_end]
+            .parse()
+            .map_err(|_| SqlAggError::Unsupported("invalid upper bound in BETWEEN".into()))?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::Between,
+                value: SqlPayloadValue::NumRange(lo, hi),
+            },
+            after_and[hi_end..].trim_start(),
+        ));
     } else if starts_with_keyword(after_close, "IS NOT NULL") {
         return Ok((
             SqlPayloadFilter {
@@ -632,23 +675,45 @@ fn sql_like_match(text: &str, pattern: &str) -> bool {
     dp[tn][pn]
 }
 
-/// Parse a chain of `PAYLOAD_FIELD(...) OP value [AND PAYLOAD_FIELD(...) OP value ...]`.
-/// Returns `(Vec<SqlPayloadFilter>, remaining_text)`.
-fn parse_payload_filter_chain(s: &str) -> Result<(Vec<SqlPayloadFilter>, &str), SqlAggError> {
+/// Parse a chain of `PAYLOAD_FIELD(...) OP value [AND|OR PAYLOAD_FIELD(...) OP value ...]`.
+/// Returns `(Vec<SqlPayloadFilter>, SqlFilterCombinator, remaining_text)`.
+/// Connectors must be consistent within one chain (all AND or all OR); mixed connectors stop the chain.
+fn parse_payload_filter_chain(
+    s: &str,
+) -> Result<(Vec<SqlPayloadFilter>, SqlFilterCombinator, &str), SqlAggError> {
     let mut filters = Vec::new();
     let (first, mut rest) = parse_payload_filter(s)?;
     filters.push(first);
     rest = rest.trim_start();
-    while starts_with_keyword(rest, "AND") {
-        let after_and = skip_keyword(rest, "AND").trim_start();
-        if !after_and.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
+    let mut combinator = SqlFilterCombinator::And;
+    let mut first_connector = true;
+    loop {
+        let is_and = starts_with_keyword(rest, "AND");
+        let is_or = starts_with_keyword(rest, "OR");
+        if !is_and && !is_or {
             break;
         }
-        let (pf, rem) = parse_payload_filter(after_and)?;
+        let this_conn = if is_and {
+            SqlFilterCombinator::And
+        } else {
+            SqlFilterCombinator::Or
+        };
+        if first_connector {
+            combinator = this_conn;
+            first_connector = false;
+        } else if this_conn != combinator {
+            break; // mixed connectors — stop consuming
+        }
+        let kw = if is_and { "AND" } else { "OR" };
+        let after_kw = skip_keyword(rest, kw).trim_start();
+        if !after_kw.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
+            break;
+        }
+        let (pf, rem) = parse_payload_filter(after_kw)?;
         filters.push(pf);
         rest = rem.trim_start();
     }
-    Ok((filters, rest))
+    Ok((filters, combinator, rest))
 }
 
 /// Apply a `SqlPayloadFilter` to a raw observation payload. Returns `true` if the
@@ -721,6 +786,19 @@ fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bo
                         _ => false,
                     }
                 }
+                SqlPayloadValue::NumRange(lo, hi) => {
+                    let field_num = match &field_val {
+                        serde_json::Value::Number(num) => match num.as_f64() {
+                            Some(f) => f,
+                            None => return false,
+                        },
+                        _ => return false,
+                    };
+                    match filter.op {
+                        SqlPayloadOp::Between => field_num >= *lo && field_num <= *hi,
+                        _ => false,
+                    }
+                }
                 SqlPayloadValue::Null => false,
             }
         }
@@ -789,6 +867,7 @@ impl BinderStore {
         if q.id_filter.is_some() || !q.payload_filters.is_empty() {
             let id_filter = q.id_filter.clone();
             let payload_filters = q.payload_filters.clone();
+            let payload_combinator = q.payload_combinator;
             let ns_prefix = format!("{}:", q.namespace);
             builder = builder.filter(move |v| {
                 if let Some(ref f) = id_filter {
@@ -807,12 +886,15 @@ impl BinderStore {
                         return false;
                     }
                 }
-                for pf in &payload_filters {
-                    if !apply_payload_filter(pf, v.payload.as_deref()) {
-                        return false;
-                    }
-                }
-                true
+                let payload_ok = match payload_combinator {
+                    SqlFilterCombinator::And => payload_filters
+                        .iter()
+                        .all(|pf| apply_payload_filter(pf, v.payload.as_deref())),
+                    SqlFilterCombinator::Or => payload_filters
+                        .iter()
+                        .any(|pf| apply_payload_filter(pf, v.payload.as_deref())),
+                };
+                payload_ok
             });
         }
 
@@ -910,6 +992,8 @@ pub enum SqlPayloadOp {
     IsNotNull,
     /// `LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
     Like,
+    /// `BETWEEN lo AND hi` — numeric inclusive range
+    Between,
 }
 
 /// A value to compare against in a `WHERE PAYLOAD_FIELD` filter.
@@ -918,6 +1002,17 @@ pub enum SqlPayloadValue {
     Str(String),
     Num(f64),
     Null,
+    /// Inclusive numeric range for `BETWEEN lo AND hi`.
+    NumRange(f64, f64),
+}
+
+/// How multiple `payload_filters` are combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlFilterCombinator {
+    /// All filters must match (AND chain — default).
+    And,
+    /// Any filter must match (OR chain).
+    Or,
 }
 
 /// `WHERE PAYLOAD_FIELD('field') OP value` filter for a projection query.
@@ -958,8 +1053,10 @@ pub struct SqlProjectQuery {
     pub return_id: bool,
     /// Optional `WHERE id ...` filter applied to object_id suffix after namespace prefix.
     pub id_filter: Option<SqlIdFilter>,
-    /// `WHERE PAYLOAD_FIELD('f') OP value` pre-filter (AND-combined, Vec matches SqlAggregateQuery).
+    /// `WHERE PAYLOAD_FIELD('f') OP value` pre-filter.
     pub payload_filters: Vec<SqlPayloadFilter>,
+    /// How `payload_filters` are combined (AND or OR). Defaults to `And`.
+    pub payload_combinator: SqlFilterCombinator,
     /// Optional `ORDER BY PAYLOAD_FIELD('f') [ASC|DESC]` sort.
     pub order_by: Option<SqlProjectOrderBy>,
     /// Number of rows to skip before applying LIMIT (applied after ORDER BY).
@@ -1033,34 +1130,34 @@ impl SqlProjectQuery {
         let (namespace, rest) = parse_quoted(s)?;
         s = rest.trim_start();
 
-        let (id_filter, payload_filters) = if starts_with_keyword(s, "WHERE") {
+        let (id_filter, payload_filters, payload_combinator) = if starts_with_keyword(s, "WHERE") {
             let after_where = skip_keyword(s, "WHERE").trim_start();
             let su = after_where.to_ascii_uppercase();
             if su.starts_with("PAYLOAD_FIELD(") {
-                let (pfs, rest2) = parse_payload_filter_chain(after_where)?;
+                let (pfs, comb, rest2) = parse_payload_filter_chain(after_where)?;
                 s = rest2.trim_start();
-                (None, pfs)
+                (None, pfs, comb)
             } else {
                 let (filter, rest2) = parse_where_id_filter(after_where)?;
                 let rest2 = rest2.trim_start();
-                // Optional AND PAYLOAD_FIELD(...) chain after the id filter
+                // Optional AND/OR PAYLOAD_FIELD(...) chain after the id filter
                 if starts_with_keyword(rest2, "AND") {
                     let after_and = skip_keyword(rest2, "AND").trim_start();
                     if after_and.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
-                        let (pfs, rem2) = parse_payload_filter_chain(after_and)?;
+                        let (pfs, comb, rem2) = parse_payload_filter_chain(after_and)?;
                         s = rem2.trim_start();
-                        (Some(filter), pfs)
+                        (Some(filter), pfs, comb)
                     } else {
                         s = rest2;
-                        (Some(filter), vec![])
+                        (Some(filter), vec![], SqlFilterCombinator::And)
                     }
                 } else {
                     s = rest2;
-                    (Some(filter), vec![])
+                    (Some(filter), vec![], SqlFilterCombinator::And)
                 }
             }
         } else {
-            (None, vec![])
+            (None, vec![], SqlFilterCombinator::And)
         };
 
         let order_by = if starts_with_keyword(s, "ORDER") {
@@ -1153,6 +1250,7 @@ impl SqlProjectQuery {
             return_id,
             id_filter,
             payload_filters,
+            payload_combinator,
             order_by,
             offset,
             limit,
@@ -1213,10 +1311,18 @@ impl BinderStore {
                     return false;
                 }
             }
-            for pf in &q.payload_filters {
-                if !apply_payload_filter(pf, v.payload.as_deref()) {
-                    return false;
-                }
+            let payload_ok = match q.payload_combinator {
+                SqlFilterCombinator::And => q
+                    .payload_filters
+                    .iter()
+                    .all(|pf| apply_payload_filter(pf, v.payload.as_deref())),
+                SqlFilterCombinator::Or => q
+                    .payload_filters
+                    .iter()
+                    .any(|pf| apply_payload_filter(pf, v.payload.as_deref())),
+            };
+            if !payload_ok {
+                return false;
             }
             true
         });

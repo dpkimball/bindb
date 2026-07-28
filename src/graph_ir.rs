@@ -349,6 +349,9 @@ pub struct GraphIrQuery {
     /// Optional WITH clause. Filters and pages mandatory `b` results before
     /// they enter optional expansion or RETURN. See [`GraphIrWithClause`].
     pub with_clause: Option<GraphIrWithClause>,
+    /// Named path variable from `MATCH p = (a)-[r]->(b)`. When set, `RETURN p`
+    /// is equivalent to `RETURN path` and `GraphIrRow::path` is populated.
+    pub path_var: Option<String>,
 }
 
 impl GraphIrQuery {
@@ -362,6 +365,27 @@ impl GraphIrQuery {
             return Err(GraphIrError::Unsupported("must start with MATCH".into()));
         }
         let after_match = skip_keyword(&raw, "MATCH");
+
+        // Optional named path variable: `p = (a)-[r]->(b)` — capture name before pattern.
+        let (path_var, after_match) = {
+            let s = after_match.trim_start();
+            // Identifier chars before ` = ` or `=`
+            let var_end = s
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(s.len());
+            let candidate = &s[..var_end];
+            let after_var = s[var_end..].trim_start();
+            if !candidate.is_empty()
+                && !candidate.eq_ignore_ascii_case("optional")
+                && after_var.starts_with('=')
+                && !after_var.starts_with("=>")
+            {
+                let after_eq = after_var[1..].trim_start();
+                (Some(candidate.to_string()), after_eq)
+            } else {
+                (None, s)
+            }
+        };
 
         let (direction, edge_types, min_depth, max_depth, after_pattern) =
             parse_pattern(after_match)?;
@@ -485,7 +509,7 @@ impl GraphIrQuery {
         };
         let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
         let (return_fields, edge_return_fields, c_return_fields, return_path, return_id) =
-            parse_return_spec(ret_spec);
+            parse_return_spec(ret_spec, path_var.as_deref());
         let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
 
         let optional_clause = optional_clause_raw.map(|mut oc| {
@@ -512,6 +536,7 @@ impl GraphIrQuery {
             skip,
             optional_clause,
             with_clause,
+            path_var,
         })
     }
 }
@@ -1568,10 +1593,13 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 /// - `b_fields`: fields projected from the mandatory `b` node (`RETURN b.f1, b.f2`)
 /// - `r_fields`: fields projected from the via-edge `r` (`RETURN r.weight`)
 /// - `c_fields`: fields projected from the optional `c` node (`RETURN c.f1`)
-/// - `return_path`: true when `path` appears in the RETURN list
+/// - `return_path`: true when `path` appears in the RETURN list, or the named path variable does
 ///
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
-fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool, bool) {
+fn parse_return_spec(
+    s: &str,
+    path_var: Option<&str>,
+) -> (Vec<String>, Vec<String>, Vec<String>, bool, bool) {
     let s = s.trim();
     if s.is_empty() {
         return (vec![], vec![], vec![], false, false);
@@ -1583,7 +1611,8 @@ fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool, b
     let mut return_id = false;
     for part in s.split(',') {
         let p = part.trim();
-        if p.eq_ignore_ascii_case("path") {
+        let is_path_var = path_var.is_some_and(|v| p.eq_ignore_ascii_case(v));
+        if p.eq_ignore_ascii_case("path") || is_path_var {
             return_path = true;
         } else if p.eq_ignore_ascii_case("id(b)") || p.eq_ignore_ascii_case("id(a)") {
             return_id = true;
