@@ -3285,3 +3285,119 @@ fn not_pred_combined() {
     assert_eq!(rows[0].object_id.0, "in://carol");
     store.close().unwrap();
 }
+
+// ── RETURN id(b) tests (issue #2) ────────────────────────────────────────────
+
+fn build_return_id_graph() -> (BinderStore, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rid://root"), b"{}".to_vec());
+    tx.put_object(
+        obj("rid://alice"),
+        br#"{"name":"alice","score":10}"#.to_vec(),
+    );
+    tx.put_object(obj("rid://bob"), br#"{"name":"bob","score":20}"#.to_vec());
+    tx.put_object(
+        obj("rid://carol"),
+        br#"{"name":"carol","score":15}"#.to_vec(),
+    );
+    tx.put_edge(
+        eid("rid://e1"),
+        obj("rid://root"),
+        obj("rid://alice"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("rid://e2"),
+        obj("rid://root"),
+        obj("rid://bob"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("rid://e3"),
+        obj("rid://root"),
+        obj("rid://carol"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn return_id_populates_field() {
+    let (store, _dir) = build_return_id_graph();
+    let q = GraphIrQuery::parse("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'rid://root' RETURN id(b)")
+        .unwrap();
+    assert!(q.return_id);
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 3);
+    let id_val = rows[0].fields.get("id(b)").and_then(|v| v.as_str());
+    assert_eq!(id_val, Some("rid://alice"));
+    let id_val2 = rows[1].fields.get("id(b)").and_then(|v| v.as_str());
+    assert_eq!(id_val2, Some("rid://bob"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_id_combined_with_payload_fields() {
+    // RETURN id(b), b.name → both object_id and payload field in fields map
+    let (store, _dir) = build_return_id_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'rid://root' RETURN id(b), b.name",
+    )
+    .unwrap();
+    assert!(q.return_id);
+    assert!(q.return_fields.contains(&"name".to_string()));
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 3);
+    let first = &rows[0];
+    assert_eq!(
+        first.fields.get("id(b)").and_then(|v| v.as_str()),
+        Some("rid://alice")
+    );
+    assert_eq!(
+        first.fields.get("name").and_then(|v| v.as_str()),
+        Some("alice")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_id_with_order_by_name() {
+    // RETURN id(b), b.score ORDER BY b.score DESC
+    let (store, _dir) = build_return_id_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'rid://root' RETURN id(b), b.score ORDER BY b.score DESC",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 3);
+    // DESC score: bob(20), carol(15), alice(10)
+    assert_eq!(
+        rows[0].fields.get("id(b)").and_then(|v| v.as_str()),
+        Some("rid://bob")
+    );
+    assert_eq!(
+        rows[1].fields.get("id(b)").and_then(|v| v.as_str()),
+        Some("rid://carol")
+    );
+    assert_eq!(
+        rows[2].fields.get("id(b)").and_then(|v| v.as_str()),
+        Some("rid://alice")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_id_parse_flag_not_set_without_keyword() {
+    // Without id(b) in RETURN, return_id should be false
+    let q = GraphIrQuery::parse("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'rid://root' RETURN b.name")
+        .unwrap();
+    assert!(!q.return_id);
+}

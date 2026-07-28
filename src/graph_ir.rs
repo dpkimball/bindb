@@ -319,6 +319,8 @@ pub struct GraphIrQuery {
     /// When true, `graph_ir_projected` populates `GraphIrRow::path` with the
     /// sequence of node IDs from the start node to each matched node.
     pub return_path: bool,
+    /// When true, `graph_ir_projected` adds `"id(b)"` → object_id to each row's `fields`.
+    pub return_id: bool,
     /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
     pub distinct: bool,
     /// Optional ORDER BY clause applied after min-depth filtering.
@@ -474,7 +476,7 @@ impl GraphIrQuery {
             (false, after_return)
         };
         let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
-        let (return_fields, edge_return_fields, c_return_fields, return_path) =
+        let (return_fields, edge_return_fields, c_return_fields, return_path, return_id) =
             parse_return_spec(ret_spec);
         let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
 
@@ -495,6 +497,7 @@ impl GraphIrQuery {
             return_fields,
             edge_return_fields,
             return_path,
+            return_id,
             distinct,
             order_by,
             limit,
@@ -1487,19 +1490,22 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 /// - `return_path`: true when `path` appears in the RETURN list
 ///
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
-fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
+fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool, bool) {
     let s = s.trim();
     if s.is_empty() {
-        return (vec![], vec![], vec![], false);
+        return (vec![], vec![], vec![], false, false);
     }
     let mut b_fields = Vec::new();
     let mut r_fields = Vec::new();
     let mut c_fields = Vec::new();
     let mut return_path = false;
+    let mut return_id = false;
     for part in s.split(',') {
         let p = part.trim();
         if p.eq_ignore_ascii_case("path") {
             return_path = true;
+        } else if p.eq_ignore_ascii_case("id(b)") || p.eq_ignore_ascii_case("id(a)") {
+            return_id = true;
         } else if let Some(field) = p.strip_prefix("b.").or_else(|| p.strip_prefix("B.")) {
             let f = field.trim().to_string();
             if !f.is_empty() {
@@ -1518,7 +1524,7 @@ fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
         }
         // "b", "r", "c" alone → plain return; ignore
     }
-    (b_fields, r_fields, c_fields, return_path)
+    (b_fields, r_fields, c_fields, return_path, return_id)
 }
 
 enum SortKey {
@@ -1665,6 +1671,12 @@ impl BinderStore {
                         }
                     }
                 }
+            }
+            if q.return_id {
+                b_fields.insert(
+                    "id(b)".to_string(),
+                    serde_json::Value::String(m.object.object_id.0.clone()),
+                );
             }
 
             let mut r_fields = HashMap::new();
