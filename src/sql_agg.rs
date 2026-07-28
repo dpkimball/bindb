@@ -120,6 +120,8 @@ pub struct SqlAggregateQuery {
     pub order_by: Option<AggOrderBy>,
     /// Optional cap on returned aggregate rows (applied last).
     pub limit: Option<usize>,
+    /// Number of aggregate rows to skip before applying LIMIT.
+    pub offset: Option<usize>,
 }
 
 impl SqlAggregateQuery {
@@ -185,6 +187,20 @@ impl SqlAggregateQuery {
             None
         };
 
+        let offset = if starts_with_keyword(rest, "OFFSET") {
+            let after_offset = skip_keyword(rest, "OFFSET").trim_start();
+            let end = after_offset
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_offset.len());
+            let n: usize = after_offset[..end].parse().map_err(|_| {
+                SqlAggError::Unsupported("OFFSET must be a non-negative integer".into())
+            })?;
+            rest = after_offset[end..].trim_start();
+            Some(n)
+        } else {
+            None
+        };
+
         let limit = if starts_with_keyword(rest, "LIMIT") {
             let after_limit = skip_keyword(rest, "LIMIT").trim_start();
             let end = after_limit
@@ -214,6 +230,7 @@ impl SqlAggregateQuery {
             having,
             order_by,
             limit,
+            offset,
         })
     }
 }
@@ -567,7 +584,14 @@ impl BinderStore {
             }
         }
 
-        // Apply LIMIT (after ORDER BY so it picks top-N)
+        // Apply OFFSET then LIMIT (OFFSET first so LIMIT picks from the right window)
+        if let Some(n) = q.offset {
+            if n >= results.len() {
+                results.clear();
+            } else {
+                results.drain(..n);
+            }
+        }
         if let Some(n) = q.limit {
             results.truncate(n);
         }

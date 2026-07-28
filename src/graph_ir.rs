@@ -154,6 +154,8 @@ pub struct PayloadPred {
     pub field: String,
     pub op: CmpOp,
     pub value: CmpValue,
+    /// When `true`, the predicate result is inverted (`NOT`).
+    pub negated: bool,
 }
 
 /// The `OPTIONAL MATCH` clause in a two-clause query.
@@ -362,20 +364,28 @@ impl GraphIrQuery {
         let (start, end_pred, after_preds) = parse_where(after_where)?;
         let after_preds = after_preds.trim_start();
 
-        // Optional payload predicates: AND b.FIELD OP VALUE or AND r.FIELD OP VALUE (may repeat)
+        // Optional payload predicates: AND [NOT] b.FIELD OP VALUE or AND [NOT] r.FIELD OP VALUE
         let mut payload_preds: Vec<PayloadPred> = Vec::new();
         let mut edge_preds: Vec<PayloadPred> = Vec::new();
         let mut after_preds2 = after_preds;
         loop {
             if starts_with_keyword(after_preds2, "AND") {
                 let after_and = skip_keyword(after_preds2, "AND").trim_start();
-                if after_and.starts_with("b.") || after_and.starts_with("B.") {
-                    let (pred, rest) = parse_payload_pred(after_and)?;
+                // Detect optional NOT modifier
+                let (negated, after_not) = if starts_with_keyword(after_and, "NOT") {
+                    (true, skip_keyword(after_and, "NOT").trim_start())
+                } else {
+                    (false, after_and)
+                };
+                if after_not.starts_with("b.") || after_not.starts_with("B.") {
+                    let (mut pred, rest) = parse_payload_pred(after_not)?;
+                    pred.negated = negated;
                     payload_preds.push(pred);
                     after_preds2 = rest.trim_start();
                     continue;
-                } else if after_and.starts_with("r.") || after_and.starts_with("R.") {
-                    let (pred, rest) = parse_payload_pred_for_var(after_and, "r")?;
+                } else if after_not.starts_with("r.") || after_not.starts_with("R.") {
+                    let (mut pred, rest) = parse_payload_pred_for_var(after_not, "r")?;
+                    pred.negated = negated;
                     edge_preds.push(pred);
                     after_preds2 = rest.trim_start();
                     continue;
@@ -737,6 +747,7 @@ fn parse_payload_pred_inner<'a>(
                 field,
                 op: CmpOp::IsNotNull,
                 value: CmpValue::Null,
+                negated: false,
             },
             rest,
         ));
@@ -748,6 +759,7 @@ fn parse_payload_pred_inner<'a>(
                 field,
                 op: CmpOp::IsNull,
                 value: CmpValue::Null,
+                negated: false,
             },
             rest,
         ));
@@ -762,6 +774,7 @@ fn parse_payload_pred_inner<'a>(
                 field,
                 op: CmpOp::NotIn,
                 value: CmpValue::StringList(items),
+                negated: false,
             },
             rest,
         ));
@@ -774,6 +787,7 @@ fn parse_payload_pred_inner<'a>(
                 field,
                 op: CmpOp::In,
                 value: CmpValue::StringList(items),
+                negated: false,
             },
             rest,
         ));
@@ -829,7 +843,15 @@ fn parse_payload_pred_inner<'a>(
         (CmpValue::Number(n), &rest[num_end..])
     };
 
-    Ok((PayloadPred { field, op, value }, rest))
+    Ok((
+        PayloadPred {
+            field,
+            op,
+            value,
+            negated: false,
+        },
+        rest,
+    ))
 }
 
 fn parse_id_eq<'a>(s: &'a str, var: &str) -> Result<(ObjectId, &'a str), GraphIrError> {
@@ -1298,6 +1320,15 @@ fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
 /// Evaluate a payload predicate against raw payload bytes.
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
 fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
+    let result = apply_payload_pred_inner(payload, pred);
+    if pred.negated {
+        !result
+    } else {
+        result
+    }
+}
+
+fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
     let Ok(text) = std::str::from_utf8(payload) else {
         // Non-UTF-8: treat as no JSON fields present
         return pred.op == CmpOp::IsNull;

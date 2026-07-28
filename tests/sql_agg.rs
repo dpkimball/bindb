@@ -627,3 +627,44 @@ fn agg_limit_with_having() {
     assert_eq!(results[0].count, 3); // x
     store.close().unwrap();
 }
+
+// ── OFFSET tests for sql_aggregate (issue #5) ────────────────────────────────
+
+#[test]
+fn agg_offset_skips_first_n() {
+    // 3 groups sorted by value ASC: y(2.0), z(5.0), x(9.0)
+    // OFFSET 1 → skip y → z, x
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT AVG(VALUE) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY value ASC OFFSET 1",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].group_key.as_deref(), Some("z"));
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_offset_with_limit() {
+    // OFFSET 1 LIMIT 1: middle element → z
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT AVG(VALUE) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY value ASC OFFSET 1 LIMIT 1",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].group_key.as_deref(), Some("z"));
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_offset_beyond_end_is_empty() {
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) OFFSET 100")
+        .unwrap();
+    assert!(results.is_empty());
+    store.close().unwrap();
+}

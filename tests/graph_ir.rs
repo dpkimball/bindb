@@ -3234,3 +3234,54 @@ fn distinct_parse_flag() {
     let q2 = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' RETURN b").unwrap();
     assert!(!q2.distinct);
 }
+
+// ── NOT predicate tests ───────────────────────────────────────────────────────
+
+#[test]
+fn not_pred_negates_eq() {
+    // AND NOT b.role = 'admin' → bob (editor) + carol (viewer) [using in_pred graph]
+    // reuse build_in_pred_graph: alice=admin, bob=editor, carol=viewer, dave=admin
+    let (store, _dir) = build_in_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:MEMBER]->(b) WHERE id(a) = 'in://root' AND NOT b.role = 'admin' RETURN b",
+    )
+    .unwrap();
+    assert!(q.payload_preds[0].negated);
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].object_id.0, "in://bob");
+    assert_eq!(rows[1].object_id.0, "in://carol");
+    store.close().unwrap();
+}
+
+#[test]
+fn not_pred_negates_contains() {
+    // AND NOT b.tag CONTAINS 'alpha' → bob + dave [using string_pred graph]
+    let (store, _dir) = build_string_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sp://root' AND NOT b.tag CONTAINS 'alpha' RETURN b",
+    )
+    .unwrap();
+    assert!(q.payload_preds[0].negated);
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].object_id.0, "sp://bob");
+    assert_eq!(rows[1].object_id.0, "sp://dave");
+    store.close().unwrap();
+}
+
+#[test]
+fn not_pred_combined() {
+    // AND NOT b.role = 'admin' AND NOT b.dept = 'eng' → carol only (viewer, hr)
+    let (store, _dir) = build_in_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:MEMBER]->(b) WHERE id(a) = 'in://root' AND NOT b.role = 'admin' AND NOT b.dept = 'eng' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "in://carol");
+    store.close().unwrap();
+}
