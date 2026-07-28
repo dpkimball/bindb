@@ -108,6 +108,8 @@ pub enum NodeIdPred {
     /// No predicate on matched end nodes.
     Any,
     StartsWith(String),
+    EndsWith(String),
+    Contains(String),
     Equals(String),
 }
 
@@ -120,6 +122,24 @@ pub enum CmpOp {
     Lt,
     Gte,
     Lte,
+    /// `b.field STARTS WITH 'prefix'`
+    StartsWith,
+    /// `b.field ENDS WITH 'suffix'`
+    EndsWith,
+    /// `b.field CONTAINS 'substr'`
+    Contains,
+    /// `b.field IS NULL` — field absent from the JSON payload
+    IsNull,
+    /// `b.field IS NOT NULL` — field present in the JSON payload
+    IsNotNull,
+    /// `b.field IN ['v1', 'v2']` — field value is in the list
+    In,
+    /// `b.field NOT IN ['v1', 'v2']` — field value is not in the list
+    NotIn,
+    /// `b.field BETWEEN lo AND hi` — numeric range, inclusive on both ends
+    Between,
+    /// `b.field LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
+    Like,
 }
 
 /// Right-hand side of a payload predicate.
@@ -127,6 +147,12 @@ pub enum CmpOp {
 pub enum CmpValue {
     Number(f64),
     Text(String),
+    /// Placeholder for IS NULL / IS NOT NULL (no RHS value).
+    Null,
+    /// List of string values for IN / NOT IN.
+    StringList(Vec<String>),
+    /// Inclusive numeric range for BETWEEN.
+    NumberRange(f64, f64),
 }
 
 /// Predicate on a JSON field of the matched end node's payload.
@@ -136,6 +162,8 @@ pub struct PayloadPred {
     pub field: String,
     pub op: CmpOp,
     pub value: CmpValue,
+    /// When `true`, the predicate result is inverted (`NOT`).
+    pub negated: bool,
 }
 
 /// The `OPTIONAL MATCH` clause in a two-clause query.
@@ -299,6 +327,10 @@ pub struct GraphIrQuery {
     /// When true, `graph_ir_projected` populates `GraphIrRow::path` with the
     /// sequence of node IDs from the start node to each matched node.
     pub return_path: bool,
+    /// When true, `graph_ir_projected` adds `"id(b)"` → object_id to each row's `fields`.
+    pub return_id: bool,
+    /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
+    pub distinct: bool,
     /// Optional ORDER BY clause applied after min-depth filtering.
     pub order_by: Option<GraphIrOrderBy>,
     /// Maximum number of results to return (applied after ORDER BY and SKIP).
@@ -342,20 +374,28 @@ impl GraphIrQuery {
         let (start, end_pred, after_preds) = parse_where(after_where)?;
         let after_preds = after_preds.trim_start();
 
-        // Optional payload predicates: AND b.FIELD OP VALUE or AND r.FIELD OP VALUE (may repeat)
+        // Optional payload predicates: AND [NOT] b.FIELD OP VALUE or AND [NOT] r.FIELD OP VALUE
         let mut payload_preds: Vec<PayloadPred> = Vec::new();
         let mut edge_preds: Vec<PayloadPred> = Vec::new();
         let mut after_preds2 = after_preds;
         loop {
             if starts_with_keyword(after_preds2, "AND") {
                 let after_and = skip_keyword(after_preds2, "AND").trim_start();
-                if after_and.starts_with("b.") || after_and.starts_with("B.") {
-                    let (pred, rest) = parse_payload_pred(after_and)?;
+                // Detect optional NOT modifier
+                let (negated, after_not) = if starts_with_keyword(after_and, "NOT") {
+                    (true, skip_keyword(after_and, "NOT").trim_start())
+                } else {
+                    (false, after_and)
+                };
+                if after_not.starts_with("b.") || after_not.starts_with("B.") {
+                    let (mut pred, rest) = parse_payload_pred(after_not)?;
+                    pred.negated = negated;
                     payload_preds.push(pred);
                     after_preds2 = rest.trim_start();
                     continue;
-                } else if after_and.starts_with("r.") || after_and.starts_with("R.") {
-                    let (pred, rest) = parse_payload_pred_for_var(after_and, "r")?;
+                } else if after_not.starts_with("r.") || after_not.starts_with("R.") {
+                    let (mut pred, rest) = parse_payload_pred_for_var(after_not, "r")?;
+                    pred.negated = negated;
                     edge_preds.push(pred);
                     after_preds2 = rest.trim_start();
                     continue;
@@ -438,8 +478,13 @@ impl GraphIrQuery {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
         let after_return = skip_keyword(after_preds3, "RETURN");
+        let (distinct, after_return) = if starts_with_keyword(after_return, "DISTINCT") {
+            (true, skip_keyword(after_return, "DISTINCT"))
+        } else {
+            (false, after_return)
+        };
         let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
-        let (return_fields, edge_return_fields, c_return_fields, return_path) =
+        let (return_fields, edge_return_fields, c_return_fields, return_path, return_id) =
             parse_return_spec(ret_spec);
         let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
 
@@ -460,6 +505,8 @@ impl GraphIrQuery {
             return_fields,
             edge_return_fields,
             return_path,
+            return_id,
+            distinct,
             order_by,
             limit,
             skip,
@@ -703,7 +750,119 @@ fn parse_payload_pred_inner<'a>(
     let field = s[..field_end].to_string();
     let rest = s[field_end..].trim_start();
 
-    let (op, rest) = if let Some(r) = rest.strip_prefix(">=") {
+    // BETWEEN lo AND hi — numeric inclusive range
+    if starts_with_keyword(rest, "BETWEEN") {
+        let after_kw = skip_keyword(rest, "BETWEEN").trim_start();
+        let lo_end = after_kw
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_kw.len());
+        if lo_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "BETWEEN requires a numeric lower bound".into(),
+            ));
+        }
+        let lo: f64 = after_kw[..lo_end]
+            .parse()
+            .map_err(|_| GraphIrError::Unsupported("invalid lower bound in BETWEEN".into()))?;
+        let after_lo = after_kw[lo_end..].trim_start();
+        if !starts_with_keyword(after_lo, "AND") {
+            return Err(GraphIrError::Unsupported(
+                "BETWEEN requires AND between bounds".into(),
+            ));
+        }
+        let after_and = skip_keyword(after_lo, "AND").trim_start();
+        let hi_end = after_and
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_and.len());
+        if hi_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "BETWEEN requires a numeric upper bound".into(),
+            ));
+        }
+        let hi: f64 = after_and[..hi_end]
+            .parse()
+            .map_err(|_| GraphIrError::Unsupported("invalid upper bound in BETWEEN".into()))?;
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::Between,
+                value: CmpValue::NumberRange(lo, hi),
+                negated: false,
+            },
+            after_and[hi_end..].trim_start(),
+        ));
+    }
+
+    // IS NOT NULL and IS NULL must be checked before other operators (no RHS)
+    if starts_with_keyword(rest, "IS NOT NULL") {
+        let rest = skip_keyword(rest, "IS NOT NULL");
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::IsNotNull,
+                value: CmpValue::Null,
+                negated: false,
+            },
+            rest,
+        ));
+    }
+    if starts_with_keyword(rest, "IS NULL") {
+        let rest = skip_keyword(rest, "IS NULL");
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::IsNull,
+                value: CmpValue::Null,
+                negated: false,
+            },
+            rest,
+        ));
+    }
+
+    // NOT IN [...] before IN [...] to avoid ambiguity
+    if starts_with_keyword(rest, "NOT IN") {
+        let after_kw = skip_keyword(rest, "NOT IN").trim_start();
+        let (items, rest) = parse_string_list(after_kw)?;
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::NotIn,
+                value: CmpValue::StringList(items),
+                negated: false,
+            },
+            rest,
+        ));
+    }
+    if starts_with_keyword(rest, "IN") {
+        let after_kw = skip_keyword(rest, "IN").trim_start();
+        let (items, rest) = parse_string_list(after_kw)?;
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::In,
+                value: CmpValue::StringList(items),
+                negated: false,
+            },
+            rest,
+        ));
+    }
+
+    // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS, LIKE) before symbols
+    let (op, rest) = if starts_with_keyword(rest, "LIKE") {
+        (CmpOp::Like, skip_keyword(rest, "LIKE").trim_start())
+    } else if starts_with_keyword(rest, "STARTS WITH") {
+        (
+            CmpOp::StartsWith,
+            skip_keyword(rest, "STARTS WITH").trim_start(),
+        )
+    } else if starts_with_keyword(rest, "ENDS WITH") {
+        (
+            CmpOp::EndsWith,
+            skip_keyword(rest, "ENDS WITH").trim_start(),
+        )
+    } else if starts_with_keyword(rest, "CONTAINS") {
+        (CmpOp::Contains, skip_keyword(rest, "CONTAINS").trim_start())
+    } else if let Some(r) = rest.strip_prefix(">=") {
         (CmpOp::Gte, r.trim_start())
     } else if let Some(r) = rest.strip_prefix("<=") {
         (CmpOp::Lte, r.trim_start())
@@ -740,7 +899,15 @@ fn parse_payload_pred_inner<'a>(
         (CmpValue::Number(n), &rest[num_end..])
     };
 
-    Ok((PayloadPred { field, op, value }, rest))
+    Ok((
+        PayloadPred {
+            field,
+            op,
+            value,
+            negated: false,
+        },
+        rest,
+    ))
 }
 
 fn parse_id_eq<'a>(s: &'a str, var: &str) -> Result<(ObjectId, &'a str), GraphIrError> {
@@ -759,58 +926,40 @@ fn parse_id_eq<'a>(s: &'a str, var: &str) -> Result<(ObjectId, &'a str), GraphIr
 }
 
 fn parse_end_pred(s: &str) -> Result<(NodeIdPred, &str), GraphIrError> {
-    let s = s.trim_start();
-    let prefix = "id(b)";
-    if s.len() < prefix.len() || !s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        return Err(GraphIrError::Unsupported(
-            "AND clause must be id(b) STARTS WITH or id(b) =".into(),
-        ));
-    }
-    let after = s[prefix.len()..].trim_start();
-    if starts_with_keyword(after, "STARTS") {
-        let after_starts = skip_keyword(after, "STARTS");
-        if !starts_with_keyword(after_starts, "WITH") {
-            return Err(GraphIrError::Unsupported("expected STARTS WITH".into()));
-        }
-        let after_with = skip_keyword(after_starts, "WITH");
-        let (val, rest) = parse_quoted(after_with)?;
-        Ok((NodeIdPred::StartsWith(val), rest))
-    } else if let Some(after_eq) = after.strip_prefix('=') {
-        let (val, rest) = parse_quoted(after_eq.trim_start())?;
-        Ok((NodeIdPred::Equals(val), rest))
-    } else {
-        Err(GraphIrError::Unsupported(
-            "expected id(b) STARTS WITH or id(b) =".into(),
-        ))
-    }
+    parse_end_pred_for_var(s, "b")
 }
 
-/// Parse `id(VAR) STARTS WITH '…'` or `id(VAR) = '…'` for a named variable.
+/// Parse `id(VAR) STARTS WITH / ENDS WITH / CONTAINS / = '…'` for a named variable.
 fn parse_end_pred_for_var<'a>(
     s: &'a str,
     var: &str,
 ) -> Result<(NodeIdPred, &'a str), GraphIrError> {
     let prefix = format!("id({var})");
+    let s = s.trim_start();
     if s.len() < prefix.len() || !s[..prefix.len()].eq_ignore_ascii_case(&prefix) {
         return Err(GraphIrError::Unsupported(format!(
-            "expected id({var}) STARTS WITH or id({var}) ="
+            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, or id({var}) ="
         )));
     }
     let after = s[prefix.len()..].trim_start();
-    if starts_with_keyword(after, "STARTS") {
-        let after_starts = skip_keyword(after, "STARTS");
-        if !starts_with_keyword(after_starts, "WITH") {
-            return Err(GraphIrError::Unsupported("expected STARTS WITH".into()));
-        }
-        let after_with = skip_keyword(after_starts, "WITH");
-        let (val, rest) = parse_quoted(after_with)?;
+    if starts_with_keyword(after, "STARTS WITH") {
+        let after_kw = skip_keyword(after, "STARTS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
         Ok((NodeIdPred::StartsWith(val), rest))
+    } else if starts_with_keyword(after, "ENDS WITH") {
+        let after_kw = skip_keyword(after, "ENDS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((NodeIdPred::EndsWith(val), rest))
+    } else if starts_with_keyword(after, "CONTAINS") {
+        let after_kw = skip_keyword(after, "CONTAINS");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((NodeIdPred::Contains(val), rest))
     } else if let Some(after_eq) = after.strip_prefix('=') {
         let (val, rest) = parse_quoted(after_eq.trim_start())?;
         Ok((NodeIdPred::Equals(val), rest))
     } else {
         Err(GraphIrError::Unsupported(format!(
-            "expected id({var}) STARTS WITH or id({var}) ="
+            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, or id({var}) ="
         )))
     }
 }
@@ -1113,6 +1262,28 @@ fn parse_quoted(s: &str) -> Result<(String, &str), GraphIrError> {
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
 }
 
+/// Parse a `['v1', 'v2', ...]` string list literal.
+fn parse_string_list(s: &str) -> Result<(Vec<String>, &str), GraphIrError> {
+    let s = s.trim_start();
+    let Some(s) = s.strip_prefix('[') else {
+        return Err(GraphIrError::Unsupported("expected '[' for IN list".into()));
+    };
+    let mut items = Vec::new();
+    let mut rest = s.trim_start();
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix(']') {
+            return Ok((items, after.trim_start()));
+        }
+        let (item, after_item) = parse_quoted(rest)?;
+        items.push(item);
+        rest = after_item.trim_start();
+        if let Some(after_comma) = rest.strip_prefix(',') {
+            rest = after_comma;
+        }
+    }
+}
+
 /// Split the RETURN spec from any trailing ORDER BY / SKIP / LIMIT clause.
 /// Advances char by char and stops at the first keyword boundary for those tokens.
 fn split_at_ordering_clause(s: &str) -> (&str, &str) {
@@ -1186,17 +1357,62 @@ fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
 
 /// Evaluate a payload predicate against raw payload bytes.
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
+/// Match `text` against a SQL LIKE pattern. `%` matches any sequence; `_` matches one char.
+fn like_match(text: &str, pattern: &str) -> bool {
+    // dp[i][j] = text[..i] matches pattern[..j]
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (tn, pn) = (t.len(), p.len());
+    let mut dp = vec![vec![false; pn + 1]; tn + 1];
+    dp[0][0] = true;
+    for j in 1..=pn {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
+    }
+    for i in 1..=tn {
+        for j in 1..=pn {
+            dp[i][j] = match p[j - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && t[i - 1] == c,
+            };
+        }
+    }
+    dp[tn][pn]
+}
+
 fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
+    let result = apply_payload_pred_inner(payload, pred);
+    if pred.negated {
+        !result
+    } else {
+        result
+    }
+}
+
+fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
     let Ok(text) = std::str::from_utf8(payload) else {
-        return false;
+        // Non-UTF-8: treat as no JSON fields present
+        return pred.op == CmpOp::IsNull;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
+        return pred.op == CmpOp::IsNull;
     };
-    let field_val = match v.get(&pred.field) {
+    let field_val = v.get(&pred.field);
+
+    // IS NULL / IS NOT NULL don't need a value on the RHS
+    match pred.op {
+        CmpOp::IsNull => return field_val.is_none(),
+        CmpOp::IsNotNull => return field_val.is_some(),
+        _ => {}
+    }
+
+    let field_val = match field_val {
         Some(fv) => fv,
         None => return false,
     };
+
     match &pred.value {
         CmpValue::Number(rhs) => {
             let lhs = match field_val.as_f64() {
@@ -1210,6 +1426,22 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::Lt => lhs < *rhs,
                 CmpOp::Gte => lhs >= *rhs,
                 CmpOp::Lte => lhs <= *rhs,
+                // String ops on a numeric field never match
+                CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
+                // Already handled above
+                CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
+                // IN/NOT IN handled via StringList arm; Between via NumberRange; Like on text only
+                CmpOp::In | CmpOp::NotIn | CmpOp::Between | CmpOp::Like => false,
+            }
+        }
+        CmpValue::NumberRange(lo, hi) => {
+            let lhs = match field_val.as_f64() {
+                Some(n) => n,
+                None => return false,
+            };
+            match pred.op {
+                CmpOp::Between => lhs >= *lo && lhs <= *hi,
+                _ => false,
             }
         }
         CmpValue::Text(rhs) => {
@@ -1224,6 +1456,29 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::Lt => lhs < rhs.as_str(),
                 CmpOp::Gte => lhs >= rhs.as_str(),
                 CmpOp::Lte => lhs <= rhs.as_str(),
+                CmpOp::StartsWith => lhs.starts_with(rhs.as_str()),
+                CmpOp::EndsWith => lhs.ends_with(rhs.as_str()),
+                CmpOp::Contains => lhs.contains(rhs.as_str()),
+                // Already handled above
+                CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
+                // IN/NOT IN with a single Text value: treat as 1-element list
+                CmpOp::In => lhs == rhs.as_str(),
+                CmpOp::NotIn => lhs != rhs.as_str(),
+                // BETWEEN on a text field never matches
+                CmpOp::Between => false,
+                CmpOp::Like => like_match(lhs, rhs.as_str()),
+            }
+        }
+        CmpValue::Null => false,
+        CmpValue::StringList(list) => {
+            let lhs = match field_val.as_str() {
+                Some(s) => s,
+                None => return false,
+            };
+            match pred.op {
+                CmpOp::In => list.iter().any(|v| v == lhs),
+                CmpOp::NotIn => list.iter().all(|v| v != lhs),
+                _ => false, // StringList only valid for In/NotIn
             }
         }
     }
@@ -1274,6 +1529,14 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
             let pfx = pfx.clone();
             builder.filter_node(move |obj| obj.object_id.0.starts_with(&pfx))
         }
+        NodeIdPred::EndsWith(sfx) => {
+            let sfx = sfx.clone();
+            builder.filter_node(move |obj| obj.object_id.0.ends_with(sfx.as_str()))
+        }
+        NodeIdPred::Contains(sub) => {
+            let sub = sub.clone();
+            builder.filter_node(move |obj| obj.object_id.0.contains(sub.as_str()))
+        }
         NodeIdPred::Equals(id) => {
             let id = id.clone();
             builder.filter_node(move |obj| obj.object_id.0 == id)
@@ -1308,19 +1571,22 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 /// - `return_path`: true when `path` appears in the RETURN list
 ///
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
-fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
+fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool, bool) {
     let s = s.trim();
     if s.is_empty() {
-        return (vec![], vec![], vec![], false);
+        return (vec![], vec![], vec![], false, false);
     }
     let mut b_fields = Vec::new();
     let mut r_fields = Vec::new();
     let mut c_fields = Vec::new();
     let mut return_path = false;
+    let mut return_id = false;
     for part in s.split(',') {
         let p = part.trim();
         if p.eq_ignore_ascii_case("path") {
             return_path = true;
+        } else if p.eq_ignore_ascii_case("id(b)") || p.eq_ignore_ascii_case("id(a)") {
+            return_id = true;
         } else if let Some(field) = p.strip_prefix("b.").or_else(|| p.strip_prefix("B.")) {
             let f = field.trim().to_string();
             if !f.is_empty() {
@@ -1339,7 +1605,7 @@ fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
         }
         // "b", "r", "c" alone → plain return; ignore
     }
-    (b_fields, r_fields, c_fields, return_path)
+    (b_fields, r_fields, c_fields, return_path, return_id)
 }
 
 enum SortKey {
@@ -1487,6 +1753,12 @@ impl BinderStore {
                     }
                 }
             }
+            if q.return_id {
+                b_fields.insert(
+                    "id(b)".to_string(),
+                    serde_json::Value::String(m.object.object_id.0.clone()),
+                );
+            }
 
             let mut r_fields = HashMap::new();
             if !q.edge_return_fields.is_empty() {
@@ -1550,6 +1822,12 @@ impl BinderStore {
             }
         }
 
+        // DISTINCT: keep first occurrence of each object_id
+        if q.distinct {
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|r| seen.insert(r.object_id.clone()));
+        }
+
         // Post-expansion ordering: applied to final rows only when a WITH clause
         // was present (WITH owns the pre-expansion pass; RETURN owns the post-expansion pass).
         if q.with_clause.is_some() {
@@ -1566,6 +1844,12 @@ fn apply_with_clause(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause)
         NodeIdPred::Any => {}
         NodeIdPred::StartsWith(pfx) => {
             matches.retain(|m| m.object.object_id.0.starts_with(pfx.as_str()));
+        }
+        NodeIdPred::EndsWith(sfx) => {
+            matches.retain(|m| m.object.object_id.0.ends_with(sfx.as_str()));
+        }
+        NodeIdPred::Contains(sub) => {
+            matches.retain(|m| m.object.object_id.0.contains(sub.as_str()));
         }
         NodeIdPred::Equals(id) => {
             matches.retain(|m| m.object.object_id.0 == id.as_str());
@@ -1669,6 +1953,14 @@ fn execute_optional_clause(
             let pfx = pfx.clone();
             builder.filter_node(move |obj| obj.object_id.0.starts_with(&pfx))
         }
+        NodeIdPred::EndsWith(sfx) => {
+            let sfx = sfx.clone();
+            builder.filter_node(move |obj| obj.object_id.0.ends_with(sfx.as_str()))
+        }
+        NodeIdPred::Contains(sub) => {
+            let sub = sub.clone();
+            builder.filter_node(move |obj| obj.object_id.0.contains(sub.as_str()))
+        }
         NodeIdPred::Equals(id) => {
             let id = id.clone();
             builder.filter_node(move |obj| obj.object_id.0 == id)
@@ -1725,6 +2017,12 @@ fn apply_with_clause_filter(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWith
         NodeIdPred::Any => {}
         NodeIdPred::StartsWith(pfx) => {
             matches.retain(|m| m.object.object_id.0.starts_with(pfx.as_str()));
+        }
+        NodeIdPred::EndsWith(sfx) => {
+            matches.retain(|m| m.object.object_id.0.ends_with(sfx.as_str()));
+        }
+        NodeIdPred::Contains(sub) => {
+            matches.retain(|m| m.object.object_id.0.contains(sub.as_str()));
         }
         NodeIdPred::Equals(id) => {
             matches.retain(|m| m.object.object_id.0 == id.as_str());

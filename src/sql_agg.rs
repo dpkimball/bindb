@@ -52,15 +52,91 @@ pub enum SqlGroupBy {
     PayloadField(String),
 }
 
+/// Filter applied to observation `object_id` in a `WHERE` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlIdFilter {
+    /// `WHERE id STARTS WITH 'prefix'`
+    StartsWith(String),
+    /// `WHERE id ENDS WITH 'suffix'`
+    EndsWith(String),
+    /// `WHERE id CONTAINS 'substr'`
+    Contains(String),
+    /// `WHERE id = 'exact'`
+    Equals(String),
+}
+
+/// Comparison operator for a HAVING clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HavingOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+}
+
+/// Which aggregate value to compare in the HAVING clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HavingAggregate {
+    /// `COUNT(*)` — compare against `AggregateResult::count`
+    Count,
+    /// Any `VALUE` aggregate — compare against `AggregateResult::value`
+    Value,
+}
+
+/// Post-aggregation filter: `HAVING COUNT(*) > 5` or `HAVING AVG(VALUE) >= 3.0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HavingClause {
+    pub agg: HavingAggregate,
+    pub op: HavingOp,
+    pub threshold: f64,
+}
+
+/// Column to sort aggregate results by in `ORDER BY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggOrderByField {
+    /// Sort by the aggregate result value (avg/count/sum/…).
+    Value,
+    /// Sort by the observation count within the group.
+    Count,
+    /// Sort by the group key string.
+    GroupKey,
+}
+
+/// Sort direction for `ORDER BY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggOrderDirection {
+    Asc,
+    Desc,
+}
+
+/// Post-aggregation sort: `ORDER BY value DESC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggOrderBy {
+    pub field: AggOrderByField,
+    pub direction: AggOrderDirection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqlAggregateQuery {
     pub aggregate: Aggregate,
     pub namespace: String,
     pub group_by: SqlGroupBy,
     /// True when the aggregate needs numeric `VALUE` extraction.
     pub needs_value: bool,
-    /// Optional `WHERE id STARTS WITH '...'` filter applied to object_id.
-    pub id_prefix: Option<String>,
+    /// Optional `WHERE id ...` filter applied to observation `object_id`.
+    pub id_filter: Option<SqlIdFilter>,
+    /// `WHERE PAYLOAD_FIELD('f') OP value` pre-aggregation filters (AND-combined).
+    pub payload_filters: Vec<SqlPayloadFilter>,
+    /// Optional post-aggregation filter.
+    pub having: Option<HavingClause>,
+    /// Optional post-aggregation sort (applied after HAVING).
+    pub order_by: Option<AggOrderBy>,
+    /// Optional cap on returned aggregate rows (applied last).
+    pub limit: Option<usize>,
+    /// Number of aggregate rows to skip before applying LIMIT.
+    pub offset: Option<usize>,
 }
 
 impl SqlAggregateQuery {
@@ -85,27 +161,110 @@ impl SqlAggregateQuery {
         let (namespace, rest) = parse_quoted(after_from)?;
         let rest = rest.trim_start();
 
-        // Optional WHERE id STARTS WITH '...'
-        let (id_prefix, rest) = if starts_with_keyword(rest, "WHERE") {
-            let after_where = skip_keyword(rest, "WHERE");
-            let prefix = parse_where_id_prefix(after_where)?;
-            (Some(prefix.0), prefix.1)
+        // Optional WHERE clause: id filter, payload filter, or both joined with AND.
+        let (id_filter, payload_filters, rest) = if starts_with_keyword(rest, "WHERE") {
+            let after_where = skip_keyword(rest, "WHERE").trim_start();
+            let su = after_where.to_ascii_uppercase();
+            if su.starts_with("PAYLOAD_FIELD(") {
+                let (pfs, remaining) = parse_payload_filter_chain(after_where)?;
+                (None, pfs, remaining)
+            } else {
+                let (filter, remaining) = parse_where_id_filter(after_where)?;
+                let remaining = remaining.trim_start();
+                // Optional AND PAYLOAD_FIELD(...) chain after the id filter
+                if starts_with_keyword(remaining, "AND") {
+                    let after_and = skip_keyword(remaining, "AND").trim_start();
+                    if after_and.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
+                        let (pfs, rem2) = parse_payload_filter_chain(after_and)?;
+                        (Some(filter), pfs, rem2)
+                    } else {
+                        (Some(filter), vec![], remaining)
+                    }
+                } else {
+                    (Some(filter), vec![], remaining)
+                }
+            }
         } else {
-            (None, rest)
+            (None, vec![], rest)
         };
 
-        let group_by = if rest.trim_start().is_empty() {
-            SqlGroupBy::None
+        let mut rest = rest.trim_start();
+
+        let group_by = if starts_with_keyword(rest, "GROUP") {
+            let (gb, remaining) = parse_group_by(rest)?;
+            rest = remaining;
+            gb
         } else {
-            parse_group_by(rest.trim_start())?
+            SqlGroupBy::None
         };
+
+        let having = if starts_with_keyword(rest, "HAVING") {
+            let after_having = skip_keyword(rest, "HAVING").trim_start();
+            let (having_clause, remainder) = parse_having(after_having)?;
+            rest = remainder;
+            Some(having_clause)
+        } else {
+            None
+        };
+
+        let order_by = if starts_with_keyword(rest, "ORDER") {
+            let after_order = skip_keyword(rest, "ORDER").trim_start();
+            if !starts_with_keyword(after_order, "BY") {
+                return Err(SqlAggError::Unsupported("expected ORDER BY".into()));
+            }
+            let after_by = skip_keyword(after_order, "BY").trim_start();
+            let (ob, remainder) = parse_agg_order_by(after_by)?;
+            rest = remainder;
+            Some(ob)
+        } else {
+            None
+        };
+
+        let offset = if starts_with_keyword(rest, "OFFSET") {
+            let after_offset = skip_keyword(rest, "OFFSET").trim_start();
+            let end = after_offset
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_offset.len());
+            let n: usize = after_offset[..end].parse().map_err(|_| {
+                SqlAggError::Unsupported("OFFSET must be a non-negative integer".into())
+            })?;
+            rest = after_offset[end..].trim_start();
+            Some(n)
+        } else {
+            None
+        };
+
+        let limit = if starts_with_keyword(rest, "LIMIT") {
+            let after_limit = skip_keyword(rest, "LIMIT").trim_start();
+            let end = after_limit
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_limit.len());
+            let n: usize = after_limit[..end]
+                .parse()
+                .map_err(|_| SqlAggError::Unsupported("LIMIT must be a positive integer".into()))?;
+            rest = after_limit[end..].trim_start();
+            Some(n)
+        } else {
+            None
+        };
+
+        if !rest.is_empty() {
+            return Err(SqlAggError::Unsupported(format!(
+                "trailing SQL not supported: {rest}"
+            )));
+        }
 
         Ok(SqlAggregateQuery {
             aggregate,
             namespace,
             group_by,
             needs_value,
-            id_prefix,
+            id_filter,
+            payload_filters,
+            having,
+            order_by,
+            limit,
+            offset,
         })
     }
 }
@@ -159,32 +318,38 @@ fn parse_quoted(s: &str) -> Result<(String, &str), SqlAggError> {
     Ok((ns, &rest[end + quote.len_utf8()..]))
 }
 
-fn parse_where_id_prefix(s: &str) -> Result<(String, &str), SqlAggError> {
+fn parse_where_id_filter(s: &str) -> Result<(SqlIdFilter, &str), SqlAggError> {
     let s = s.trim_start();
-    // id STARTS WITH '…'
     if !starts_with_keyword(s, "id") {
         return Err(SqlAggError::Unsupported(
-            "WHERE clause must be: id STARTS WITH '…'".into(),
+            "WHERE clause must be: id STARTS WITH / ENDS WITH / CONTAINS / = '…'".into(),
         ));
     }
     let after_id = skip_keyword(s, "id");
-    if !starts_with_keyword(after_id, "STARTS") {
-        return Err(SqlAggError::Unsupported(
-            "expected STARTS WITH after id".into(),
-        ));
+    if starts_with_keyword(after_id, "STARTS WITH") {
+        let after_kw = skip_keyword(after_id, "STARTS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((SqlIdFilter::StartsWith(val), rest.trim_start()))
+    } else if starts_with_keyword(after_id, "ENDS WITH") {
+        let after_kw = skip_keyword(after_id, "ENDS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((SqlIdFilter::EndsWith(val), rest.trim_start()))
+    } else if starts_with_keyword(after_id, "CONTAINS") {
+        let after_kw = skip_keyword(after_id, "CONTAINS");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((SqlIdFilter::Contains(val), rest.trim_start()))
+    } else if let Some(after_eq) = after_id.trim_start().strip_prefix('=') {
+        let (val, rest) = parse_quoted(after_eq)?;
+        Ok((SqlIdFilter::Equals(val), rest.trim_start()))
+    } else {
+        Err(SqlAggError::Unsupported(
+            "WHERE id must be followed by STARTS WITH, ENDS WITH, CONTAINS, or =".into(),
+        ))
     }
-    let after_starts = skip_keyword(after_id, "STARTS");
-    if !starts_with_keyword(after_starts, "WITH") {
-        return Err(SqlAggError::Unsupported(
-            "expected WITH after STARTS".into(),
-        ));
-    }
-    let after_with = skip_keyword(after_starts, "WITH");
-    let (prefix, rest) = parse_quoted(after_with)?;
-    Ok((prefix, rest.trim_start()))
 }
 
-fn parse_group_by(s: &str) -> Result<SqlGroupBy, SqlAggError> {
+/// Returns `(SqlGroupBy, remaining_text)`.
+fn parse_group_by(s: &str) -> Result<(SqlGroupBy, &str), SqlAggError> {
     if !starts_with_keyword(s, "GROUP") {
         return Err(SqlAggError::Unsupported(format!(
             "trailing SQL not supported: {s}"
@@ -204,13 +369,8 @@ fn parse_group_by(s: &str) -> Result<SqlGroupBy, SqlAggError> {
             .trim()
             .parse()
             .map_err(|_| SqlAggError::BadPathSegment)?;
-        let trailing = orig[close + 1..].trim();
-        if !trailing.is_empty() {
-            return Err(SqlAggError::Unsupported(format!(
-                "trailing SQL: {trailing}"
-            )));
-        }
-        Ok(SqlGroupBy::PathSegment(idx))
+        let rest = orig[close + 1..].trim_start();
+        Ok((SqlGroupBy::PathSegment(idx), rest))
     } else if au.starts_with("PAYLOAD_FIELD(") {
         let orig = &after["PAYLOAD_FIELD(".len()..];
         let (field, rest) = parse_quoted_sql(orig)?;
@@ -220,13 +380,7 @@ fn parse_group_by(s: &str) -> Result<SqlGroupBy, SqlAggError> {
                 "expected ')' after PAYLOAD_FIELD argument".into(),
             ));
         }
-        let trailing = rest[1..].trim();
-        if !trailing.is_empty() {
-            return Err(SqlAggError::Unsupported(format!(
-                "trailing SQL: {trailing}"
-            )));
-        }
-        Ok(SqlGroupBy::PayloadField(field))
+        Ok((SqlGroupBy::PayloadField(field), rest[1..].trim_start()))
     } else {
         Err(SqlAggError::Unsupported(
             "GROUP BY must be PATH_SEGMENT(i) or PAYLOAD_FIELD('name')".into(),
@@ -250,6 +404,327 @@ fn parse_quoted_sql(s: &str) -> Result<(String, &str), SqlAggError> {
         .find(quote)
         .ok_or_else(|| SqlAggError::Unsupported("unclosed string in PAYLOAD_FIELD".into()))?;
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
+}
+
+/// Parse `COUNT(*) > 5` or `AVG(VALUE) >= 3.0` after the HAVING keyword.
+/// Returns `(HavingClause, remaining_text)`.
+fn parse_having(s: &str) -> Result<(HavingClause, &str), SqlAggError> {
+    let su = s.to_ascii_uppercase();
+    let (agg, after_agg) = if su.starts_with("COUNT(*)") {
+        (HavingAggregate::Count, &s["COUNT(*)".len()..])
+    } else {
+        let agg_patterns: &[(&str, bool)] = &[
+            ("AVG(VALUE)", true),
+            ("SUM(VALUE)", true),
+            ("MIN(VALUE)", true),
+            ("MAX(VALUE)", true),
+            ("P50(VALUE)", true),
+            ("P99(VALUE)", true),
+        ];
+        let mut found = None;
+        for (pat, _) in agg_patterns {
+            if su.starts_with(pat) {
+                found = Some(&s[pat.len()..]);
+                break;
+            }
+        }
+        match found {
+            Some(rest) => (HavingAggregate::Value, rest),
+            None => {
+                return Err(SqlAggError::Unsupported(
+                    "HAVING must use COUNT(*) or a VALUE aggregate".into(),
+                ))
+            }
+        }
+    };
+
+    let after_agg = after_agg.trim_start();
+    let (op, after_op) = if let Some(r) = after_agg.strip_prefix(">=") {
+        (HavingOp::Gte, r)
+    } else if let Some(r) = after_agg.strip_prefix("<=") {
+        (HavingOp::Lte, r)
+    } else if let Some(r) = after_agg.strip_prefix("!=") {
+        (HavingOp::Ne, r)
+    } else if let Some(r) = after_agg.strip_prefix('>') {
+        (HavingOp::Gt, r)
+    } else if let Some(r) = after_agg.strip_prefix('<') {
+        (HavingOp::Lt, r)
+    } else if let Some(r) = after_agg.strip_prefix('=') {
+        (HavingOp::Eq, r)
+    } else {
+        return Err(SqlAggError::Unsupported(
+            "expected comparison operator in HAVING clause".into(),
+        ));
+    };
+
+    let after_op = after_op.trim_start();
+    let num_end = after_op
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(after_op.len());
+    if num_end == 0 {
+        return Err(SqlAggError::Unsupported(
+            "expected numeric threshold in HAVING clause".into(),
+        ));
+    }
+    let threshold: f64 = after_op[..num_end]
+        .parse()
+        .map_err(|_| SqlAggError::Unsupported("invalid number in HAVING clause".into()))?;
+
+    Ok((
+        HavingClause { agg, op, threshold },
+        after_op[num_end..].trim_start(),
+    ))
+}
+
+/// Parse `value|count|group_key [ASC|DESC]`.
+fn parse_agg_order_by(s: &str) -> Result<(AggOrderBy, &str), SqlAggError> {
+    let (field, rest) = if starts_with_keyword(s, "value") {
+        (AggOrderByField::Value, skip_keyword(s, "value"))
+    } else if starts_with_keyword(s, "count") {
+        (AggOrderByField::Count, skip_keyword(s, "count"))
+    } else if starts_with_keyword(s, "group_key") {
+        (AggOrderByField::GroupKey, skip_keyword(s, "group_key"))
+    } else {
+        return Err(SqlAggError::Unsupported(
+            "ORDER BY must be value, count, or group_key".into(),
+        ));
+    };
+    let rest = rest.trim_start();
+    let (direction, rest) = if starts_with_keyword(rest, "DESC") {
+        (AggOrderDirection::Desc, skip_keyword(rest, "DESC"))
+    } else if starts_with_keyword(rest, "ASC") {
+        (AggOrderDirection::Asc, skip_keyword(rest, "ASC"))
+    } else {
+        (AggOrderDirection::Asc, rest)
+    };
+    Ok((AggOrderBy { field, direction }, rest.trim_start()))
+}
+
+/// Parse `PAYLOAD_FIELD('field') OP value` after the WHERE keyword.
+/// Returns `(SqlPayloadFilter, remaining_text)`.
+fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError> {
+    let su = s.to_ascii_uppercase();
+    if !su.starts_with("PAYLOAD_FIELD(") {
+        return Err(SqlAggError::Unsupported(
+            "WHERE payload filter must start with PAYLOAD_FIELD('field')".into(),
+        ));
+    }
+    let after_pf = &s["PAYLOAD_FIELD(".len()..];
+    let (field, rest) = parse_quoted_sql(after_pf)?;
+    let rest = rest.trim_start();
+    if !rest.starts_with(')') {
+        return Err(SqlAggError::Unsupported(
+            "expected ')' after PAYLOAD_FIELD argument".into(),
+        ));
+    }
+    let after_close = rest[1..].trim_start();
+
+    // Parse operator
+    let (op, after_op) = if starts_with_keyword(after_close, "STARTS WITH") {
+        (
+            SqlPayloadOp::StartsWith,
+            skip_keyword(after_close, "STARTS WITH"),
+        )
+    } else if starts_with_keyword(after_close, "ENDS WITH") {
+        (
+            SqlPayloadOp::EndsWith,
+            skip_keyword(after_close, "ENDS WITH"),
+        )
+    } else if starts_with_keyword(after_close, "CONTAINS") {
+        (
+            SqlPayloadOp::Contains,
+            skip_keyword(after_close, "CONTAINS"),
+        )
+    } else if starts_with_keyword(after_close, "LIKE") {
+        (SqlPayloadOp::Like, skip_keyword(after_close, "LIKE"))
+    } else if starts_with_keyword(after_close, "IS NOT NULL") {
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::IsNotNull,
+                value: SqlPayloadValue::Null,
+            },
+            skip_keyword(after_close, "IS NOT NULL").trim_start(),
+        ));
+    } else if starts_with_keyword(after_close, "IS NULL") {
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::IsNull,
+                value: SqlPayloadValue::Null,
+            },
+            skip_keyword(after_close, "IS NULL").trim_start(),
+        ));
+    } else if let Some(r) = after_close.strip_prefix(">=") {
+        (SqlPayloadOp::Gte, r)
+    } else if let Some(r) = after_close.strip_prefix("<=") {
+        (SqlPayloadOp::Lte, r)
+    } else if let Some(r) = after_close.strip_prefix("!=") {
+        (SqlPayloadOp::Ne, r)
+    } else if let Some(r) = after_close.strip_prefix('>') {
+        (SqlPayloadOp::Gt, r)
+    } else if let Some(r) = after_close.strip_prefix('<') {
+        (SqlPayloadOp::Lt, r)
+    } else if let Some(r) = after_close.strip_prefix('=') {
+        (SqlPayloadOp::Eq, r)
+    } else {
+        return Err(SqlAggError::Unsupported(
+            "unrecognised operator in WHERE PAYLOAD_FIELD clause".into(),
+        ));
+    };
+
+    let after_op = after_op.trim_start();
+
+    // Parse value: quoted string or numeric literal
+    if after_op.starts_with('\'') || after_op.starts_with('"') {
+        let (s, rest2) = parse_quoted(after_op)?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op,
+                value: SqlPayloadValue::Str(s),
+            },
+            rest2.trim_start(),
+        ));
+    }
+    let num_end = after_op
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(after_op.len());
+    if num_end == 0 {
+        return Err(SqlAggError::Unsupported(
+            "expected quoted string or number in WHERE PAYLOAD_FIELD clause".into(),
+        ));
+    }
+    let n: f64 = after_op[..num_end]
+        .parse()
+        .map_err(|_| SqlAggError::Unsupported("invalid number in WHERE PAYLOAD_FIELD".into()))?;
+    Ok((
+        SqlPayloadFilter {
+            field,
+            op,
+            value: SqlPayloadValue::Num(n),
+        },
+        after_op[num_end..].trim_start(),
+    ))
+}
+
+/// SQL LIKE pattern matching: `%` = any char sequence, `_` = exactly one char.
+fn sql_like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (tn, pn) = (t.len(), p.len());
+    let mut dp = vec![vec![false; pn + 1]; tn + 1];
+    dp[0][0] = true;
+    for j in 1..=pn {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
+    }
+    for i in 1..=tn {
+        for j in 1..=pn {
+            dp[i][j] = match p[j - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && t[i - 1] == c,
+            };
+        }
+    }
+    dp[tn][pn]
+}
+
+/// Parse a chain of `PAYLOAD_FIELD(...) OP value [AND PAYLOAD_FIELD(...) OP value ...]`.
+/// Returns `(Vec<SqlPayloadFilter>, remaining_text)`.
+fn parse_payload_filter_chain(s: &str) -> Result<(Vec<SqlPayloadFilter>, &str), SqlAggError> {
+    let mut filters = Vec::new();
+    let (first, mut rest) = parse_payload_filter(s)?;
+    filters.push(first);
+    rest = rest.trim_start();
+    while starts_with_keyword(rest, "AND") {
+        let after_and = skip_keyword(rest, "AND").trim_start();
+        if !after_and.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
+            break;
+        }
+        let (pf, rem) = parse_payload_filter(after_and)?;
+        filters.push(pf);
+        rest = rem.trim_start();
+    }
+    Ok((filters, rest))
+}
+
+/// Apply a `SqlPayloadFilter` to a raw observation payload. Returns `true` if the
+/// observation passes the filter, `false` if it should be excluded.
+fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bool {
+    let get_json = || -> Option<serde_json::Value> {
+        let bytes = payload?;
+        let text = std::str::from_utf8(bytes).ok()?;
+        serde_json::from_str(text).ok()
+    };
+
+    match filter.op {
+        SqlPayloadOp::IsNull => {
+            let v = get_json();
+            v.as_ref()
+                .and_then(|j| j.get(&filter.field))
+                .map(|f| f.is_null())
+                .unwrap_or(true)
+        }
+        SqlPayloadOp::IsNotNull => {
+            let v = get_json();
+            v.as_ref()
+                .and_then(|j| j.get(&filter.field))
+                .map(|f| !f.is_null())
+                .unwrap_or(false)
+        }
+        _ => {
+            let json = match get_json() {
+                Some(j) => j,
+                None => return false,
+            };
+            let field_val = match json.get(&filter.field) {
+                Some(v) if !v.is_null() => v.clone(),
+                _ => return false,
+            };
+            match &filter.value {
+                SqlPayloadValue::Str(s) => {
+                    let field_str = match &field_val {
+                        serde_json::Value::String(fs) => fs.as_str(),
+                        _ => return false,
+                    };
+                    match filter.op {
+                        SqlPayloadOp::Eq => field_str == s.as_str(),
+                        SqlPayloadOp::Ne => field_str != s.as_str(),
+                        SqlPayloadOp::StartsWith => field_str.starts_with(s.as_str()),
+                        SqlPayloadOp::EndsWith => field_str.ends_with(s.as_str()),
+                        SqlPayloadOp::Contains => field_str.contains(s.as_str()),
+                        SqlPayloadOp::Like => sql_like_match(field_str, s.as_str()),
+                        _ => false,
+                    }
+                }
+                SqlPayloadValue::Num(n) => {
+                    let field_num = match &field_val {
+                        serde_json::Value::Number(num) => {
+                            if let Some(f) = num.as_f64() {
+                                f
+                            } else {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    };
+                    match filter.op {
+                        SqlPayloadOp::Eq => (field_num - n).abs() < f64::EPSILON,
+                        SqlPayloadOp::Ne => (field_num - n).abs() >= f64::EPSILON,
+                        SqlPayloadOp::Gt => field_num > *n,
+                        SqlPayloadOp::Lt => field_num < *n,
+                        SqlPayloadOp::Gte => field_num >= *n,
+                        SqlPayloadOp::Lte => field_num <= *n,
+                        _ => false,
+                    }
+                }
+                SqlPayloadValue::Null => false,
+            }
+        }
+    }
 }
 
 /// Extract a JSON payload field value as a group key string.
@@ -310,9 +785,35 @@ impl BinderStore {
             builder = builder.extract_f64(extract_value);
         }
 
-        if let Some(prefix) = &q.id_prefix {
-            let prefix = prefix.clone();
-            builder = builder.filter(move |v| v.object_id.0.contains(prefix.as_str()));
+        // Combine id_filter and payload_filters into a single closure (filter() replaces).
+        if q.id_filter.is_some() || !q.payload_filters.is_empty() {
+            let id_filter = q.id_filter.clone();
+            let payload_filters = q.payload_filters.clone();
+            let ns_prefix = format!("{}:", q.namespace);
+            builder = builder.filter(move |v| {
+                if let Some(ref f) = id_filter {
+                    let id = v
+                        .object_id
+                        .0
+                        .strip_prefix(ns_prefix.as_str())
+                        .unwrap_or(&v.object_id.0);
+                    let id_ok = match f {
+                        SqlIdFilter::StartsWith(s) => id.starts_with(s.as_str()),
+                        SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
+                        SqlIdFilter::Contains(s) => id.contains(s.as_str()),
+                        SqlIdFilter::Equals(s) => id == s.as_str(),
+                    };
+                    if !id_ok {
+                        return false;
+                    }
+                }
+                for pf in &payload_filters {
+                    if !apply_payload_filter(pf, v.payload.as_deref()) {
+                        return false;
+                    }
+                }
+                true
+            });
         }
 
         builder = match &q.group_by {
@@ -327,13 +828,117 @@ impl BinderStore {
             }
         };
 
-        builder.execute()
+        let results = builder.execute()?;
+
+        // Apply HAVING filter post-aggregation
+        let mut results = if let Some(having) = &q.having {
+            results
+                .into_iter()
+                .filter(|r| {
+                    let lhs = match having.agg {
+                        HavingAggregate::Count => r.count as f64,
+                        HavingAggregate::Value => r.value,
+                    };
+                    let rhs = having.threshold;
+                    match having.op {
+                        HavingOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
+                        HavingOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
+                        HavingOp::Gt => lhs > rhs,
+                        HavingOp::Lt => lhs < rhs,
+                        HavingOp::Gte => lhs >= rhs,
+                        HavingOp::Lte => lhs <= rhs,
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            results
+        };
+
+        // Apply ORDER BY sort (overrides the default group_key sort from aggregation.rs)
+        if let Some(ob) = &q.order_by {
+            match ob.field {
+                AggOrderByField::Value => {
+                    results.sort_by(|a, b| {
+                        a.value
+                            .partial_cmp(&b.value)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                AggOrderByField::Count => {
+                    results.sort_by_key(|r| r.count);
+                }
+                AggOrderByField::GroupKey => {
+                    results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+                }
+            }
+            if ob.direction == AggOrderDirection::Desc {
+                results.reverse();
+            }
+        }
+
+        // Apply OFFSET then LIMIT (OFFSET first so LIMIT picks from the right window)
+        if let Some(n) = q.offset {
+            if n >= results.len() {
+                results.clear();
+            } else {
+                results.drain(..n);
+            }
+        }
+        if let Some(n) = q.limit {
+            results.truncate(n);
+        }
+
+        Ok(results)
     }
 }
 
 // ── Columnar projection (issue #5) ───────────────────────────────────────────
 
-/// A parsed `SELECT PAYLOAD_FIELD(…) [, …] FROM … [WHERE …] [LIMIT n]` query.
+/// Comparison operator for a `WHERE PAYLOAD_FIELD` filter in a projection query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlPayloadOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    StartsWith,
+    EndsWith,
+    Contains,
+    IsNull,
+    IsNotNull,
+    /// `LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
+    Like,
+}
+
+/// A value to compare against in a `WHERE PAYLOAD_FIELD` filter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlPayloadValue {
+    Str(String),
+    Num(f64),
+    Null,
+}
+
+/// `WHERE PAYLOAD_FIELD('field') OP value` filter for a projection query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlPayloadFilter {
+    pub field: String,
+    pub op: SqlPayloadOp,
+    pub value: SqlPayloadValue,
+}
+
+/// Sort direction for `ORDER BY` in a projection query.
+pub use AggOrderDirection as SqlProjectDirection;
+
+/// `ORDER BY PAYLOAD_FIELD('field') [ASC|DESC]` sort clause for `SqlProjectQuery`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlProjectOrderBy {
+    pub field: String,
+    pub direction: AggOrderDirection,
+}
+
+/// A parsed `SELECT PAYLOAD_FIELD(…) [, …] FROM … [WHERE …] [ORDER BY …] [LIMIT n]` query.
 ///
 /// Returns one row per matching observation; each row holds the projected field
 /// values as JSON. Missing or non-JSON fields become `null`.
@@ -341,13 +946,24 @@ impl BinderStore {
 /// ```text
 /// SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('score') FROM 'obs://activities'
 /// SELECT PAYLOAD_FIELD('category') FROM 'obs://items' WHERE id STARTS WITH '2024' LIMIT 100
+/// SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('status') = 'active'
+/// SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('score') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('score') DESC LIMIT 5
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqlProjectQuery {
     /// Field names to extract from each observation's JSON payload.
     pub fields: Vec<String>,
     pub namespace: String,
-    pub id_prefix: Option<String>,
+    /// When `true`, each row includes an `"id"` key holding the full object_id string.
+    pub return_id: bool,
+    /// Optional `WHERE id ...` filter applied to object_id suffix after namespace prefix.
+    pub id_filter: Option<SqlIdFilter>,
+    /// `WHERE PAYLOAD_FIELD('f') OP value` pre-filter (AND-combined, Vec matches SqlAggregateQuery).
+    pub payload_filters: Vec<SqlPayloadFilter>,
+    /// Optional `ORDER BY PAYLOAD_FIELD('f') [ASC|DESC]` sort.
+    pub order_by: Option<SqlProjectOrderBy>,
+    /// Number of rows to skip before applying LIMIT (applied after ORDER BY).
+    pub offset: Option<usize>,
     pub limit: Option<usize>,
 }
 
@@ -364,15 +980,32 @@ impl SqlProjectQuery {
         let mut s = skip_keyword(raw, "SELECT");
 
         let mut fields = Vec::new();
+        let mut return_id = false;
         loop {
             s = s.trim_start();
             if starts_with_keyword(s, "FROM") {
                 break;
             }
+            // `id` — return the full object_id as the `"id"` column
+            // Allow `id` followed by `,`, whitespace, or end (not just whitespace).
+            let su = s.to_ascii_uppercase();
+            let is_id = su.starts_with("ID,")
+                || su.starts_with("ID ")
+                || su == "ID"
+                || su.starts_with("ID\t");
+            if is_id {
+                return_id = true;
+                s = &s[2..]; // skip "id"
+                s = s.trim_start();
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
             let su = s.to_ascii_uppercase();
             if !su.starts_with("PAYLOAD_FIELD(") {
                 return Err(SqlAggError::Unsupported(
-                    "SELECT list must contain only PAYLOAD_FIELD('name') expressions".into(),
+                    "SELECT list must contain id or PAYLOAD_FIELD('name') expressions".into(),
                 ));
             }
             let after_pf = &s["PAYLOAD_FIELD(".len()..];
@@ -390,9 +1023,9 @@ impl SqlProjectQuery {
             }
         }
 
-        if fields.is_empty() {
+        if fields.is_empty() && !return_id {
             return Err(SqlAggError::Unsupported(
-                "SELECT list must have at least one PAYLOAD_FIELD".into(),
+                "SELECT list must have at least one id or PAYLOAD_FIELD expression".into(),
             ));
         }
 
@@ -400,11 +1033,96 @@ impl SqlProjectQuery {
         let (namespace, rest) = parse_quoted(s)?;
         s = rest.trim_start();
 
-        let id_prefix = if starts_with_keyword(s, "WHERE") {
-            let after_where = skip_keyword(s, "WHERE");
-            let (prefix, rest2) = parse_where_id_prefix(after_where)?;
-            s = rest2.trim_start();
-            Some(prefix)
+        let (id_filter, payload_filters) = if starts_with_keyword(s, "WHERE") {
+            let after_where = skip_keyword(s, "WHERE").trim_start();
+            let su = after_where.to_ascii_uppercase();
+            if su.starts_with("PAYLOAD_FIELD(") {
+                let (pfs, rest2) = parse_payload_filter_chain(after_where)?;
+                s = rest2.trim_start();
+                (None, pfs)
+            } else {
+                let (filter, rest2) = parse_where_id_filter(after_where)?;
+                let rest2 = rest2.trim_start();
+                // Optional AND PAYLOAD_FIELD(...) chain after the id filter
+                if starts_with_keyword(rest2, "AND") {
+                    let after_and = skip_keyword(rest2, "AND").trim_start();
+                    if after_and.to_ascii_uppercase().starts_with("PAYLOAD_FIELD(") {
+                        let (pfs, rem2) = parse_payload_filter_chain(after_and)?;
+                        s = rem2.trim_start();
+                        (Some(filter), pfs)
+                    } else {
+                        s = rest2;
+                        (Some(filter), vec![])
+                    }
+                } else {
+                    s = rest2;
+                    (Some(filter), vec![])
+                }
+            }
+        } else {
+            (None, vec![])
+        };
+
+        let order_by = if starts_with_keyword(s, "ORDER") {
+            let after_order = skip_keyword(s, "ORDER").trim_start();
+            if !starts_with_keyword(after_order, "BY") {
+                return Err(SqlAggError::Unsupported("expected ORDER BY".into()));
+            }
+            let after_by = skip_keyword(after_order, "BY").trim_start();
+            let su = after_by.to_ascii_uppercase();
+            if starts_with_keyword(after_by, "id") {
+                // ORDER BY id [ASC|DESC]
+                let rest2 = skip_keyword(after_by, "id").trim_start();
+                let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
+                    (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
+                } else if starts_with_keyword(rest2, "ASC") {
+                    (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+                } else {
+                    (AggOrderDirection::Asc, rest2)
+                };
+                s = rest2.trim_start();
+                Some(SqlProjectOrderBy {
+                    field: "id".to_string(),
+                    direction,
+                })
+            } else if su.starts_with("PAYLOAD_FIELD(") {
+                let after_pf = &after_by["PAYLOAD_FIELD(".len()..];
+                let (field, rest2) = parse_quoted_sql(after_pf)?;
+                let rest2 = rest2.trim_start();
+                if !rest2.starts_with(')') {
+                    return Err(SqlAggError::Unsupported(
+                        "expected ')' after PAYLOAD_FIELD in ORDER BY".into(),
+                    ));
+                }
+                let rest2 = rest2[1..].trim_start();
+                let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
+                    (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
+                } else if starts_with_keyword(rest2, "ASC") {
+                    (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+                } else {
+                    (AggOrderDirection::Asc, rest2)
+                };
+                s = rest2.trim_start();
+                Some(SqlProjectOrderBy { field, direction })
+            } else {
+                return Err(SqlAggError::Unsupported(
+                    "ORDER BY must be id or PAYLOAD_FIELD('field')".into(),
+                ));
+            }
+        } else {
+            None
+        };
+
+        let offset = if starts_with_keyword(s, "OFFSET") {
+            let after_offset = skip_keyword(s, "OFFSET").trim_start();
+            let end = after_offset
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_offset.len());
+            let n: usize = after_offset[..end].parse().map_err(|_| {
+                SqlAggError::Unsupported("OFFSET must be a non-negative integer".into())
+            })?;
+            s = after_offset[end..].trim_start();
+            Some(n)
         } else {
             None
         };
@@ -432,7 +1150,11 @@ impl SqlProjectQuery {
         Ok(SqlProjectQuery {
             fields,
             namespace,
-            id_prefix,
+            return_id,
+            id_filter,
+            payload_filters,
+            order_by,
+            offset,
             limit,
         })
     }
@@ -473,31 +1195,114 @@ impl BinderStore {
     ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError> {
         let versions = self.list(&q.namespace)?;
 
+        let ns_prefix = format!("{}:", q.namespace);
         let iter = versions.iter().filter(|v| {
-            if let Some(prefix) = &q.id_prefix {
-                v.object_id.0.contains(prefix.as_str())
-            } else {
-                true
+            if let Some(ref f) = q.id_filter {
+                let id = v
+                    .object_id
+                    .0
+                    .strip_prefix(ns_prefix.as_str())
+                    .unwrap_or(&v.object_id.0);
+                let ok = match f {
+                    SqlIdFilter::StartsWith(s) => id.starts_with(s.as_str()),
+                    SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
+                    SqlIdFilter::Contains(s) => id.contains(s.as_str()),
+                    SqlIdFilter::Equals(s) => id == s.as_str(),
+                };
+                if !ok {
+                    return false;
+                }
             }
+            for pf in &q.payload_filters {
+                if !apply_payload_filter(pf, v.payload.as_deref()) {
+                    return false;
+                }
+            }
+            true
         });
 
+        // When ORDER BY references a field not in SELECT, we need to project it
+        // temporarily for sorting, then strip it from the output rows.
+        let sort_key_extra = q
+            .order_by
+            .as_ref()
+            .filter(|ob| ob.field != "id" && !q.fields.contains(&ob.field))
+            .map(|ob| ob.field.clone());
+
+        let return_id = q.return_id;
         let mut rows: Vec<std::collections::HashMap<String, serde_json::Value>> = iter
             .map(|v| {
-                q.fields
+                let mut row: std::collections::HashMap<String, serde_json::Value> = q
+                    .fields
                     .iter()
                     .map(|field| {
                         let val = project_payload_field(v.payload.as_deref(), field);
                         (field.clone(), val)
                     })
-                    .collect()
+                    .collect();
+                if return_id {
+                    row.insert(
+                        "id".to_string(),
+                        serde_json::Value::String(v.object_id.0.clone()),
+                    );
+                }
+                if let Some(ref sk) = sort_key_extra {
+                    row.insert(sk.clone(), project_payload_field(v.payload.as_deref(), sk));
+                }
+                row
             })
             .collect();
+
+        if let Some(ob) = &q.order_by {
+            let field = ob.field.clone();
+            let desc = ob.direction == AggOrderDirection::Desc;
+            rows.sort_by(|a, b| {
+                let av = a.get(&field).cloned().unwrap_or(serde_json::Value::Null);
+                let bv = b.get(&field).cloned().unwrap_or(serde_json::Value::Null);
+                let ord = compare_json_for_sort(&av, &bv);
+                if desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+        }
+
+        // Remove the temporary sort key if it wasn't in the original SELECT list.
+        if let Some(ref sk) = sort_key_extra {
+            for row in &mut rows {
+                row.remove(sk);
+            }
+        }
+
+        if let Some(n) = q.offset {
+            if n >= rows.len() {
+                rows.clear();
+            } else {
+                rows.drain(..n);
+            }
+        }
 
         if let Some(limit) = q.limit {
             rows.truncate(limit);
         }
 
         Ok(rows)
+    }
+}
+
+fn compare_json_for_sort(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (serde_json::Value::Number(na), serde_json::Value::Number(nb)) => {
+            let fa = na.as_f64().unwrap_or(f64::NAN);
+            let fb = nb.as_f64().unwrap_or(f64::NAN);
+            fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (serde_json::Value::String(sa), serde_json::Value::String(sb)) => sa.cmp(sb),
+        (serde_json::Value::Null, serde_json::Value::Null) => std::cmp::Ordering::Equal,
+        (serde_json::Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, serde_json::Value::Null) => std::cmp::Ordering::Less,
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
@@ -512,7 +1317,7 @@ mod tests {
         assert_eq!(q.namespace, "obs://sleep");
         assert!(!q.needs_value);
         assert_eq!(q.group_by, SqlGroupBy::None);
-        assert_eq!(q.id_prefix, None);
+        assert_eq!(q.id_filter, None);
     }
 
     #[test]
@@ -524,18 +1329,18 @@ mod tests {
         assert_eq!(q.aggregate, Aggregate::Avg);
         assert!(q.needs_value);
         assert_eq!(q.group_by, SqlGroupBy::PathSegment(1));
-        assert_eq!(q.id_prefix, None);
+        assert_eq!(q.id_filter, None);
     }
 
     #[test]
-    fn parses_where_id_prefix() {
+    fn parses_where_id_filter() {
         let q = SqlAggregateQuery::parse(
             "SELECT AVG(VALUE) FROM 'obs://sleep' WHERE id STARTS WITH '2024'",
         )
         .unwrap();
         assert_eq!(q.aggregate, Aggregate::Avg);
         assert_eq!(q.namespace, "obs://sleep");
-        assert_eq!(q.id_prefix, Some("2024".into()));
+        assert_eq!(q.id_filter, Some(SqlIdFilter::StartsWith("2024".into())));
         assert_eq!(q.group_by, SqlGroupBy::None);
     }
 
@@ -545,7 +1350,7 @@ mod tests {
             "SELECT COUNT(*) FROM 'obs://sleep' WHERE id STARTS WITH '2024' GROUP BY PATH_SEGMENT(1)",
         )
         .unwrap();
-        assert_eq!(q.id_prefix, Some("2024".into()));
+        assert_eq!(q.id_filter, Some(SqlIdFilter::StartsWith("2024".into())));
         assert_eq!(q.group_by, SqlGroupBy::PathSegment(1));
     }
 
