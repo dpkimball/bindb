@@ -2353,3 +2353,172 @@ fn agg_multikey_both_fields_null_group() {
         .unwrap_or(false));
     store.close().unwrap();
 }
+
+// ── Edge payload predicates / AND r.field OP value (issue #2) ────────────────
+
+fn build_weighted_graph(store: &BinderStore) {
+    // root → 4 nodes via edges that carry a JSON payload with a "weight" field.
+    //   edge to n://strong1: {"weight": 0.9, "kind": "strong"}
+    //   edge to n://strong2: {"weight": 0.8, "kind": "strong"}
+    //   edge to n://weak1:   {"weight": 0.3, "kind": "weak"}
+    //   edge to n://untyped: no payload (None)
+    let mut tx = Transaction::new();
+    tx.put_object(obj("h://wroot"), b"{}".to_vec());
+    tx.put_object(obj("n://strong1"), br#"{"label":"s1"}"#.to_vec());
+    tx.put_object(obj("n://strong2"), br#"{"label":"s2"}"#.to_vec());
+    tx.put_object(obj("n://weak1"), br#"{"label":"w1"}"#.to_vec());
+    tx.put_object(obj("n://untyped"), br#"{"label":"u1"}"#.to_vec());
+    tx.put_edge(
+        eid("we1"),
+        obj("h://wroot"),
+        obj("n://strong1"),
+        "REL",
+        Some(br#"{"weight":0.9,"kind":"strong"}"#.to_vec()),
+    );
+    tx.put_edge(
+        eid("we2"),
+        obj("h://wroot"),
+        obj("n://strong2"),
+        "REL",
+        Some(br#"{"weight":0.8,"kind":"strong"}"#.to_vec()),
+    );
+    tx.put_edge(
+        eid("we3"),
+        obj("h://wroot"),
+        obj("n://weak1"),
+        "REL",
+        Some(br#"{"weight":0.3,"kind":"weak"}"#.to_vec()),
+    );
+    tx.put_edge(
+        eid("we4"),
+        obj("h://wroot"),
+        obj("n://untyped"),
+        "REL",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+}
+
+#[test]
+fn edge_pred_parse_captures_r_field() {
+    // Parser: AND r.weight > 0.5 → edge_preds = [PayloadPred { field: "weight", op: Gt, value: Number(0.5) }]
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' AND r.weight > 0.5 RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q.edge_preds.len(), 1);
+    assert_eq!(q.edge_preds[0].field, "weight");
+    assert_eq!(q.edge_preds[0].op, CmpOp::Gt);
+    assert_eq!(q.edge_preds[0].value, CmpValue::Number(0.5));
+    assert!(q.payload_preds.is_empty(), "b preds unaffected");
+}
+
+#[test]
+fn edge_pred_filters_by_numeric_weight() {
+    // AND r.weight > 0.5 should return only strong1 and strong2.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let matches = store
+        .graph_ir("MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' AND r.weight > 0.5 RETURN b")
+        .unwrap();
+
+    let ids: Vec<_> = matches
+        .iter()
+        .map(|m| m.object.object_id.0.as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "only strong1 + strong2 pass weight > 0.5");
+    assert!(ids.contains(&"n://strong1"));
+    assert!(ids.contains(&"n://strong2"));
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_pred_string_eq_filters_by_kind() {
+    // AND r.kind = 'weak' should return only weak1.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let matches = store
+        .graph_ir("MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' AND r.kind = 'weak' RETURN b")
+        .unwrap();
+
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].object.object_id.0, "n://weak1");
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_pred_no_payload_edges_excluded() {
+    // Edges with None payload don't match any predicate → untyped node excluded.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let matches = store
+        .graph_ir("MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' AND r.weight >= 0.1 RETURN b")
+        .unwrap();
+
+    let ids: Vec<_> = matches
+        .iter()
+        .map(|m| m.object.object_id.0.as_str())
+        .collect();
+    assert!(!ids.contains(&"n://untyped"), "no-payload edge excluded");
+    assert_eq!(ids.len(), 3, "strong1, strong2, weak1 all pass");
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_pred_combined_with_node_pred() {
+    // AND r.weight > 0.5 AND b.label = 's1' → only strong1.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let matches = store
+        .graph_ir(
+            "MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' \
+             AND r.weight > 0.5 AND b.label = 's1' RETURN b",
+        )
+        .unwrap();
+
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].object.object_id.0, "n://strong1");
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_pred_multiple_r_preds() {
+    // AND r.weight > 0.5 AND r.kind = 'strong' → strong1 and strong2.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' \
+         AND r.weight > 0.5 AND r.kind = 'strong' RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q.edge_preds.len(), 2);
+
+    let matches = store.graph_ir_parsed(&q).unwrap();
+    assert_eq!(matches.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_pred_rel_var_in_pattern_accepted() {
+    // [r:REL] syntax in the pattern is valid (r is stripped from rel body).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let matches = store
+        .graph_ir("MATCH (a)-[r:REL]->(b) WHERE id(a) = 'h://wroot' AND r.weight > 0.5 RETURN b")
+        .unwrap();
+
+    assert_eq!(matches.len(), 2, "same result with or without r in pattern");
+    store.close().unwrap();
+}

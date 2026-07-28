@@ -282,6 +282,10 @@ pub struct GraphIrQuery {
     /// All predicates must hold for a node to be included in results.
     /// Empty = no payload filtering.
     pub payload_preds: Vec<PayloadPred>,
+    /// Payload field predicates applied to each traversal edge (AND-combined).
+    /// Edges whose payload does not match all predicates are skipped; the BFS
+    /// does not follow them. Empty = no edge filtering.
+    pub edge_preds: Vec<PayloadPred>,
     /// Fields to project from each matched node's JSON payload (`RETURN b.f1, b.f2`).
     /// Empty = plain node return via `graph_ir` / `graph_ir_parsed`.
     pub return_fields: Vec<String>,
@@ -331,8 +335,9 @@ impl GraphIrQuery {
         let (start, end_pred, after_preds) = parse_where(after_where)?;
         let after_preds = after_preds.trim_start();
 
-        // Optional payload predicates: AND b.FIELD OP VALUE (may repeat)
+        // Optional payload predicates: AND b.FIELD OP VALUE or AND r.FIELD OP VALUE (may repeat)
         let mut payload_preds: Vec<PayloadPred> = Vec::new();
+        let mut edge_preds: Vec<PayloadPred> = Vec::new();
         let mut after_preds2 = after_preds;
         loop {
             if starts_with_keyword(after_preds2, "AND") {
@@ -340,6 +345,11 @@ impl GraphIrQuery {
                 if after_and.starts_with("b.") || after_and.starts_with("B.") {
                     let (pred, rest) = parse_payload_pred(after_and)?;
                     payload_preds.push(pred);
+                    after_preds2 = rest.trim_start();
+                    continue;
+                } else if after_and.starts_with("r.") || after_and.starts_with("R.") {
+                    let (pred, rest) = parse_payload_pred_for_var(after_and, "r")?;
+                    edge_preds.push(pred);
                     after_preds2 = rest.trim_start();
                     continue;
                 }
@@ -438,6 +448,7 @@ impl GraphIrQuery {
             direction,
             end_pred,
             payload_preds,
+            edge_preds,
             return_fields,
             return_path,
             order_by,
@@ -556,7 +567,26 @@ fn parse_pattern(s: &str) -> Result<(Direction, Vec<String>, usize, usize, &str)
 
 fn parse_rel_body(body: &str) -> Result<(Vec<String>, usize, usize), GraphIrError> {
     // Forms: "", "*2", "*1..3", ":KNOWS", ":KNOWS|TAGGED", ":KNOWS*1..3", ":A|B*2"
+    // Also accepts an optional relationship variable prefix: "r:KNOWS*1..3", "rel*1..2"
     let body = body.trim();
+    if body.is_empty() {
+        return Ok((Vec::new(), 1, 6));
+    }
+    // Strip optional leading variable name (identifier chars before ':' or '*').
+    let body = {
+        let var_end = body
+            .find(|c: char| c == ':' || c == '*')
+            .unwrap_or(body.len());
+        if var_end > 0
+            && body[..var_end]
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            &body[var_end..]
+        } else {
+            body
+        }
+    };
     if body.is_empty() {
         return Ok((Vec::new(), 1, 6));
     }
@@ -1241,6 +1271,14 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
         let preds = q.payload_preds.clone();
         builder = builder.filter_node(move |obj| {
             let payload = obj.payload.as_deref().unwrap_or(&[]);
+            preds.iter().all(|pred| apply_payload_pred(payload, pred))
+        });
+    }
+
+    if !q.edge_preds.is_empty() {
+        let preds = q.edge_preds.clone();
+        builder = builder.filter_edge(move |edge| {
+            let payload = edge.payload.as_deref().unwrap_or(&[]);
             preds.iter().all(|pred| apply_payload_pred(payload, pred))
         });
     }
