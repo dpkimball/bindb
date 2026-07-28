@@ -36,7 +36,8 @@ pub use object::{BinderObjectVersion, ObjectVersionId};
 pub use provenance::{Provenance, ProvenanceSource};
 pub use sql_agg::{
     AggOrderBy, AggOrderByField, AggOrderDirection, HavingAggregate, HavingClause, HavingOp,
-    SqlAggError, SqlAggregateQuery, SqlGroupBy, SqlIdFilter, SqlProjectQuery,
+    SqlAggError, SqlAggregateQuery, SqlGroupBy, SqlIdFilter, SqlPayloadFilter, SqlPayloadOp,
+    SqlPayloadValue, SqlProjectQuery,
 };
 pub use transaction::Transaction;
 pub use types::{CommitId, EdgeId, ObjectId};

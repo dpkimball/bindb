@@ -762,3 +762,156 @@ fn id_filter_combined_with_group_by() {
     assert_eq!(keys, vec![Some("humidity"), Some("temperature")]);
     store.close().unwrap();
 }
+
+// ── WHERE PAYLOAD_FIELD filter for sql_project (issue #5) ────────────────────
+
+fn build_payload_filter_store() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://users:1"),
+        br#"{"name":"alice","score":90,"status":"active"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://users:2"),
+        br#"{"name":"bob","score":40,"status":"inactive"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://users:3"),
+        br#"{"name":"carol","score":75,"status":"active"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://users:4"),
+        br#"{"name":"dave","score":60}"#.to_vec(), // no status field
+    );
+    store.commit(tx, "test", "seed").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn project_payload_filter_eq_string() {
+    // WHERE PAYLOAD_FIELD('status') = 'active' → alice and carol
+    let (store, _dir) = build_payload_filter_store();
+    let mut rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('status') = 'active'",
+        )
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(rows[1].get("name").and_then(|v| v.as_str()), Some("carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_gte_num() {
+    // WHERE PAYLOAD_FIELD('score') >= 75 → alice(90) and carol(75)
+    let (store, _dir) = build_payload_filter_store();
+    let mut rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('score') >= 75",
+        )
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(rows[1].get("name").and_then(|v| v.as_str()), Some("carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_lt_num() {
+    // WHERE PAYLOAD_FIELD('score') < 70 → bob(40) and dave(60)
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('score') < 70",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_is_null_skips_present_field() {
+    // WHERE PAYLOAD_FIELD('status') IS NULL → dave only (no status field)
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('status') IS NULL",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("dave"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_is_not_null_returns_present() {
+    // WHERE PAYLOAD_FIELD('status') IS NOT NULL → alice, bob, carol (not dave)
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('status') IS NOT NULL",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_contains_string() {
+    // WHERE PAYLOAD_FIELD('name') CONTAINS 'ar' → carol
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('name') CONTAINS 'ar'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_combined_with_limit() {
+    // WHERE PAYLOAD_FIELD('score') > 50 LIMIT 2 → at most 2 of alice/carol/dave
+    let (store, _dir) = build_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('score') > 50 LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_parse_roundtrip() {
+    use bindb::{SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' WHERE PAYLOAD_FIELD('score') >= 10",
+    )
+    .unwrap();
+    assert_eq!(
+        q.payload_filter,
+        Some(SqlPayloadFilter {
+            field: "score".into(),
+            op: SqlPayloadOp::Gte,
+            value: SqlPayloadValue::Num(10.0),
+        })
+    );
+    assert_eq!(q.id_prefix, None);
+}

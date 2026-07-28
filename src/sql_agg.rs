@@ -479,6 +479,187 @@ fn parse_agg_order_by(s: &str) -> Result<(AggOrderBy, &str), SqlAggError> {
     Ok((AggOrderBy { field, direction }, rest.trim_start()))
 }
 
+/// Parse `PAYLOAD_FIELD('field') OP value` after the WHERE keyword.
+/// Returns `(SqlPayloadFilter, remaining_text)`.
+fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError> {
+    let su = s.to_ascii_uppercase();
+    if !su.starts_with("PAYLOAD_FIELD(") {
+        return Err(SqlAggError::Unsupported(
+            "WHERE payload filter must start with PAYLOAD_FIELD('field')".into(),
+        ));
+    }
+    let after_pf = &s["PAYLOAD_FIELD(".len()..];
+    let (field, rest) = parse_quoted_sql(after_pf)?;
+    let rest = rest.trim_start();
+    if !rest.starts_with(')') {
+        return Err(SqlAggError::Unsupported(
+            "expected ')' after PAYLOAD_FIELD argument".into(),
+        ));
+    }
+    let after_close = rest[1..].trim_start();
+
+    // Parse operator
+    let (op, after_op) = if starts_with_keyword(after_close, "STARTS WITH") {
+        (
+            SqlPayloadOp::StartsWith,
+            skip_keyword(after_close, "STARTS WITH"),
+        )
+    } else if starts_with_keyword(after_close, "ENDS WITH") {
+        (
+            SqlPayloadOp::EndsWith,
+            skip_keyword(after_close, "ENDS WITH"),
+        )
+    } else if starts_with_keyword(after_close, "CONTAINS") {
+        (
+            SqlPayloadOp::Contains,
+            skip_keyword(after_close, "CONTAINS"),
+        )
+    } else if starts_with_keyword(after_close, "IS NOT NULL") {
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::IsNotNull,
+                value: SqlPayloadValue::Null,
+            },
+            skip_keyword(after_close, "IS NOT NULL").trim_start(),
+        ));
+    } else if starts_with_keyword(after_close, "IS NULL") {
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::IsNull,
+                value: SqlPayloadValue::Null,
+            },
+            skip_keyword(after_close, "IS NULL").trim_start(),
+        ));
+    } else if let Some(r) = after_close.strip_prefix(">=") {
+        (SqlPayloadOp::Gte, r)
+    } else if let Some(r) = after_close.strip_prefix("<=") {
+        (SqlPayloadOp::Lte, r)
+    } else if let Some(r) = after_close.strip_prefix("!=") {
+        (SqlPayloadOp::Ne, r)
+    } else if let Some(r) = after_close.strip_prefix('>') {
+        (SqlPayloadOp::Gt, r)
+    } else if let Some(r) = after_close.strip_prefix('<') {
+        (SqlPayloadOp::Lt, r)
+    } else if let Some(r) = after_close.strip_prefix('=') {
+        (SqlPayloadOp::Eq, r)
+    } else {
+        return Err(SqlAggError::Unsupported(
+            "unrecognised operator in WHERE PAYLOAD_FIELD clause".into(),
+        ));
+    };
+
+    let after_op = after_op.trim_start();
+
+    // Parse value: quoted string or numeric literal
+    if after_op.starts_with('\'') || after_op.starts_with('"') {
+        let (s, rest2) = parse_quoted(after_op)?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op,
+                value: SqlPayloadValue::Str(s),
+            },
+            rest2.trim_start(),
+        ));
+    }
+    let num_end = after_op
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(after_op.len());
+    if num_end == 0 {
+        return Err(SqlAggError::Unsupported(
+            "expected quoted string or number in WHERE PAYLOAD_FIELD clause".into(),
+        ));
+    }
+    let n: f64 = after_op[..num_end]
+        .parse()
+        .map_err(|_| SqlAggError::Unsupported("invalid number in WHERE PAYLOAD_FIELD".into()))?;
+    Ok((
+        SqlPayloadFilter {
+            field,
+            op,
+            value: SqlPayloadValue::Num(n),
+        },
+        after_op[num_end..].trim_start(),
+    ))
+}
+
+/// Apply a `SqlPayloadFilter` to a raw observation payload. Returns `true` if the
+/// observation passes the filter, `false` if it should be excluded.
+fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bool {
+    let get_json = || -> Option<serde_json::Value> {
+        let bytes = payload?;
+        let text = std::str::from_utf8(bytes).ok()?;
+        serde_json::from_str(text).ok()
+    };
+
+    match filter.op {
+        SqlPayloadOp::IsNull => {
+            let v = get_json();
+            v.as_ref()
+                .and_then(|j| j.get(&filter.field))
+                .map(|f| f.is_null())
+                .unwrap_or(true)
+        }
+        SqlPayloadOp::IsNotNull => {
+            let v = get_json();
+            v.as_ref()
+                .and_then(|j| j.get(&filter.field))
+                .map(|f| !f.is_null())
+                .unwrap_or(false)
+        }
+        _ => {
+            let json = match get_json() {
+                Some(j) => j,
+                None => return false,
+            };
+            let field_val = match json.get(&filter.field) {
+                Some(v) if !v.is_null() => v.clone(),
+                _ => return false,
+            };
+            match &filter.value {
+                SqlPayloadValue::Str(s) => {
+                    let field_str = match &field_val {
+                        serde_json::Value::String(fs) => fs.as_str(),
+                        _ => return false,
+                    };
+                    match filter.op {
+                        SqlPayloadOp::Eq => field_str == s.as_str(),
+                        SqlPayloadOp::Ne => field_str != s.as_str(),
+                        SqlPayloadOp::StartsWith => field_str.starts_with(s.as_str()),
+                        SqlPayloadOp::EndsWith => field_str.ends_with(s.as_str()),
+                        SqlPayloadOp::Contains => field_str.contains(s.as_str()),
+                        _ => false,
+                    }
+                }
+                SqlPayloadValue::Num(n) => {
+                    let field_num = match &field_val {
+                        serde_json::Value::Number(num) => {
+                            if let Some(f) = num.as_f64() {
+                                f
+                            } else {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    };
+                    match filter.op {
+                        SqlPayloadOp::Eq => (field_num - n).abs() < f64::EPSILON,
+                        SqlPayloadOp::Ne => (field_num - n).abs() >= f64::EPSILON,
+                        SqlPayloadOp::Gt => field_num > *n,
+                        SqlPayloadOp::Lt => field_num < *n,
+                        SqlPayloadOp::Gte => field_num >= *n,
+                        SqlPayloadOp::Lte => field_num <= *n,
+                        _ => false,
+                    }
+                }
+                SqlPayloadValue::Null => false,
+            }
+        }
+    }
+}
+
 /// Extract a JSON payload field value as a group key string.
 /// Returns `None` for non-JSON payloads or missing fields (those go into the None group).
 fn payload_field_group_key(payload: Option<&[u8]>, field: &str) -> Option<String> {
@@ -633,6 +814,38 @@ impl BinderStore {
 
 // ── Columnar projection (issue #5) ───────────────────────────────────────────
 
+/// Comparison operator for a `WHERE PAYLOAD_FIELD` filter in a projection query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlPayloadOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    StartsWith,
+    EndsWith,
+    Contains,
+    IsNull,
+    IsNotNull,
+}
+
+/// A value to compare against in a `WHERE PAYLOAD_FIELD` filter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlPayloadValue {
+    Str(String),
+    Num(f64),
+    Null,
+}
+
+/// `WHERE PAYLOAD_FIELD('field') OP value` filter for a projection query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlPayloadFilter {
+    pub field: String,
+    pub op: SqlPayloadOp,
+    pub value: SqlPayloadValue,
+}
+
 /// A parsed `SELECT PAYLOAD_FIELD(…) [, …] FROM … [WHERE …] [LIMIT n]` query.
 ///
 /// Returns one row per matching observation; each row holds the projected field
@@ -641,13 +854,17 @@ impl BinderStore {
 /// ```text
 /// SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('score') FROM 'obs://activities'
 /// SELECT PAYLOAD_FIELD('category') FROM 'obs://items' WHERE id STARTS WITH '2024' LIMIT 100
+/// SELECT PAYLOAD_FIELD('name') FROM 'obs://users' WHERE PAYLOAD_FIELD('status') = 'active'
+/// SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('score') FROM 'obs://items' WHERE PAYLOAD_FIELD('score') >= 10 LIMIT 5
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqlProjectQuery {
     /// Field names to extract from each observation's JSON payload.
     pub fields: Vec<String>,
     pub namespace: String,
     pub id_prefix: Option<String>,
+    /// Optional `WHERE PAYLOAD_FIELD('f') OP value` filter.
+    pub payload_filter: Option<SqlPayloadFilter>,
     pub limit: Option<usize>,
 }
 
@@ -700,19 +917,26 @@ impl SqlProjectQuery {
         let (namespace, rest) = parse_quoted(s)?;
         s = rest.trim_start();
 
-        let id_prefix = if starts_with_keyword(s, "WHERE") {
-            let after_where = skip_keyword(s, "WHERE");
-            let (filter, rest2) = parse_where_id_filter(after_where)?;
-            s = rest2.trim_start();
-            let prefix = match filter {
-                SqlIdFilter::StartsWith(p) => p,
-                SqlIdFilter::Equals(p) => p,
-                SqlIdFilter::EndsWith(p) => p,
-                SqlIdFilter::Contains(p) => p,
-            };
-            Some(prefix)
+        let (id_prefix, payload_filter) = if starts_with_keyword(s, "WHERE") {
+            let after_where = skip_keyword(s, "WHERE").trim_start();
+            let su = after_where.to_ascii_uppercase();
+            if su.starts_with("PAYLOAD_FIELD(") {
+                let (pf, rest2) = parse_payload_filter(after_where)?;
+                s = rest2.trim_start();
+                (None, Some(pf))
+            } else {
+                let (filter, rest2) = parse_where_id_filter(after_where)?;
+                s = rest2.trim_start();
+                let prefix = match filter {
+                    SqlIdFilter::StartsWith(p) => p,
+                    SqlIdFilter::Equals(p) => p,
+                    SqlIdFilter::EndsWith(p) => p,
+                    SqlIdFilter::Contains(p) => p,
+                };
+                (Some(prefix), None)
+            }
         } else {
-            None
+            (None, None)
         };
 
         let limit = if starts_with_keyword(s, "LIMIT") {
@@ -739,6 +963,7 @@ impl SqlProjectQuery {
             fields,
             namespace,
             id_prefix,
+            payload_filter,
             limit,
         })
     }
@@ -781,10 +1006,16 @@ impl BinderStore {
 
         let iter = versions.iter().filter(|v| {
             if let Some(prefix) = &q.id_prefix {
-                v.object_id.0.contains(prefix.as_str())
-            } else {
-                true
+                if !v.object_id.0.contains(prefix.as_str()) {
+                    return false;
+                }
             }
+            if let Some(pf) = &q.payload_filter {
+                if !apply_payload_filter(pf, v.payload.as_deref()) {
+                    return false;
+                }
+            }
+            true
         });
 
         let mut rows: Vec<std::collections::HashMap<String, serde_json::Value>> = iter
