@@ -3611,3 +3611,160 @@ fn between_on_edge_payload() {
     assert_eq!(results[0].object.object_id.0, "item://a");
     store.close().unwrap();
 }
+
+// ── LIKE predicate (issue #2) ─────────────────────────────────────────────────
+
+fn build_like_graph(store: &BinderStore) {
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://root"), b"{}".to_vec());
+    tx.put_object(
+        obj("node://alice"),
+        br#"{"name":"alice@corp.com","code":"US01"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://bob"),
+        br#"{"name":"bob@corp.com","code":"US02"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://carol"),
+        br#"{"name":"carol@other.com","code":"EU01"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://dave"),
+        br#"{"name":"dave","code":"EU02"}"#.to_vec(), // no @ — won't match email pattern
+    );
+    tx.put_edge(
+        eid("e1"),
+        obj("hub://root"),
+        obj("node://alice"),
+        "HAS",
+        None,
+    );
+    tx.put_edge(eid("e2"), obj("hub://root"), obj("node://bob"), "HAS", None);
+    tx.put_edge(
+        eid("e3"),
+        obj("hub://root"),
+        obj("node://carol"),
+        "HAS",
+        None,
+    );
+    tx.put_edge(
+        eid("e4"),
+        obj("hub://root"),
+        obj("node://dave"),
+        "HAS",
+        None,
+    );
+    store.commit(tx, "test", "seed").unwrap();
+}
+
+#[test]
+fn like_prefix_wildcard() {
+    // LIKE 'alice%' → alice only
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_like_graph(&store);
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.name LIKE 'alice%' RETURN b",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "node://alice");
+    store.close().unwrap();
+}
+
+#[test]
+fn like_suffix_wildcard() {
+    // LIKE '%@corp.com' → alice and bob
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_like_graph(&store);
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.name LIKE '%@corp.com' RETURN b",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let ids: std::collections::HashSet<_> = results
+        .iter()
+        .map(|r| r.object.object_id.0.as_str())
+        .collect();
+    assert!(ids.contains("node://alice") && ids.contains("node://bob"));
+    store.close().unwrap();
+}
+
+#[test]
+fn like_both_wildcards() {
+    // LIKE '%@%.com' → alice, bob, carol (all with @something.com)
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_like_graph(&store);
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.name LIKE '%@%.com' RETURN b",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn like_underscore_wildcard() {
+    // LIKE 'US0_' → US01, US02 (2 chars: U S 0 and any 1 char)
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_like_graph(&store);
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.code LIKE 'US0_' RETURN b",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn like_no_wildcards_exact() {
+    // LIKE 'alice@corp.com' → exact match
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_like_graph(&store);
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.name LIKE 'alice@corp.com' RETURN b",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "node://alice");
+    store.close().unwrap();
+}
+
+#[test]
+fn like_parse_roundtrip() {
+    use bindb::{CmpOp, CmpValue, GraphIrQuery};
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.name LIKE 'a%c' RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q.payload_preds.len(), 1);
+    let pred = &q.payload_preds[0];
+    assert_eq!(pred.field, "name");
+    assert_eq!(pred.op, CmpOp::Like);
+    assert_eq!(pred.value, CmpValue::Text("a%c".into()));
+}
+
+#[test]
+fn like_no_match_returns_empty() {
+    // LIKE 'xyz%' → none
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_like_graph(&store);
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.name LIKE 'xyz%' RETURN b",
+        )
+        .unwrap();
+    assert!(results.is_empty());
+    store.close().unwrap();
+}

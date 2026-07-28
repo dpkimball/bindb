@@ -138,6 +138,8 @@ pub enum CmpOp {
     NotIn,
     /// `b.field BETWEEN lo AND hi` — numeric range, inclusive on both ends
     Between,
+    /// `b.field LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
+    Like,
 }
 
 /// Right-hand side of a payload predicate.
@@ -845,8 +847,10 @@ fn parse_payload_pred_inner<'a>(
         ));
     }
 
-    // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS) before symbols
-    let (op, rest) = if starts_with_keyword(rest, "STARTS WITH") {
+    // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS, LIKE) before symbols
+    let (op, rest) = if starts_with_keyword(rest, "LIKE") {
+        (CmpOp::Like, skip_keyword(rest, "LIKE").trim_start())
+    } else if starts_with_keyword(rest, "STARTS WITH") {
         (
             CmpOp::StartsWith,
             skip_keyword(rest, "STARTS WITH").trim_start(),
@@ -1353,6 +1357,31 @@ fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
 
 /// Evaluate a payload predicate against raw payload bytes.
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
+/// Match `text` against a SQL LIKE pattern. `%` matches any sequence; `_` matches one char.
+fn like_match(text: &str, pattern: &str) -> bool {
+    // dp[i][j] = text[..i] matches pattern[..j]
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (tn, pn) = (t.len(), p.len());
+    let mut dp = vec![vec![false; pn + 1]; tn + 1];
+    dp[0][0] = true;
+    for j in 1..=pn {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
+    }
+    for i in 1..=tn {
+        for j in 1..=pn {
+            dp[i][j] = match p[j - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && t[i - 1] == c,
+            };
+        }
+    }
+    dp[tn][pn]
+}
+
 fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
     let result = apply_payload_pred_inner(payload, pred);
     if pred.negated {
@@ -1401,8 +1430,8 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
                 // Already handled above
                 CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
-                // IN/NOT IN handled via StringList arm; Between via NumberRange
-                CmpOp::In | CmpOp::NotIn | CmpOp::Between => false,
+                // IN/NOT IN handled via StringList arm; Between via NumberRange; Like on text only
+                CmpOp::In | CmpOp::NotIn | CmpOp::Between | CmpOp::Like => false,
             }
         }
         CmpValue::NumberRange(lo, hi) => {
@@ -1437,6 +1466,7 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::NotIn => lhs != rhs.as_str(),
                 // BETWEEN on a text field never matches
                 CmpOp::Between => false,
+                CmpOp::Like => like_match(lhs, rhs.as_str()),
             }
         }
         CmpValue::Null => false,
