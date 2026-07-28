@@ -574,9 +574,7 @@ fn parse_rel_body(body: &str) -> Result<(Vec<String>, usize, usize), GraphIrErro
     }
     // Strip optional leading variable name (identifier chars before ':' or '*').
     let body = {
-        let var_end = body
-            .find(|c: char| c == ':' || c == '*')
-            .unwrap_or(body.len());
+        let var_end = body.find([':', '*']).unwrap_or(body.len());
         if var_end > 0
             && body[..var_end]
                 .chars()
