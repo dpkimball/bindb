@@ -2640,3 +2640,129 @@ fn edge_return_r_only_no_b_fields() {
     assert!(kinds.contains(&"weak"));
     store.close().unwrap();
 }
+
+// ── RETURN path edge_path — edge IDs along path (issue #2) ───────────────────
+
+#[test]
+fn path_edge_path_single_hop() {
+    // Chain a -[e1]-> b: edge_path should contain ["e1"].
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ep://a"), b"{}".to_vec());
+    tx.put_object(obj("ep://b"), b"{}".to_vec());
+    tx.put_edge(eid("ep_e1"), obj("ep://a"), obj("ep://b"), "HOP", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:HOP]->(b) WHERE id(a) = 'ep://a' RETURN path").unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        row.path.iter().map(|id| id.0.as_str()).collect::<Vec<_>>(),
+        vec!["ep://a", "ep://b"]
+    );
+    assert_eq!(
+        row.edge_path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ep_e1"]
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn path_edge_path_multi_hop() {
+    // Chain a -[e1]-> b -[e2]-> c: edge_path for c should be ["e1", "e2"].
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ep2://a"), b"{}".to_vec());
+    tx.put_object(obj("ep2://b"), b"{}".to_vec());
+    tx.put_object(obj("ep2://c"), b"{}".to_vec());
+    tx.put_edge(eid("ep2_e1"), obj("ep2://a"), obj("ep2://b"), "HOP2", None);
+    tx.put_edge(eid("ep2_e2"), obj("ep2://b"), obj("ep2://c"), "HOP2", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse("MATCH (a)-[:HOP2*1..3]->(b) WHERE id(a) = 'ep2://a' RETURN path")
+        .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    let row_c = rows.iter().find(|r| r.object_id.0 == "ep2://c").unwrap();
+    assert_eq!(
+        row_c
+            .path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ep2://a", "ep2://b", "ep2://c"]
+    );
+    assert_eq!(
+        row_c
+            .edge_path
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ep2_e1", "ep2_e2"]
+    );
+    // edge_path length = path length - 1
+    assert_eq!(row_c.edge_path.len(), row_c.path.len() - 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn path_edge_path_empty_when_not_requested() {
+    // Without RETURN path, edge_path is empty.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ep3://a"), b"{}".to_vec());
+    tx.put_object(obj("ep3://b"), b"{}".to_vec());
+    tx.put_edge(eid("ep3_e1"), obj("ep3://a"), obj("ep3://b"), "HOP3", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse("MATCH (a)-[:HOP3]->(b) WHERE id(a) = 'ep3://a' RETURN b").unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].edge_path.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn path_edge_path_with_edge_payload() {
+    // Edges carry payloads; edge_path IDs can be used to identify them.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ep4://src"), b"{}".to_vec());
+    tx.put_object(obj("ep4://dst"), b"{}".to_vec());
+    tx.put_edge(
+        eid("ep4_weighted"),
+        obj("ep4://src"),
+        obj("ep4://dst"),
+        "W",
+        Some(br#"{"weight":0.7}"#.to_vec()),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:W]->(b) WHERE id(a) = 'ep4://src' RETURN path, r.weight")
+            .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].edge_path[0].0, "ep4_weighted");
+    assert_eq!(
+        rows[0].edge_fields.get("weight").and_then(|v| v.as_f64()),
+        Some(0.7)
+    );
+    store.close().unwrap();
+}

@@ -237,7 +237,12 @@ pub struct GraphIrRow {
     /// Fields projected from the via-edge (`RETURN r.field`). Empty when no
     /// `r.` fields were requested.
     pub edge_fields: HashMap<String, serde_json::Value>,
+    /// Node IDs from start to this node when `RETURN path` was requested; otherwise empty.
+    /// Length N means N nodes (start inclusive). Parallel to `edge_path`.
     pub path: Vec<ObjectId>,
+    /// Edge IDs traversed along `path` when `RETURN path` was requested; otherwise empty.
+    /// Length N-1 for a path of N nodes: `edge_path[i]` is the edge from `path[i]` to `path[i+1]`.
+    pub edge_path: Vec<crate::types::EdgeId>,
     /// Result of the `OPTIONAL MATCH` clause, if present in the query.
     pub optional: Option<GraphIrOptionalMatch>,
 }
@@ -1230,18 +1235,24 @@ fn reconstruct_path(
     start: &ObjectId,
     node: &ObjectId,
     parent_map: &HashMap<ObjectId, ObjectId>,
-) -> Vec<ObjectId> {
-    let mut path = vec![node.clone()];
+    parent_edge_map: &HashMap<ObjectId, crate::types::EdgeId>,
+) -> (Vec<ObjectId>, Vec<crate::types::EdgeId>) {
+    let mut nodes = vec![node.clone()];
+    let mut edges = Vec::new();
     let mut current = node;
     while let Some(parent) = parent_map.get(current) {
-        path.push(parent.clone());
+        if let Some(eid) = parent_edge_map.get(current) {
+            edges.push(eid.clone());
+        }
+        nodes.push(parent.clone());
         current = parent;
         if current == start {
             break;
         }
     }
-    path.reverse();
-    path
+    nodes.reverse();
+    edges.reverse();
+    (nodes, edges)
 }
 
 /// Build a `GraphQuery` from a `GraphIrQuery` (shared by `graph_ir_parsed` and
@@ -1435,18 +1446,19 @@ impl BinderStore {
     /// Fields absent from the payload or non-JSON payloads produce no entry for that key.
     /// For plain `RETURN b` with no optional clause, prefer `graph_ir_parsed`.
     pub fn graph_ir_projected(&self, q: &GraphIrQuery) -> Result<Vec<GraphIrRow>, StoreError> {
-        let (mut matches, parent_map) = if q.return_path {
-            let (mut ms, pm) = self.execute_graph_query_with_paths(build_graph_query(self, q))?;
+        let (mut matches, parent_map, parent_edge_map) = if q.return_path {
+            let (mut ms, pm, pem) =
+                self.execute_graph_query_with_paths(build_graph_query(self, q))?;
             if q.min_depth > 1 {
                 ms.retain(|m| m.depth >= q.min_depth);
             }
-            (ms, pm)
+            (ms, pm, pem)
         } else {
             let mut ms = build_graph_query(self, q).execute()?;
             if q.min_depth > 1 {
                 ms.retain(|m| m.depth >= q.min_depth);
             }
-            (ms, HashMap::new())
+            (ms, HashMap::new(), HashMap::new())
         };
 
         // Pre-expansion ordering: WITH clause controls mandatory results.
@@ -1494,10 +1506,10 @@ impl BinderStore {
                 }
             }
 
-            let path = if q.return_path {
-                reconstruct_path(start, &m.object.object_id, &parent_map)
+            let (path, edge_path) = if q.return_path {
+                reconstruct_path(start, &m.object.object_id, &parent_map, &parent_edge_map)
             } else {
-                vec![]
+                (vec![], vec![])
             };
 
             if let Some(opt_clause) = &q.optional_clause {
@@ -1509,6 +1521,7 @@ impl BinderStore {
                         fields: b_fields,
                         edge_fields: r_fields,
                         path,
+                        edge_path,
                         optional: None,
                     });
                 } else {
@@ -1519,6 +1532,7 @@ impl BinderStore {
                             fields: b_fields.clone(),
                             edge_fields: r_fields.clone(),
                             path: path.clone(),
+                            edge_path: edge_path.clone(),
                             optional: Some(opt),
                         });
                     }
@@ -1530,6 +1544,7 @@ impl BinderStore {
                     fields: b_fields,
                     edge_fields: r_fields,
                     path,
+                    edge_path,
                     optional: None,
                 });
             }
