@@ -63,6 +63,8 @@ pub enum SqlIdFilter {
     Contains(String),
     /// `WHERE id = 'exact'`
     Equals(String),
+    /// `WHERE id IN ('a', 'b', 'c')` — matches any of the listed suffixes
+    In(Vec<String>),
 }
 
 /// Comparison operator for a HAVING clause.
@@ -326,7 +328,7 @@ fn parse_where_id_filter(s: &str) -> Result<(SqlIdFilter, &str), SqlAggError> {
     let s = s.trim_start();
     if !starts_with_keyword(s, "id") {
         return Err(SqlAggError::Unsupported(
-            "WHERE clause must be: id STARTS WITH / ENDS WITH / CONTAINS / = '…'".into(),
+            "WHERE clause must be: id STARTS WITH / ENDS WITH / CONTAINS / = / IN '…'".into(),
         ));
     }
     let after_id = skip_keyword(s, "id");
@@ -342,13 +344,38 @@ fn parse_where_id_filter(s: &str) -> Result<(SqlIdFilter, &str), SqlAggError> {
         let after_kw = skip_keyword(after_id, "CONTAINS");
         let (val, rest) = parse_quoted(after_kw)?;
         Ok((SqlIdFilter::Contains(val), rest.trim_start()))
+    } else if starts_with_keyword(after_id, "IN") {
+        let after_kw = skip_keyword(after_id, "IN").trim_start();
+        let (vals, rest) = parse_quoted_list(after_kw)?;
+        Ok((SqlIdFilter::In(vals), rest.trim_start()))
     } else if let Some(after_eq) = after_id.trim_start().strip_prefix('=') {
         let (val, rest) = parse_quoted(after_eq)?;
         Ok((SqlIdFilter::Equals(val), rest.trim_start()))
     } else {
         Err(SqlAggError::Unsupported(
-            "WHERE id must be followed by STARTS WITH, ENDS WITH, CONTAINS, or =".into(),
+            "WHERE id must be followed by STARTS WITH, ENDS WITH, CONTAINS, IN, or =".into(),
         ))
+    }
+}
+
+/// Parse a parenthesised list of quoted strings: `('a', 'b', 'c')`.
+fn parse_quoted_list(s: &str) -> Result<(Vec<String>, &str), SqlAggError> {
+    let s = s.trim_start();
+    let s = s
+        .strip_prefix('(')
+        .ok_or_else(|| SqlAggError::Unsupported("expected '(' before id IN list".into()))?;
+    let mut vals = Vec::new();
+    let mut rest = s.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix(')') {
+            return Ok((vals, after));
+        }
+        let (val, after) = parse_quoted(rest)?;
+        vals.push(val);
+        rest = after.trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+        }
     }
 }
 
@@ -881,6 +908,7 @@ impl BinderStore {
                         SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
                         SqlIdFilter::Contains(s) => id.contains(s.as_str()),
                         SqlIdFilter::Equals(s) => id == s.as_str(),
+                        SqlIdFilter::In(vs) => vs.iter().any(|s| id == s.as_str()),
                     };
                     if !id_ok {
                         return false;
@@ -1051,6 +1079,8 @@ pub struct SqlProjectQuery {
     pub namespace: String,
     /// When `true`, each row includes an `"id"` key holding the full object_id string.
     pub return_id: bool,
+    /// When `true`, duplicate rows (identical projected field values) are removed.
+    pub distinct: bool,
     /// Optional `WHERE id ...` filter applied to object_id suffix after namespace prefix.
     pub id_filter: Option<SqlIdFilter>,
     /// `WHERE PAYLOAD_FIELD('f') OP value` pre-filter.
@@ -1075,6 +1105,14 @@ impl SqlProjectQuery {
             return Err(SqlAggError::Unsupported("must start with SELECT".into()));
         }
         let mut s = skip_keyword(raw, "SELECT");
+
+        // Optional DISTINCT keyword immediately after SELECT.
+        let distinct = if starts_with_keyword(s, "DISTINCT") {
+            s = skip_keyword(s, "DISTINCT");
+            true
+        } else {
+            false
+        };
 
         let mut fields = Vec::new();
         let mut return_id = false;
@@ -1248,6 +1286,7 @@ impl SqlProjectQuery {
             fields,
             namespace,
             return_id,
+            distinct,
             id_filter,
             payload_filters,
             payload_combinator,
@@ -1306,6 +1345,7 @@ impl BinderStore {
                     SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
                     SqlIdFilter::Contains(s) => id.contains(s.as_str()),
                     SqlIdFilter::Equals(s) => id == s.as_str(),
+                    SqlIdFilter::In(vs) => vs.iter().any(|s| id == s.as_str()),
                 };
                 if !ok {
                     return false;
@@ -1379,6 +1419,22 @@ impl BinderStore {
             for row in &mut rows {
                 row.remove(sk);
             }
+        }
+
+        // DISTINCT: remove duplicate rows (identical projected field values).
+        if q.distinct {
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|row| {
+                // Use sorted-key JSON serialisation as the dedup key.
+                let mut pairs: Vec<_> = row.iter().collect();
+                pairs.sort_by_key(|(k, _)| k.as_str());
+                let key = pairs
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                seen.insert(key)
+            });
         }
 
         if let Some(n) = q.offset {

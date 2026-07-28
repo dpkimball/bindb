@@ -28,7 +28,8 @@ pub use error::StoreError;
 pub use graph_ir::{
     AggFunc, CmpOp, CmpValue, GraphIrError, GraphIrOptionalClause, GraphIrOptionalMatch,
     GraphIrOrderBy, GraphIrQuery, GraphIrRow, GraphIrWithClause, GraphIrWrite, GraphIrWriteError,
-    NodeIdPred, OrderByField, OrderDirection, PayloadPred, WithAggregation, WriteOp,
+    NodeIdPred, OrderByField, OrderDirection, PayloadPred, PayloadPredCombinator, WithAggregation,
+    WriteOp,
 };
 pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;
