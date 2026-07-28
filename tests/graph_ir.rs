@@ -3401,3 +3401,65 @@ fn return_id_parse_flag_not_set_without_keyword() {
         .unwrap();
     assert!(!q.return_id);
 }
+
+// ── id(b) ENDS WITH / CONTAINS (NodeIdPred extensions, issue #2) ─────────────
+
+#[test]
+fn end_pred_ends_with_filters_targets() {
+    // id(b) ENDS WITH 'alice' → only rid://alice
+    let (store, _dir) = build_return_id_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'rid://root' AND id(b) ENDS WITH 'alice' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "rid://alice");
+    store.close().unwrap();
+}
+
+#[test]
+fn end_pred_contains_filters_targets() {
+    // id(b) CONTAINS '//b' → rid://bob
+    let (store, _dir) = build_return_id_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'rid://root' AND id(b) CONTAINS '//b' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "rid://bob");
+    store.close().unwrap();
+}
+
+#[test]
+fn end_pred_ends_with_multiple_matches() {
+    // id(b) ENDS WITH 'ol' → carol (rid://carol ends with 'ol')
+    let (store, _dir) = build_return_id_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'rid://root' AND id(b) ENDS WITH 'ol' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "rid://carol");
+    store.close().unwrap();
+}
+
+#[test]
+fn end_pred_parse_ends_with() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'ns://root' AND id(b) ENDS WITH '://suffix' RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q.end_pred, NodeIdPred::EndsWith("://suffix".into()));
+}
+
+#[test]
+fn end_pred_parse_contains() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'ns://root' AND id(b) CONTAINS 'mid' RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q.end_pred, NodeIdPred::Contains("mid".into()));
+}

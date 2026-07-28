@@ -108,6 +108,8 @@ pub enum NodeIdPred {
     /// No predicate on matched end nodes.
     Any,
     StartsWith(String),
+    EndsWith(String),
+    Contains(String),
     Equals(String),
 }
 
@@ -873,58 +875,40 @@ fn parse_id_eq<'a>(s: &'a str, var: &str) -> Result<(ObjectId, &'a str), GraphIr
 }
 
 fn parse_end_pred(s: &str) -> Result<(NodeIdPred, &str), GraphIrError> {
-    let s = s.trim_start();
-    let prefix = "id(b)";
-    if s.len() < prefix.len() || !s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        return Err(GraphIrError::Unsupported(
-            "AND clause must be id(b) STARTS WITH or id(b) =".into(),
-        ));
-    }
-    let after = s[prefix.len()..].trim_start();
-    if starts_with_keyword(after, "STARTS") {
-        let after_starts = skip_keyword(after, "STARTS");
-        if !starts_with_keyword(after_starts, "WITH") {
-            return Err(GraphIrError::Unsupported("expected STARTS WITH".into()));
-        }
-        let after_with = skip_keyword(after_starts, "WITH");
-        let (val, rest) = parse_quoted(after_with)?;
-        Ok((NodeIdPred::StartsWith(val), rest))
-    } else if let Some(after_eq) = after.strip_prefix('=') {
-        let (val, rest) = parse_quoted(after_eq.trim_start())?;
-        Ok((NodeIdPred::Equals(val), rest))
-    } else {
-        Err(GraphIrError::Unsupported(
-            "expected id(b) STARTS WITH or id(b) =".into(),
-        ))
-    }
+    parse_end_pred_for_var(s, "b")
 }
 
-/// Parse `id(VAR) STARTS WITH '…'` or `id(VAR) = '…'` for a named variable.
+/// Parse `id(VAR) STARTS WITH / ENDS WITH / CONTAINS / = '…'` for a named variable.
 fn parse_end_pred_for_var<'a>(
     s: &'a str,
     var: &str,
 ) -> Result<(NodeIdPred, &'a str), GraphIrError> {
     let prefix = format!("id({var})");
+    let s = s.trim_start();
     if s.len() < prefix.len() || !s[..prefix.len()].eq_ignore_ascii_case(&prefix) {
         return Err(GraphIrError::Unsupported(format!(
-            "expected id({var}) STARTS WITH or id({var}) ="
+            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, or id({var}) ="
         )));
     }
     let after = s[prefix.len()..].trim_start();
-    if starts_with_keyword(after, "STARTS") {
-        let after_starts = skip_keyword(after, "STARTS");
-        if !starts_with_keyword(after_starts, "WITH") {
-            return Err(GraphIrError::Unsupported("expected STARTS WITH".into()));
-        }
-        let after_with = skip_keyword(after_starts, "WITH");
-        let (val, rest) = parse_quoted(after_with)?;
+    if starts_with_keyword(after, "STARTS WITH") {
+        let after_kw = skip_keyword(after, "STARTS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
         Ok((NodeIdPred::StartsWith(val), rest))
+    } else if starts_with_keyword(after, "ENDS WITH") {
+        let after_kw = skip_keyword(after, "ENDS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((NodeIdPred::EndsWith(val), rest))
+    } else if starts_with_keyword(after, "CONTAINS") {
+        let after_kw = skip_keyword(after, "CONTAINS");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((NodeIdPred::Contains(val), rest))
     } else if let Some(after_eq) = after.strip_prefix('=') {
         let (val, rest) = parse_quoted(after_eq.trim_start())?;
         Ok((NodeIdPred::Equals(val), rest))
     } else {
         Err(GraphIrError::Unsupported(format!(
-            "expected id({var}) STARTS WITH or id({var}) ="
+            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, or id({var}) ="
         )))
     }
 }
@@ -1456,6 +1440,14 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
             let pfx = pfx.clone();
             builder.filter_node(move |obj| obj.object_id.0.starts_with(&pfx))
         }
+        NodeIdPred::EndsWith(sfx) => {
+            let sfx = sfx.clone();
+            builder.filter_node(move |obj| obj.object_id.0.ends_with(sfx.as_str()))
+        }
+        NodeIdPred::Contains(sub) => {
+            let sub = sub.clone();
+            builder.filter_node(move |obj| obj.object_id.0.contains(sub.as_str()))
+        }
         NodeIdPred::Equals(id) => {
             let id = id.clone();
             builder.filter_node(move |obj| obj.object_id.0 == id)
@@ -1764,6 +1756,12 @@ fn apply_with_clause(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause)
         NodeIdPred::StartsWith(pfx) => {
             matches.retain(|m| m.object.object_id.0.starts_with(pfx.as_str()));
         }
+        NodeIdPred::EndsWith(sfx) => {
+            matches.retain(|m| m.object.object_id.0.ends_with(sfx.as_str()));
+        }
+        NodeIdPred::Contains(sub) => {
+            matches.retain(|m| m.object.object_id.0.contains(sub.as_str()));
+        }
         NodeIdPred::Equals(id) => {
             matches.retain(|m| m.object.object_id.0 == id.as_str());
         }
@@ -1866,6 +1864,14 @@ fn execute_optional_clause(
             let pfx = pfx.clone();
             builder.filter_node(move |obj| obj.object_id.0.starts_with(&pfx))
         }
+        NodeIdPred::EndsWith(sfx) => {
+            let sfx = sfx.clone();
+            builder.filter_node(move |obj| obj.object_id.0.ends_with(sfx.as_str()))
+        }
+        NodeIdPred::Contains(sub) => {
+            let sub = sub.clone();
+            builder.filter_node(move |obj| obj.object_id.0.contains(sub.as_str()))
+        }
         NodeIdPred::Equals(id) => {
             let id = id.clone();
             builder.filter_node(move |obj| obj.object_id.0 == id)
@@ -1922,6 +1928,12 @@ fn apply_with_clause_filter(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWith
         NodeIdPred::Any => {}
         NodeIdPred::StartsWith(pfx) => {
             matches.retain(|m| m.object.object_id.0.starts_with(pfx.as_str()));
+        }
+        NodeIdPred::EndsWith(sfx) => {
+            matches.retain(|m| m.object.object_id.0.ends_with(sfx.as_str()));
+        }
+        NodeIdPred::Contains(sub) => {
+            matches.retain(|m| m.object.object_id.0.contains(sub.as_str()));
         }
         NodeIdPred::Equals(id) => {
             matches.retain(|m| m.object.object_id.0 == id.as_str());
