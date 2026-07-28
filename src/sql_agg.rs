@@ -907,6 +907,8 @@ pub struct SqlProjectQuery {
     /// Field names to extract from each observation's JSON payload.
     pub fields: Vec<String>,
     pub namespace: String,
+    /// When `true`, each row includes an `"id"` key holding the full object_id string.
+    pub return_id: bool,
     /// Optional `WHERE id ...` filter applied to object_id suffix after namespace prefix.
     pub id_filter: Option<SqlIdFilter>,
     /// Optional `WHERE PAYLOAD_FIELD('f') OP value` filter.
@@ -931,15 +933,32 @@ impl SqlProjectQuery {
         let mut s = skip_keyword(raw, "SELECT");
 
         let mut fields = Vec::new();
+        let mut return_id = false;
         loop {
             s = s.trim_start();
             if starts_with_keyword(s, "FROM") {
                 break;
             }
+            // `id` — return the full object_id as the `"id"` column
+            // Allow `id` followed by `,`, whitespace, or end (not just whitespace).
+            let su = s.to_ascii_uppercase();
+            let is_id = su.starts_with("ID,")
+                || su.starts_with("ID ")
+                || su == "ID"
+                || su.starts_with("ID\t");
+            if is_id {
+                return_id = true;
+                s = &s[2..]; // skip "id"
+                s = s.trim_start();
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
             let su = s.to_ascii_uppercase();
             if !su.starts_with("PAYLOAD_FIELD(") {
                 return Err(SqlAggError::Unsupported(
-                    "SELECT list must contain only PAYLOAD_FIELD('name') expressions".into(),
+                    "SELECT list must contain id or PAYLOAD_FIELD('name') expressions".into(),
                 ));
             }
             let after_pf = &s["PAYLOAD_FIELD(".len()..];
@@ -957,9 +976,9 @@ impl SqlProjectQuery {
             }
         }
 
-        if fields.is_empty() {
+        if fields.is_empty() && !return_id {
             return Err(SqlAggError::Unsupported(
-                "SELECT list must have at least one PAYLOAD_FIELD".into(),
+                "SELECT list must have at least one id or PAYLOAD_FIELD expression".into(),
             ));
         }
 
@@ -1005,29 +1024,45 @@ impl SqlProjectQuery {
             }
             let after_by = skip_keyword(after_order, "BY").trim_start();
             let su = after_by.to_ascii_uppercase();
-            if !su.starts_with("PAYLOAD_FIELD(") {
-                return Err(SqlAggError::Unsupported(
-                    "ORDER BY must be PAYLOAD_FIELD('field')".into(),
-                ));
-            }
-            let after_pf = &after_by["PAYLOAD_FIELD(".len()..];
-            let (field, rest2) = parse_quoted_sql(after_pf)?;
-            let rest2 = rest2.trim_start();
-            if !rest2.starts_with(')') {
-                return Err(SqlAggError::Unsupported(
-                    "expected ')' after PAYLOAD_FIELD in ORDER BY".into(),
-                ));
-            }
-            let rest2 = rest2[1..].trim_start();
-            let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
-                (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
-            } else if starts_with_keyword(rest2, "ASC") {
-                (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+            if starts_with_keyword(after_by, "id") {
+                // ORDER BY id [ASC|DESC]
+                let rest2 = skip_keyword(after_by, "id").trim_start();
+                let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
+                    (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
+                } else if starts_with_keyword(rest2, "ASC") {
+                    (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+                } else {
+                    (AggOrderDirection::Asc, rest2)
+                };
+                s = rest2.trim_start();
+                Some(SqlProjectOrderBy {
+                    field: "id".to_string(),
+                    direction,
+                })
+            } else if su.starts_with("PAYLOAD_FIELD(") {
+                let after_pf = &after_by["PAYLOAD_FIELD(".len()..];
+                let (field, rest2) = parse_quoted_sql(after_pf)?;
+                let rest2 = rest2.trim_start();
+                if !rest2.starts_with(')') {
+                    return Err(SqlAggError::Unsupported(
+                        "expected ')' after PAYLOAD_FIELD in ORDER BY".into(),
+                    ));
+                }
+                let rest2 = rest2[1..].trim_start();
+                let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
+                    (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
+                } else if starts_with_keyword(rest2, "ASC") {
+                    (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+                } else {
+                    (AggOrderDirection::Asc, rest2)
+                };
+                s = rest2.trim_start();
+                Some(SqlProjectOrderBy { field, direction })
             } else {
-                (AggOrderDirection::Asc, rest2)
-            };
-            s = rest2.trim_start();
-            Some(SqlProjectOrderBy { field, direction })
+                return Err(SqlAggError::Unsupported(
+                    "ORDER BY must be id or PAYLOAD_FIELD('field')".into(),
+                ));
+            }
         } else {
             None
         };
@@ -1069,6 +1104,7 @@ impl SqlProjectQuery {
         Ok(SqlProjectQuery {
             fields,
             namespace,
+            return_id,
             id_filter,
             payload_filter,
             order_by,
@@ -1144,9 +1180,10 @@ impl BinderStore {
         let sort_key_extra = q
             .order_by
             .as_ref()
-            .filter(|ob| !q.fields.contains(&ob.field))
+            .filter(|ob| ob.field != "id" && !q.fields.contains(&ob.field))
             .map(|ob| ob.field.clone());
 
+        let return_id = q.return_id;
         let mut rows: Vec<std::collections::HashMap<String, serde_json::Value>> = iter
             .map(|v| {
                 let mut row: std::collections::HashMap<String, serde_json::Value> = q
@@ -1157,6 +1194,12 @@ impl BinderStore {
                         (field.clone(), val)
                     })
                     .collect();
+                if return_id {
+                    row.insert(
+                        "id".to_string(),
+                        serde_json::Value::String(v.object_id.0.clone()),
+                    );
+                }
                 if let Some(ref sk) = sort_key_extra {
                     row.insert(sk.clone(), project_payload_field(v.payload.as_deref(), sk));
                 }

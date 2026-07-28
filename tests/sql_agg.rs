@@ -1273,3 +1273,87 @@ fn project_offset_beyond_end_returns_empty() {
     assert!(rows.is_empty());
     store.close().unwrap();
 }
+
+// ── SELECT id for sql_project (issue #5) ─────────────────────────────────────
+
+#[test]
+fn project_select_id_returns_object_id() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store.sql_project("SELECT id FROM 'obs://proj'").unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        let id = row.get("id").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            id.starts_with("obs://proj:"),
+            "id should be full object_id, got {id}"
+        );
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn project_select_id_and_payload_field() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store
+        .sql_project("SELECT id, PAYLOAD_FIELD('name') FROM 'obs://proj'")
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let alice_row = rows
+        .iter()
+        .find(|r| r.get("name").and_then(|v| v.as_str()) == Some("alice"))
+        .unwrap();
+    assert_eq!(
+        alice_row.get("id").and_then(|v| v.as_str()),
+        Some("obs://proj:a")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn project_select_id_with_filter() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store
+        .sql_project("SELECT id FROM 'obs://proj' WHERE id STARTS WITH 'b'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("id").and_then(|v| v.as_str()),
+        Some("obs://proj:b")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn project_select_id_order_by_id() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_projection_store(&store);
+    let rows = store
+        .sql_project("SELECT id, PAYLOAD_FIELD('name') FROM 'obs://proj' ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let ids: Vec<_> = rows.iter().filter_map(|r| r.get("id")?.as_str()).collect();
+    // IDs are obs://proj:a, obs://proj:b, obs://proj:c → lexicographic order
+    assert_eq!(ids, vec!["obs://proj:a", "obs://proj:b", "obs://proj:c"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_select_id_parse_roundtrip() {
+    let q = SqlProjectQuery::parse("SELECT id, PAYLOAD_FIELD('score') FROM 'obs://x'").unwrap();
+    assert!(q.return_id);
+    assert_eq!(q.fields, vec!["score"]);
+}
+
+#[test]
+fn project_select_id_only_parse() {
+    let q = SqlProjectQuery::parse("SELECT id FROM 'obs://x'").unwrap();
+    assert!(q.return_id);
+    assert!(q.fields.is_empty());
+}
