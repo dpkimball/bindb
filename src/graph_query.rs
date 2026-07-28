@@ -43,6 +43,10 @@ pub struct GraphQueryMatch {
     pub object: BinderObjectVersion,
     /// How many hops from the start node this object was found at.
     pub depth: usize,
+    /// The edge that was traversed to reach this node (BFS first-arrival edge).
+    /// `None` only when the match was synthesised outside of normal BFS (e.g.
+    /// optional-clause results that carry no direct edge reference).
+    pub via_edge: Option<BinderEdgeVersion>,
 }
 
 // ── builder ───────────────────────────────────────────────────────────────────
