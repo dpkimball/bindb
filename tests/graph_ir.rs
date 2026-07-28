@@ -2766,3 +2766,179 @@ fn path_edge_path_with_edge_payload() {
     );
     store.close().unwrap();
 }
+
+// ── string predicate tests (STARTS WITH / ENDS WITH / CONTAINS) ──────────────
+
+fn build_string_pred_graph() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    // Nodes with string payload fields
+    tx.put_object(
+        obj("sp://alice"),
+        br#"{"name":"Alice Smith","role":"admin","tag":"alpha-user"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("sp://bob"),
+        br#"{"name":"Bobby Jones","role":"editor","tag":"beta-user"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("sp://carol"),
+        br#"{"name":"Carol White","role":"admin","tag":"alpha-mod"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("sp://dave"),
+        br#"{"name":"Dave Brown","role":"viewer","tag":"gamma"}"#.to_vec(),
+    );
+    tx.put_object(obj("sp://root"), br#"{"name":"Root"}"#.to_vec());
+    // Edges from root to everyone
+    tx.put_edge(
+        eid("sp_e1"),
+        obj("sp://root"),
+        obj("sp://alice"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("sp_e2"),
+        obj("sp://root"),
+        obj("sp://bob"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("sp_e3"),
+        obj("sp://root"),
+        obj("sp://carol"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("sp_e4"),
+        obj("sp://root"),
+        obj("sp://dave"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn string_pred_starts_with_name() {
+    // AND b.name STARTS WITH 'A' → only Alice
+    let (store, _dir) = build_string_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sp://root' AND b.name STARTS WITH 'A' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "sp://alice");
+    store.close().unwrap();
+}
+
+#[test]
+fn string_pred_ends_with_role() {
+    // AND b.role ENDS WITH 'or' → "editor" matches; "viewer" ends with "er", "admin" ends with "n"
+    let (store, _dir) = build_string_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sp://root' AND b.role ENDS WITH 'or' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "sp://bob");
+    store.close().unwrap();
+}
+
+#[test]
+fn string_pred_contains_tag() {
+    // AND b.tag CONTAINS 'alpha' → alice + carol
+    let (store, _dir) = build_string_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sp://root' AND b.tag CONTAINS 'alpha' RETURN b",
+    )
+    .unwrap();
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].object_id.0, "sp://alice");
+    assert_eq!(rows[1].object_id.0, "sp://carol");
+    store.close().unwrap();
+}
+
+#[test]
+fn string_pred_combined_with_eq() {
+    // role = 'admin' AND name CONTAINS 'Carol' → just carol
+    let (store, _dir) = build_string_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sp://root' AND b.role = 'admin' AND b.name CONTAINS 'Carol' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "sp://carol");
+    store.close().unwrap();
+}
+
+#[test]
+fn string_pred_no_match_returns_empty() {
+    // STARTS WITH 'Z' → nobody
+    let (store, _dir) = build_string_pred_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sp://root' AND b.name STARTS WITH 'Z' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn string_pred_missing_field_skipped() {
+    // sp://root has no "role" field — should not appear in results.
+    // Query exactly 1 hop from alice: alice→root; root has no "role" → predicate fails → empty.
+    let (store, _dir) = build_string_pred_graph();
+    let mut tx = Transaction::new();
+    tx.put_edge(
+        eid("sp_rev"),
+        obj("sp://alice"),
+        obj("sp://root"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'sp://alice' AND b.role STARTS WITH 'a' RETURN b",
+    )
+    .unwrap();
+    // Root is the only 1-hop KNOWS target from alice; root has no "role" field → empty
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn string_pred_parse_op_variants() {
+    // Unit-level: verify CmpOp parsed correctly for all three string ops
+    let q1 = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' AND b.f STARTS WITH 'p' RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q1.payload_preds.len(), 1);
+    assert_eq!(q1.payload_preds[0].op, CmpOp::StartsWith);
+    assert_eq!(q1.payload_preds[0].value, CmpValue::Text("p".into()));
+
+    let q2 = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' AND b.f ENDS WITH 's' RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q2.payload_preds[0].op, CmpOp::EndsWith);
+
+    let q3 = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' AND b.f CONTAINS 'oo' RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q3.payload_preds[0].op, CmpOp::Contains);
+}

@@ -120,6 +120,12 @@ pub enum CmpOp {
     Lt,
     Gte,
     Lte,
+    /// `b.field STARTS WITH 'prefix'`
+    StartsWith,
+    /// `b.field ENDS WITH 'suffix'`
+    EndsWith,
+    /// `b.field CONTAINS 'substr'`
+    Contains,
 }
 
 /// Right-hand side of a payload predicate.
@@ -703,7 +709,20 @@ fn parse_payload_pred_inner<'a>(
     let field = s[..field_end].to_string();
     let rest = s[field_end..].trim_start();
 
-    let (op, rest) = if let Some(r) = rest.strip_prefix(">=") {
+    // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS) before symbols
+    let (op, rest) = if starts_with_keyword(rest, "STARTS WITH") {
+        (
+            CmpOp::StartsWith,
+            skip_keyword(rest, "STARTS WITH").trim_start(),
+        )
+    } else if starts_with_keyword(rest, "ENDS WITH") {
+        (
+            CmpOp::EndsWith,
+            skip_keyword(rest, "ENDS WITH").trim_start(),
+        )
+    } else if starts_with_keyword(rest, "CONTAINS") {
+        (CmpOp::Contains, skip_keyword(rest, "CONTAINS").trim_start())
+    } else if let Some(r) = rest.strip_prefix(">=") {
         (CmpOp::Gte, r.trim_start())
     } else if let Some(r) = rest.strip_prefix("<=") {
         (CmpOp::Lte, r.trim_start())
@@ -1210,6 +1229,8 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::Lt => lhs < *rhs,
                 CmpOp::Gte => lhs >= *rhs,
                 CmpOp::Lte => lhs <= *rhs,
+                // String ops on a numeric field never match
+                CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
             }
         }
         CmpValue::Text(rhs) => {
@@ -1224,6 +1245,9 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::Lt => lhs < rhs.as_str(),
                 CmpOp::Gte => lhs >= rhs.as_str(),
                 CmpOp::Lte => lhs <= rhs.as_str(),
+                CmpOp::StartsWith => lhs.starts_with(rhs.as_str()),
+                CmpOp::EndsWith => lhs.ends_with(rhs.as_str()),
+                CmpOp::Contains => lhs.contains(rhs.as_str()),
             }
         }
     }
