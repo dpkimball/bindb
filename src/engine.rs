@@ -1020,10 +1020,19 @@ impl BinderStore {
     /// Like `execute_graph_query` but also returns a `parent_map` for path
     /// reconstruction. Each entry maps a visited node to the node it was
     /// reached from; the start node has no entry (it is the root).
+    /// The second map records the edge used to first reach each node (edge parent map).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn execute_graph_query_with_paths(
         &self,
         q: GraphQuery<'_>,
-    ) -> Result<(Vec<GraphQueryMatch>, HashMap<ObjectId, ObjectId>), StoreError> {
+    ) -> Result<
+        (
+            Vec<GraphQueryMatch>,
+            HashMap<ObjectId, ObjectId>,
+            HashMap<ObjectId, EdgeId>,
+        ),
+        StoreError,
+    > {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
@@ -1041,6 +1050,7 @@ impl BinderStore {
 
         let mut results: Vec<GraphQueryMatch> = Vec::new();
         let mut parent_map: HashMap<ObjectId, ObjectId> = HashMap::new();
+        let mut parent_edge_map: HashMap<ObjectId, EdgeId> = HashMap::new();
 
         while let Some((current, depth)) = queue.pop_front() {
             if depth >= q.max_depth {
@@ -1107,6 +1117,7 @@ impl BinderStore {
                 }
                 visited.insert(neighbor.clone());
                 parent_map.insert(neighbor.clone(), current.clone());
+                parent_edge_map.insert(neighbor.clone(), eid.clone());
 
                 let Some(obj) = head_objects.get(neighbor) else {
                     continue;
@@ -1127,7 +1138,7 @@ impl BinderStore {
             }
         }
 
-        Ok((results, parent_map))
+        Ok((results, parent_map, parent_edge_map))
     }
 
     // ── observation aggregation ───────────────────────────────────────────────
