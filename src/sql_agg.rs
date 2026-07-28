@@ -52,7 +52,35 @@ pub enum SqlGroupBy {
     PayloadField(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Comparison operator for a HAVING clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HavingOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+}
+
+/// Which aggregate value to compare in the HAVING clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HavingAggregate {
+    /// `COUNT(*)` — compare against `AggregateResult::count`
+    Count,
+    /// Any `VALUE` aggregate — compare against `AggregateResult::value`
+    Value,
+}
+
+/// Post-aggregation filter: `HAVING COUNT(*) > 5` or `HAVING AVG(VALUE) >= 3.0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HavingClause {
+    pub agg: HavingAggregate,
+    pub op: HavingOp,
+    pub threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqlAggregateQuery {
     pub aggregate: Aggregate,
     pub namespace: String,
@@ -61,6 +89,8 @@ pub struct SqlAggregateQuery {
     pub needs_value: bool,
     /// Optional `WHERE id STARTS WITH '...'` filter applied to object_id.
     pub id_prefix: Option<String>,
+    /// Optional post-aggregation filter.
+    pub having: Option<HavingClause>,
 }
 
 impl SqlAggregateQuery {
@@ -94,11 +124,30 @@ impl SqlAggregateQuery {
             (None, rest)
         };
 
-        let group_by = if rest.trim_start().is_empty() {
-            SqlGroupBy::None
+        let mut rest = rest.trim_start();
+
+        let group_by = if starts_with_keyword(rest, "GROUP") {
+            let (gb, remaining) = parse_group_by(rest)?;
+            rest = remaining;
+            gb
         } else {
-            parse_group_by(rest.trim_start())?
+            SqlGroupBy::None
         };
+
+        let having = if starts_with_keyword(rest, "HAVING") {
+            let after_having = skip_keyword(rest, "HAVING").trim_start();
+            let (having_clause, remainder) = parse_having(after_having)?;
+            rest = remainder;
+            Some(having_clause)
+        } else {
+            None
+        };
+
+        if !rest.is_empty() {
+            return Err(SqlAggError::Unsupported(format!(
+                "trailing SQL not supported: {rest}"
+            )));
+        }
 
         Ok(SqlAggregateQuery {
             aggregate,
@@ -106,6 +155,7 @@ impl SqlAggregateQuery {
             group_by,
             needs_value,
             id_prefix,
+            having,
         })
     }
 }
@@ -184,7 +234,8 @@ fn parse_where_id_prefix(s: &str) -> Result<(String, &str), SqlAggError> {
     Ok((prefix, rest.trim_start()))
 }
 
-fn parse_group_by(s: &str) -> Result<SqlGroupBy, SqlAggError> {
+/// Returns `(SqlGroupBy, remaining_text)`.
+fn parse_group_by(s: &str) -> Result<(SqlGroupBy, &str), SqlAggError> {
     if !starts_with_keyword(s, "GROUP") {
         return Err(SqlAggError::Unsupported(format!(
             "trailing SQL not supported: {s}"
@@ -204,13 +255,8 @@ fn parse_group_by(s: &str) -> Result<SqlGroupBy, SqlAggError> {
             .trim()
             .parse()
             .map_err(|_| SqlAggError::BadPathSegment)?;
-        let trailing = orig[close + 1..].trim();
-        if !trailing.is_empty() {
-            return Err(SqlAggError::Unsupported(format!(
-                "trailing SQL: {trailing}"
-            )));
-        }
-        Ok(SqlGroupBy::PathSegment(idx))
+        let rest = orig[close + 1..].trim_start();
+        Ok((SqlGroupBy::PathSegment(idx), rest))
     } else if au.starts_with("PAYLOAD_FIELD(") {
         let orig = &after["PAYLOAD_FIELD(".len()..];
         let (field, rest) = parse_quoted_sql(orig)?;
@@ -220,13 +266,7 @@ fn parse_group_by(s: &str) -> Result<SqlGroupBy, SqlAggError> {
                 "expected ')' after PAYLOAD_FIELD argument".into(),
             ));
         }
-        let trailing = rest[1..].trim();
-        if !trailing.is_empty() {
-            return Err(SqlAggError::Unsupported(format!(
-                "trailing SQL: {trailing}"
-            )));
-        }
-        Ok(SqlGroupBy::PayloadField(field))
+        Ok((SqlGroupBy::PayloadField(field), rest[1..].trim_start()))
     } else {
         Err(SqlAggError::Unsupported(
             "GROUP BY must be PATH_SEGMENT(i) or PAYLOAD_FIELD('name')".into(),
@@ -250,6 +290,76 @@ fn parse_quoted_sql(s: &str) -> Result<(String, &str), SqlAggError> {
         .find(quote)
         .ok_or_else(|| SqlAggError::Unsupported("unclosed string in PAYLOAD_FIELD".into()))?;
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
+}
+
+/// Parse `COUNT(*) > 5` or `AVG(VALUE) >= 3.0` after the HAVING keyword.
+/// Returns `(HavingClause, remaining_text)`.
+fn parse_having(s: &str) -> Result<(HavingClause, &str), SqlAggError> {
+    let su = s.to_ascii_uppercase();
+    let (agg, after_agg) = if su.starts_with("COUNT(*)") {
+        (HavingAggregate::Count, &s["COUNT(*)".len()..])
+    } else {
+        let agg_patterns: &[(&str, bool)] = &[
+            ("AVG(VALUE)", true),
+            ("SUM(VALUE)", true),
+            ("MIN(VALUE)", true),
+            ("MAX(VALUE)", true),
+            ("P50(VALUE)", true),
+            ("P99(VALUE)", true),
+        ];
+        let mut found = None;
+        for (pat, _) in agg_patterns {
+            if su.starts_with(pat) {
+                found = Some(&s[pat.len()..]);
+                break;
+            }
+        }
+        match found {
+            Some(rest) => (HavingAggregate::Value, rest),
+            None => {
+                return Err(SqlAggError::Unsupported(
+                    "HAVING must use COUNT(*) or a VALUE aggregate".into(),
+                ))
+            }
+        }
+    };
+
+    let after_agg = after_agg.trim_start();
+    let (op, after_op) = if let Some(r) = after_agg.strip_prefix(">=") {
+        (HavingOp::Gte, r)
+    } else if let Some(r) = after_agg.strip_prefix("<=") {
+        (HavingOp::Lte, r)
+    } else if let Some(r) = after_agg.strip_prefix("!=") {
+        (HavingOp::Ne, r)
+    } else if let Some(r) = after_agg.strip_prefix('>') {
+        (HavingOp::Gt, r)
+    } else if let Some(r) = after_agg.strip_prefix('<') {
+        (HavingOp::Lt, r)
+    } else if let Some(r) = after_agg.strip_prefix('=') {
+        (HavingOp::Eq, r)
+    } else {
+        return Err(SqlAggError::Unsupported(
+            "expected comparison operator in HAVING clause".into(),
+        ));
+    };
+
+    let after_op = after_op.trim_start();
+    let num_end = after_op
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(after_op.len());
+    if num_end == 0 {
+        return Err(SqlAggError::Unsupported(
+            "expected numeric threshold in HAVING clause".into(),
+        ));
+    }
+    let threshold: f64 = after_op[..num_end]
+        .parse()
+        .map_err(|_| SqlAggError::Unsupported("invalid number in HAVING clause".into()))?;
+
+    Ok((
+        HavingClause { agg, op, threshold },
+        after_op[num_end..].trim_start(),
+    ))
 }
 
 /// Extract a JSON payload field value as a group key string.
@@ -327,7 +437,32 @@ impl BinderStore {
             }
         };
 
-        builder.execute()
+        let results = builder.execute()?;
+
+        // Apply HAVING filter post-aggregation
+        if let Some(having) = &q.having {
+            let results = results
+                .into_iter()
+                .filter(|r| {
+                    let lhs = match having.agg {
+                        HavingAggregate::Count => r.count as f64,
+                        HavingAggregate::Value => r.value,
+                    };
+                    let rhs = having.threshold;
+                    match having.op {
+                        HavingOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
+                        HavingOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
+                        HavingOp::Gt => lhs > rhs,
+                        HavingOp::Lt => lhs < rhs,
+                        HavingOp::Gte => lhs >= rhs,
+                        HavingOp::Lte => lhs <= rhs,
+                    }
+                })
+                .collect();
+            return Ok(results);
+        }
+
+        Ok(results)
     }
 }
 

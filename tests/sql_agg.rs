@@ -388,3 +388,102 @@ fn project_rejects_non_payload_field() {
     assert!(err.to_string().contains("invalid argument"));
     store.close().unwrap();
 }
+
+// ── HAVING clause tests (issue #5) ───────────────────────────────────────────
+
+fn build_having_store() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    // Three sensors with different observation counts; values vary by sensor
+    // sensor:a — 3 observations, avg = (6+7+8)/3 = 7.0
+    tx.put_object(oid("obs://sensors:a:1"), encode(6.0));
+    tx.put_object(oid("obs://sensors:a:2"), encode(7.0));
+    tx.put_object(oid("obs://sensors:a:3"), encode(8.0));
+    // sensor:b — 2 observations, avg = (3+5)/2 = 4.0
+    tx.put_object(oid("obs://sensors:b:1"), encode(3.0));
+    tx.put_object(oid("obs://sensors:b:2"), encode(5.0));
+    // sensor:c — 1 observation, avg = 9.0
+    tx.put_object(oid("obs://sensors:c:1"), encode(9.0));
+    store.commit(tx, "test", "seed").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn having_count_gt_filters_small_groups() {
+    // HAVING COUNT(*) > 1 → keep a (3) and b (2), drop c (1)
+    let (store, _dir) = build_having_store();
+    let mut results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://sensors' GROUP BY PATH_SEGMENT(2) HAVING COUNT(*) > 1",
+        )
+        .unwrap();
+    results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("a"), Some("b")]);
+    store.close().unwrap();
+}
+
+#[test]
+fn having_count_gte_boundary() {
+    // HAVING COUNT(*) >= 3 → only a (3)
+    let (store, _dir) = build_having_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://sensors' GROUP BY PATH_SEGMENT(2) HAVING COUNT(*) >= 3",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].group_key.as_deref(), Some("a"));
+    assert_eq!(results[0].count, 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn having_value_gt_filters_low_avg() {
+    // HAVING AVG(VALUE) > 6.0 → a (7.0) and c (9.0), drop b (4.0)
+    let (store, _dir) = build_having_store();
+    let mut results = store
+        .sql_aggregate(
+            "SELECT AVG(VALUE) FROM 'obs://sensors' GROUP BY PATH_SEGMENT(2) HAVING AVG(VALUE) > 6.0",
+        )
+        .unwrap();
+    results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("a"), Some("c")]);
+    store.close().unwrap();
+}
+
+#[test]
+fn having_no_group_by_filters_total() {
+    // No GROUP BY + HAVING COUNT(*) > 10 → empty (only 6 total observations)
+    let (store, _dir) = build_having_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://sensors' HAVING COUNT(*) > 10")
+        .unwrap();
+    assert!(results.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn having_no_group_by_passes_when_matching() {
+    // HAVING COUNT(*) >= 6 → one ungrouped result with count = 6
+    let (store, _dir) = build_having_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://sensors' HAVING COUNT(*) >= 6")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 6);
+    store.close().unwrap();
+}
+
+#[test]
+fn having_parse_error_on_bad_syntax() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let err = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://x' HAVING invalid")
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid argument"));
+    store.close().unwrap();
+}
