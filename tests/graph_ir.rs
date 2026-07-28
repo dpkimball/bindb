@@ -3162,3 +3162,75 @@ fn in_pred_parse_op_variant() {
     .unwrap();
     assert_eq!(q2.payload_preds[0].op, CmpOp::NotIn);
 }
+
+// ── RETURN DISTINCT tests ─────────────────────────────────────────────────────
+
+#[test]
+fn distinct_deduplicates_optional_expansion() {
+    // When OPTIONAL MATCH matches multiple c nodes per b node, the same b node
+    // appears multiple times in the final rows (once per c). DISTINCT on the
+    // mandatory node's object_id removes duplicates.
+    //
+    // Graph: root -[LINK]-> a; a -[TAG]-> t1; a -[TAG]-> t2
+    // Query: MATCH root -> a OPTIONAL MATCH a -> c RETURN DISTINCT b
+    // Without DISTINCT: 2 rows (both pointing to a, optional=t1 and optional=t2).
+    // With DISTINCT: 1 row (a, first optional only — first-arrival dedup).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("di://root"), b"{}".to_vec());
+    tx.put_object(obj("di://a"), br#"{"name":"a"}"#.to_vec());
+    tx.put_object(obj("di://t1"), br#"{"tag":"t1"}"#.to_vec());
+    tx.put_object(obj("di://t2"), br#"{"tag":"t2"}"#.to_vec());
+    tx.put_edge(eid("di_e1"), obj("di://root"), obj("di://a"), "LINK", None);
+    tx.put_edge(eid("di_e2"), obj("di://a"), obj("di://t1"), "TAG", None);
+    tx.put_edge(eid("di_e3"), obj("di://a"), obj("di://t2"), "TAG", None);
+    store.commit(tx, "test", "").unwrap();
+
+    // Without DISTINCT: a appears twice (once per tag)
+    let q_no_distinct = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK]->(b) WHERE id(a) = 'di://root' OPTIONAL MATCH (b)-[:TAG]->(c) RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q_no_distinct).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "without DISTINCT, 2 rows (one per optional c)"
+    );
+
+    // With DISTINCT: a appears only once
+    let q_distinct = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK]->(b) WHERE id(a) = 'di://root' OPTIONAL MATCH (b)-[:TAG]->(c) RETURN DISTINCT b",
+    )
+    .unwrap();
+    assert!(q_distinct.distinct);
+    let rows = store.graph_ir_projected(&q_distinct).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "di://a");
+    store.close().unwrap();
+}
+
+#[test]
+fn distinct_preserves_single_occurrence() {
+    // When each node appears only once, DISTINCT is a no-op
+    let (store, _dir) = build_string_pred_graph();
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sp://root' RETURN DISTINCT b")
+            .unwrap();
+    assert!(q.distinct);
+    let rows = store.graph_ir_projected(&q).unwrap();
+    // All 4 leaf nodes appear once each
+    assert_eq!(rows.len(), 4);
+    store.close().unwrap();
+}
+
+#[test]
+fn distinct_parse_flag() {
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' RETURN DISTINCT b").unwrap();
+    assert!(q.distinct);
+
+    let q2 = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' RETURN b").unwrap();
+    assert!(!q2.distinct);
+}

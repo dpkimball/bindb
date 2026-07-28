@@ -585,3 +585,45 @@ fn order_by_with_having() {
     assert_eq!(results[1].group_key.as_deref(), Some("z"));
     store.close().unwrap();
 }
+
+// ── LIMIT tests for sql_aggregate (issue #5) ─────────────────────────────────
+
+#[test]
+fn agg_limit_caps_group_count() {
+    // 3 groups (x=3, y=1, z=2); ORDER BY count DESC LIMIT 2 → x then z
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY count DESC LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].count, 3); // x
+    assert_eq!(results[1].count, 2); // z
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_limit_larger_than_results() {
+    // LIMIT 100 on 3 groups → all 3 returned
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) LIMIT 100")
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_limit_with_having() {
+    // HAVING removes y → 2 groups; LIMIT 1 → 1
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) HAVING COUNT(*) > 1 ORDER BY count DESC LIMIT 1",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3); // x
+    store.close().unwrap();
+}

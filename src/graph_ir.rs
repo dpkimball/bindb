@@ -317,6 +317,8 @@ pub struct GraphIrQuery {
     /// When true, `graph_ir_projected` populates `GraphIrRow::path` with the
     /// sequence of node IDs from the start node to each matched node.
     pub return_path: bool,
+    /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
+    pub distinct: bool,
     /// Optional ORDER BY clause applied after min-depth filtering.
     pub order_by: Option<GraphIrOrderBy>,
     /// Maximum number of results to return (applied after ORDER BY and SKIP).
@@ -456,6 +458,11 @@ impl GraphIrQuery {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
         let after_return = skip_keyword(after_preds3, "RETURN");
+        let (distinct, after_return) = if starts_with_keyword(after_return, "DISTINCT") {
+            (true, skip_keyword(after_return, "DISTINCT"))
+        } else {
+            (false, after_return)
+        };
         let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
         let (return_fields, edge_return_fields, c_return_fields, return_path) =
             parse_return_spec(ret_spec);
@@ -478,6 +485,7 @@ impl GraphIrQuery {
             return_fields,
             edge_return_fields,
             return_path,
+            distinct,
             order_by,
             limit,
             skip,
@@ -1688,6 +1696,12 @@ impl BinderStore {
                     optional: None,
                 });
             }
+        }
+
+        // DISTINCT: keep first occurrence of each object_id
+        if q.distinct {
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|r| seen.insert(r.object_id.clone()));
         }
 
         // Post-expansion ordering: applied to final rows only when a WITH clause

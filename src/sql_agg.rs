@@ -118,6 +118,8 @@ pub struct SqlAggregateQuery {
     pub having: Option<HavingClause>,
     /// Optional post-aggregation sort (applied after HAVING).
     pub order_by: Option<AggOrderBy>,
+    /// Optional cap on returned aggregate rows (applied last).
+    pub limit: Option<usize>,
 }
 
 impl SqlAggregateQuery {
@@ -183,6 +185,20 @@ impl SqlAggregateQuery {
             None
         };
 
+        let limit = if starts_with_keyword(rest, "LIMIT") {
+            let after_limit = skip_keyword(rest, "LIMIT").trim_start();
+            let end = after_limit
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_limit.len());
+            let n: usize = after_limit[..end]
+                .parse()
+                .map_err(|_| SqlAggError::Unsupported("LIMIT must be a positive integer".into()))?;
+            rest = after_limit[end..].trim_start();
+            Some(n)
+        } else {
+            None
+        };
+
         if !rest.is_empty() {
             return Err(SqlAggError::Unsupported(format!(
                 "trailing SQL not supported: {rest}"
@@ -197,6 +213,7 @@ impl SqlAggregateQuery {
             id_prefix,
             having,
             order_by,
+            limit,
         })
     }
 }
@@ -548,6 +565,11 @@ impl BinderStore {
             if ob.direction == AggOrderDirection::Desc {
                 results.reverse();
             }
+        }
+
+        // Apply LIMIT (after ORDER BY so it picks top-N)
+        if let Some(n) = q.limit {
+            results.truncate(n);
         }
 
         Ok(results)
