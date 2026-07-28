@@ -80,6 +80,31 @@ pub struct HavingClause {
     pub threshold: f64,
 }
 
+/// Column to sort aggregate results by in `ORDER BY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggOrderByField {
+    /// Sort by the aggregate result value (avg/count/sum/…).
+    Value,
+    /// Sort by the observation count within the group.
+    Count,
+    /// Sort by the group key string.
+    GroupKey,
+}
+
+/// Sort direction for `ORDER BY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggOrderDirection {
+    Asc,
+    Desc,
+}
+
+/// Post-aggregation sort: `ORDER BY value DESC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggOrderBy {
+    pub field: AggOrderByField,
+    pub direction: AggOrderDirection,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlAggregateQuery {
     pub aggregate: Aggregate,
@@ -91,6 +116,8 @@ pub struct SqlAggregateQuery {
     pub id_prefix: Option<String>,
     /// Optional post-aggregation filter.
     pub having: Option<HavingClause>,
+    /// Optional post-aggregation sort (applied after HAVING).
+    pub order_by: Option<AggOrderBy>,
 }
 
 impl SqlAggregateQuery {
@@ -143,6 +170,19 @@ impl SqlAggregateQuery {
             None
         };
 
+        let order_by = if starts_with_keyword(rest, "ORDER") {
+            let after_order = skip_keyword(rest, "ORDER").trim_start();
+            if !starts_with_keyword(after_order, "BY") {
+                return Err(SqlAggError::Unsupported("expected ORDER BY".into()));
+            }
+            let after_by = skip_keyword(after_order, "BY").trim_start();
+            let (ob, remainder) = parse_agg_order_by(after_by)?;
+            rest = remainder;
+            Some(ob)
+        } else {
+            None
+        };
+
         if !rest.is_empty() {
             return Err(SqlAggError::Unsupported(format!(
                 "trailing SQL not supported: {rest}"
@@ -156,6 +196,7 @@ impl SqlAggregateQuery {
             needs_value,
             id_prefix,
             having,
+            order_by,
         })
     }
 }
@@ -362,6 +403,30 @@ fn parse_having(s: &str) -> Result<(HavingClause, &str), SqlAggError> {
     ))
 }
 
+/// Parse `value|count|group_key [ASC|DESC]`.
+fn parse_agg_order_by(s: &str) -> Result<(AggOrderBy, &str), SqlAggError> {
+    let (field, rest) = if starts_with_keyword(s, "value") {
+        (AggOrderByField::Value, skip_keyword(s, "value"))
+    } else if starts_with_keyword(s, "count") {
+        (AggOrderByField::Count, skip_keyword(s, "count"))
+    } else if starts_with_keyword(s, "group_key") {
+        (AggOrderByField::GroupKey, skip_keyword(s, "group_key"))
+    } else {
+        return Err(SqlAggError::Unsupported(
+            "ORDER BY must be value, count, or group_key".into(),
+        ));
+    };
+    let rest = rest.trim_start();
+    let (direction, rest) = if starts_with_keyword(rest, "DESC") {
+        (AggOrderDirection::Desc, skip_keyword(rest, "DESC"))
+    } else if starts_with_keyword(rest, "ASC") {
+        (AggOrderDirection::Asc, skip_keyword(rest, "ASC"))
+    } else {
+        (AggOrderDirection::Asc, rest)
+    };
+    Ok((AggOrderBy { field, direction }, rest.trim_start()))
+}
+
 /// Extract a JSON payload field value as a group key string.
 /// Returns `None` for non-JSON payloads or missing fields (those go into the None group).
 fn payload_field_group_key(payload: Option<&[u8]>, field: &str) -> Option<String> {
@@ -440,8 +505,8 @@ impl BinderStore {
         let results = builder.execute()?;
 
         // Apply HAVING filter post-aggregation
-        if let Some(having) = &q.having {
-            let results = results
+        let mut results = if let Some(having) = &q.having {
+            results
                 .into_iter()
                 .filter(|r| {
                     let lhs = match having.agg {
@@ -458,8 +523,31 @@ impl BinderStore {
                         HavingOp::Lte => lhs <= rhs,
                     }
                 })
-                .collect();
-            return Ok(results);
+                .collect::<Vec<_>>()
+        } else {
+            results
+        };
+
+        // Apply ORDER BY sort (overrides the default group_key sort from aggregation.rs)
+        if let Some(ob) = &q.order_by {
+            match ob.field {
+                AggOrderByField::Value => {
+                    results.sort_by(|a, b| {
+                        a.value
+                            .partial_cmp(&b.value)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                AggOrderByField::Count => {
+                    results.sort_by_key(|r| r.count);
+                }
+                AggOrderByField::GroupKey => {
+                    results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+                }
+            }
+            if ob.direction == AggOrderDirection::Desc {
+                results.reverse();
+            }
         }
 
         Ok(results)

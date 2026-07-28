@@ -126,6 +126,10 @@ pub enum CmpOp {
     EndsWith,
     /// `b.field CONTAINS 'substr'`
     Contains,
+    /// `b.field IS NULL` — field absent from the JSON payload
+    IsNull,
+    /// `b.field IS NOT NULL` — field present in the JSON payload
+    IsNotNull,
 }
 
 /// Right-hand side of a payload predicate.
@@ -133,6 +137,8 @@ pub enum CmpOp {
 pub enum CmpValue {
     Number(f64),
     Text(String),
+    /// Placeholder for IS NULL / IS NOT NULL (no RHS value).
+    Null,
 }
 
 /// Predicate on a JSON field of the matched end node's payload.
@@ -709,6 +715,30 @@ fn parse_payload_pred_inner<'a>(
     let field = s[..field_end].to_string();
     let rest = s[field_end..].trim_start();
 
+    // IS NOT NULL and IS NULL must be checked before other operators (no RHS)
+    if starts_with_keyword(rest, "IS NOT NULL") {
+        let rest = skip_keyword(rest, "IS NOT NULL");
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::IsNotNull,
+                value: CmpValue::Null,
+            },
+            rest,
+        ));
+    }
+    if starts_with_keyword(rest, "IS NULL") {
+        let rest = skip_keyword(rest, "IS NULL");
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::IsNull,
+                value: CmpValue::Null,
+            },
+            rest,
+        ));
+    }
+
     // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS) before symbols
     let (op, rest) = if starts_with_keyword(rest, "STARTS WITH") {
         (
@@ -1207,15 +1237,26 @@ fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
 fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
     let Ok(text) = std::str::from_utf8(payload) else {
-        return false;
+        // Non-UTF-8: treat as no JSON fields present
+        return pred.op == CmpOp::IsNull;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
+        return pred.op == CmpOp::IsNull;
     };
-    let field_val = match v.get(&pred.field) {
+    let field_val = v.get(&pred.field);
+
+    // IS NULL / IS NOT NULL don't need a value on the RHS
+    match pred.op {
+        CmpOp::IsNull => return field_val.is_none(),
+        CmpOp::IsNotNull => return field_val.is_some(),
+        _ => {}
+    }
+
+    let field_val = match field_val {
         Some(fv) => fv,
         None => return false,
     };
+
     match &pred.value {
         CmpValue::Number(rhs) => {
             let lhs = match field_val.as_f64() {
@@ -1231,6 +1272,8 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::Lte => lhs <= *rhs,
                 // String ops on a numeric field never match
                 CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
+                // Already handled above
+                CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
             }
         }
         CmpValue::Text(rhs) => {
@@ -1248,8 +1291,11 @@ fn apply_payload_pred(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::StartsWith => lhs.starts_with(rhs.as_str()),
                 CmpOp::EndsWith => lhs.ends_with(rhs.as_str()),
                 CmpOp::Contains => lhs.contains(rhs.as_str()),
+                // Already handled above
+                CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
             }
         }
+        CmpValue::Null => false, // IS NULL/IS NOT NULL already dispatched; Null value otherwise invalid
     }
 }
 

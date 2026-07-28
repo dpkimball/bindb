@@ -35,8 +35,8 @@ pub use namespace::NamespaceRegistry;
 pub use object::{BinderObjectVersion, ObjectVersionId};
 pub use provenance::{Provenance, ProvenanceSource};
 pub use sql_agg::{
-    HavingAggregate, HavingClause, HavingOp, SqlAggError, SqlAggregateQuery, SqlGroupBy,
-    SqlProjectQuery,
+    AggOrderBy, AggOrderByField, AggOrderDirection, HavingAggregate, HavingClause, HavingOp,
+    SqlAggError, SqlAggregateQuery, SqlGroupBy, SqlProjectQuery,
 };
 pub use transaction::Transaction;
 pub use types::{CommitId, EdgeId, ObjectId};

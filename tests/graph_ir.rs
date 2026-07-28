@@ -2942,3 +2942,90 @@ fn string_pred_parse_op_variants() {
     .unwrap();
     assert_eq!(q3.payload_preds[0].op, CmpOp::Contains);
 }
+
+// ── IS NULL / IS NOT NULL predicate tests ────────────────────────────────────
+
+fn build_null_check_graph() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    // "optional_field" present on some nodes, absent on others
+    tx.put_object(obj("nc://a"), br#"{"name":"alpha","score":10}"#.to_vec());
+    tx.put_object(
+        obj("nc://b"),
+        br#"{"name":"beta"}"#.to_vec(), // no "score"
+    );
+    tx.put_object(obj("nc://c"), br#"{"name":"gamma","score":0}"#.to_vec());
+    tx.put_object(
+        obj("nc://d"),
+        br#"{"name":"delta"}"#.to_vec(), // no "score"
+    );
+    tx.put_object(obj("nc://root"), b"{}".to_vec());
+    tx.put_edge(eid("nc_e1"), obj("nc://root"), obj("nc://a"), "LINK", None);
+    tx.put_edge(eid("nc_e2"), obj("nc://root"), obj("nc://b"), "LINK", None);
+    tx.put_edge(eid("nc_e3"), obj("nc://root"), obj("nc://c"), "LINK", None);
+    tx.put_edge(eid("nc_e4"), obj("nc://root"), obj("nc://d"), "LINK", None);
+    store.commit(tx, "test", "").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn null_check_is_not_null_finds_present_fields() {
+    // b.score IS NOT NULL → a (score=10) and c (score=0)
+    let (store, _dir) = build_null_check_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK]->(b) WHERE id(a) = 'nc://root' AND b.score IS NOT NULL RETURN b",
+    )
+    .unwrap();
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].object_id.0, "nc://a");
+    assert_eq!(rows[1].object_id.0, "nc://c");
+    store.close().unwrap();
+}
+
+#[test]
+fn null_check_is_null_finds_absent_fields() {
+    // b.score IS NULL → b and d (no score field)
+    let (store, _dir) = build_null_check_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK]->(b) WHERE id(a) = 'nc://root' AND b.score IS NULL RETURN b",
+    )
+    .unwrap();
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].object_id.0, "nc://b");
+    assert_eq!(rows[1].object_id.0, "nc://d");
+    store.close().unwrap();
+}
+
+#[test]
+fn null_check_zero_is_not_null() {
+    // score=0 is present (not null) → IS NOT NULL should include c
+    let (store, _dir) = build_null_check_graph();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'nc://root' AND b.score IS NOT NULL AND b.name = 'gamma' RETURN b",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object_id.0, "nc://c");
+    store.close().unwrap();
+}
+
+#[test]
+fn null_check_parse_op_variants() {
+    let q1 =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' AND b.f IS NULL RETURN b")
+            .unwrap();
+    assert_eq!(q1.payload_preds[0].op, CmpOp::IsNull);
+    assert_eq!(q1.payload_preds[0].value, CmpValue::Null);
+
+    let q2 = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x://1' AND b.f IS NOT NULL RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q2.payload_preds[0].op, CmpOp::IsNotNull);
+}

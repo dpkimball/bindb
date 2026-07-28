@@ -487,3 +487,101 @@ fn having_parse_error_on_bad_syntax() {
     assert!(err.to_string().contains("invalid argument"));
     store.close().unwrap();
 }
+
+// ── ORDER BY tests for sql_aggregate (issue #5) ──────────────────────────────
+
+fn build_order_store() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    // group x: 3 obs, avg = 9.0
+    tx.put_object(oid("obs://ord:x:1"), encode(9.0));
+    tx.put_object(oid("obs://ord:x:2"), encode(9.0));
+    tx.put_object(oid("obs://ord:x:3"), encode(9.0));
+    // group y: 1 obs, avg = 2.0
+    tx.put_object(oid("obs://ord:y:1"), encode(2.0));
+    // group z: 2 obs, avg = 5.0
+    tx.put_object(oid("obs://ord:z:1"), encode(5.0));
+    tx.put_object(oid("obs://ord:z:2"), encode(5.0));
+    store.commit(tx, "test", "seed").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn order_by_value_asc() {
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT AVG(VALUE) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY value ASC",
+        )
+        .unwrap();
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("y"), Some("z"), Some("x")]);
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_value_desc() {
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT AVG(VALUE) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY value DESC",
+        )
+        .unwrap();
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("x"), Some("z"), Some("y")]);
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_count_desc() {
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY count DESC",
+        )
+        .unwrap();
+    // x=3, z=2, y=1
+    assert_eq!(results[0].count, 3);
+    assert_eq!(results[1].count, 2);
+    assert_eq!(results[2].count, 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_group_key_desc() {
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY group_key DESC",
+        )
+        .unwrap();
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("z"), Some("y"), Some("x")]);
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_default_asc() {
+    // No direction keyword → defaults to ASC
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate("SELECT AVG(VALUE) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) ORDER BY value")
+        .unwrap();
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("y"), Some("z"), Some("x")]);
+    store.close().unwrap();
+}
+
+#[test]
+fn order_by_with_having() {
+    // HAVING COUNT(*) > 1 removes y; ORDER BY value DESC → x then z
+    let (store, _dir) = build_order_store();
+    let results = store
+        .sql_aggregate("SELECT AVG(VALUE) FROM 'obs://ord' GROUP BY PATH_SEGMENT(2) HAVING COUNT(*) > 1 ORDER BY value DESC")
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].group_key.as_deref(), Some("x"));
+    assert_eq!(results[1].group_key.as_deref(), Some("z"));
+    store.close().unwrap();
+}
