@@ -915,3 +915,110 @@ fn project_payload_filter_parse_roundtrip() {
     );
     assert_eq!(q.id_prefix, None);
 }
+
+// ── WHERE PAYLOAD_FIELD filter for sql_aggregate (issue #5) ──────────────────
+
+fn build_agg_payload_filter_store() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    // ns: obs://metrics; 3 cpu, 2 memory; 3 in 'us' region (h1), 2 in 'eu' region (h2)
+    tx.put_object(
+        oid("obs://metrics:h1:c1"),
+        br#"{"type":"cpu","region":"us"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://metrics:h1:c2"),
+        br#"{"type":"cpu","region":"us"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://metrics:h1:m1"),
+        br#"{"type":"memory","region":"us"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://metrics:h2:c1"),
+        br#"{"type":"cpu","region":"eu"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://metrics:h2:m1"),
+        br#"{"type":"memory","region":"eu"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "seed").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn agg_payload_filter_eq_string_count() {
+    // WHERE PAYLOAD_FIELD('type') = 'cpu' → 3 cpu obs
+    let (store, _dir) = build_agg_payload_filter_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_payload_filter_with_group_by() {
+    // WHERE PAYLOAD_FIELD('type') = 'cpu' GROUP BY PAYLOAD_FIELD('region')
+    let (store, _dir) = build_agg_payload_filter_store();
+    let mut results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu' GROUP BY PAYLOAD_FIELD('region')",
+        )
+        .unwrap();
+    results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+    // us: h1:c1 and h1:c2 = 2; eu: h2:c1 = 1
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("eu"), Some("us")]);
+    assert_eq!(results[0].count, 1); // eu
+    assert_eq!(results[1].count, 2); // us
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_payload_filter_is_null_excludes_with_field() {
+    // WHERE PAYLOAD_FIELD('type') IS NULL → all obs have 'type' field → no groups produced
+    let (store, _dir) = build_agg_payload_filter_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') IS NULL")
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "all obs have 'type' field so IS NULL produces no groups"
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_payload_filter_combined_id_and_payload_filter() {
+    // WHERE id STARTS WITH 'h1' AND PAYLOAD_FIELD('type') = 'cpu' → h1:c1 and h1:c2
+    let (store, _dir) = build_agg_payload_filter_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://metrics' WHERE id STARTS WITH 'h1' AND PAYLOAD_FIELD('type') = 'cpu'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_payload_filter_parse_roundtrip() {
+    use bindb::{SqlAggregateQuery, SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue};
+    let q = SqlAggregateQuery::parse(
+        "SELECT COUNT(*) FROM 'obs://x' WHERE PAYLOAD_FIELD('status') = 'ok'",
+    )
+    .unwrap();
+    assert_eq!(
+        q.payload_filter,
+        Some(SqlPayloadFilter {
+            field: "status".into(),
+            op: SqlPayloadOp::Eq,
+            value: SqlPayloadValue::Str("ok".into()),
+        })
+    );
+    assert_eq!(q.id_filter, None);
+}

@@ -127,6 +127,8 @@ pub struct SqlAggregateQuery {
     pub needs_value: bool,
     /// Optional `WHERE id ...` filter applied to observation `object_id`.
     pub id_filter: Option<SqlIdFilter>,
+    /// Optional `WHERE PAYLOAD_FIELD('f') OP value` pre-aggregation filter.
+    pub payload_filter: Option<SqlPayloadFilter>,
     /// Optional post-aggregation filter.
     pub having: Option<HavingClause>,
     /// Optional post-aggregation sort (applied after HAVING).
@@ -159,13 +161,32 @@ impl SqlAggregateQuery {
         let (namespace, rest) = parse_quoted(after_from)?;
         let rest = rest.trim_start();
 
-        // Optional WHERE id <op> '...'
-        let (id_filter, rest) = if starts_with_keyword(rest, "WHERE") {
-            let after_where = skip_keyword(rest, "WHERE");
-            let (filter, remaining) = parse_where_id_filter(after_where)?;
-            (Some(filter), remaining)
+        // Optional WHERE clause: id filter, payload filter, or both joined with AND.
+        let (id_filter, payload_filter, rest) = if starts_with_keyword(rest, "WHERE") {
+            let after_where = skip_keyword(rest, "WHERE").trim_start();
+            let su = after_where.to_ascii_uppercase();
+            if su.starts_with("PAYLOAD_FIELD(") {
+                let (pf, remaining) = parse_payload_filter(after_where)?;
+                (None, Some(pf), remaining)
+            } else {
+                let (filter, remaining) = parse_where_id_filter(after_where)?;
+                let remaining = remaining.trim_start();
+                // Optional AND PAYLOAD_FIELD(...) after the id filter
+                if starts_with_keyword(remaining, "AND") {
+                    let after_and = skip_keyword(remaining, "AND").trim_start();
+                    let su2 = after_and.to_ascii_uppercase();
+                    if su2.starts_with("PAYLOAD_FIELD(") {
+                        let (pf, rem2) = parse_payload_filter(after_and)?;
+                        (Some(filter), Some(pf), rem2)
+                    } else {
+                        (Some(filter), None, remaining)
+                    }
+                } else {
+                    (Some(filter), None, remaining)
+                }
+            }
         } else {
-            (None, rest)
+            (None, None, rest)
         };
 
         let mut rest = rest.trim_start();
@@ -240,6 +261,7 @@ impl SqlAggregateQuery {
             group_by,
             needs_value,
             id_filter,
+            payload_filter,
             having,
             order_by,
             limit,
@@ -718,21 +740,34 @@ impl BinderStore {
             builder = builder.extract_f64(extract_value);
         }
 
-        if let Some(filter) = &q.id_filter {
-            let filter = filter.clone();
+        // Combine id_filter and payload_filter into a single closure (filter() replaces).
+        if q.id_filter.is_some() || q.payload_filter.is_some() {
+            let id_filter = q.id_filter.clone();
+            let payload_filter = q.payload_filter.clone();
             let ns_prefix = format!("{}:", q.namespace);
             builder = builder.filter(move |v| {
-                let id = v
-                    .object_id
-                    .0
-                    .strip_prefix(ns_prefix.as_str())
-                    .unwrap_or(&v.object_id.0);
-                match &filter {
-                    SqlIdFilter::StartsWith(s) => id.starts_with(s.as_str()),
-                    SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
-                    SqlIdFilter::Contains(s) => id.contains(s.as_str()),
-                    SqlIdFilter::Equals(s) => id == s.as_str(),
+                if let Some(ref f) = id_filter {
+                    let id = v
+                        .object_id
+                        .0
+                        .strip_prefix(ns_prefix.as_str())
+                        .unwrap_or(&v.object_id.0);
+                    let id_ok = match f {
+                        SqlIdFilter::StartsWith(s) => id.starts_with(s.as_str()),
+                        SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
+                        SqlIdFilter::Contains(s) => id.contains(s.as_str()),
+                        SqlIdFilter::Equals(s) => id == s.as_str(),
+                    };
+                    if !id_ok {
+                        return false;
+                    }
                 }
+                if let Some(ref pf) = payload_filter {
+                    if !apply_payload_filter(pf, v.payload.as_deref()) {
+                        return false;
+                    }
+                }
+                true
             });
         }
 
