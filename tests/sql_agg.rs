@@ -668,3 +668,97 @@ fn agg_offset_beyond_end_is_empty() {
     assert!(results.is_empty());
     store.close().unwrap();
 }
+
+// ── SqlIdFilter WHERE variants (issue #5) ────────────────────────────────────
+
+fn build_id_filter_store() -> (BinderStore, TempDir) {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    // IDs: sensor:temperature:room1, sensor:humidity:room1, sensor:temperature:room2, actuator:fan:room1
+    tx.put_object(oid("obs://devices:sensor:temperature:room1"), encode(21.5));
+    tx.put_object(oid("obs://devices:sensor:humidity:room1"), encode(55.0));
+    tx.put_object(oid("obs://devices:sensor:temperature:room2"), encode(22.0));
+    tx.put_object(oid("obs://devices:actuator:fan:room1"), encode(1.0));
+    store.commit(tx, "test", "seed").unwrap();
+    (store, dir)
+}
+
+#[test]
+fn id_filter_starts_with_selects_prefix() {
+    // WHERE id STARTS WITH 'sensor' → 3 obs
+    let (store, _dir) = build_id_filter_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://devices' WHERE id STARTS WITH 'sensor'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn id_filter_ends_with_selects_suffix() {
+    // WHERE id ENDS WITH 'room1' → sensor:temperature:room1, sensor:humidity:room1, actuator:fan:room1
+    let (store, _dir) = build_id_filter_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://devices' WHERE id ENDS WITH 'room1'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn id_filter_contains_selects_substring() {
+    // WHERE id CONTAINS 'temperature' → room1 and room2
+    let (store, _dir) = build_id_filter_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://devices' WHERE id CONTAINS 'temperature'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn id_filter_equals_selects_exact() {
+    // WHERE id = 'sensor:humidity:room1' → exactly 1 observation
+    let (store, _dir) = build_id_filter_store();
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://devices' WHERE id = 'sensor:humidity:room1'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn id_filter_parse_roundtrip() {
+    use bindb::{SqlAggregateQuery, SqlIdFilter};
+    let q = SqlAggregateQuery::parse("SELECT COUNT(*) FROM 'obs://x' WHERE id ENDS WITH 'suffix'")
+        .unwrap();
+    assert_eq!(q.id_filter, Some(SqlIdFilter::EndsWith("suffix".into())));
+
+    let q2 = SqlAggregateQuery::parse("SELECT AVG(VALUE) FROM 'obs://x' WHERE id CONTAINS 'mid'")
+        .unwrap();
+    assert_eq!(q2.id_filter, Some(SqlIdFilter::Contains("mid".into())));
+
+    let q3 =
+        SqlAggregateQuery::parse("SELECT COUNT(*) FROM 'obs://x' WHERE id = 'exact:id'").unwrap();
+    assert_eq!(q3.id_filter, Some(SqlIdFilter::Equals("exact:id".into())));
+}
+
+#[test]
+fn id_filter_combined_with_group_by() {
+    // WHERE id CONTAINS 'sensor' GROUP BY PATH_SEGMENT(3) → temperature, humidity groups
+    let (store, _dir) = build_id_filter_store();
+    let mut results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://devices' WHERE id CONTAINS 'sensor' GROUP BY PATH_SEGMENT(3)",
+        )
+        .unwrap();
+    results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+    let keys: Vec<_> = results.iter().map(|r| r.group_key.as_deref()).collect();
+    assert_eq!(keys, vec![Some("humidity"), Some("temperature")]);
+    store.close().unwrap();
+}

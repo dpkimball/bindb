@@ -52,6 +52,19 @@ pub enum SqlGroupBy {
     PayloadField(String),
 }
 
+/// Filter applied to observation `object_id` in a `WHERE` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlIdFilter {
+    /// `WHERE id STARTS WITH 'prefix'`
+    StartsWith(String),
+    /// `WHERE id ENDS WITH 'suffix'`
+    EndsWith(String),
+    /// `WHERE id CONTAINS 'substr'`
+    Contains(String),
+    /// `WHERE id = 'exact'`
+    Equals(String),
+}
+
 /// Comparison operator for a HAVING clause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HavingOp {
@@ -112,8 +125,8 @@ pub struct SqlAggregateQuery {
     pub group_by: SqlGroupBy,
     /// True when the aggregate needs numeric `VALUE` extraction.
     pub needs_value: bool,
-    /// Optional `WHERE id STARTS WITH '...'` filter applied to object_id.
-    pub id_prefix: Option<String>,
+    /// Optional `WHERE id ...` filter applied to observation `object_id`.
+    pub id_filter: Option<SqlIdFilter>,
     /// Optional post-aggregation filter.
     pub having: Option<HavingClause>,
     /// Optional post-aggregation sort (applied after HAVING).
@@ -146,11 +159,11 @@ impl SqlAggregateQuery {
         let (namespace, rest) = parse_quoted(after_from)?;
         let rest = rest.trim_start();
 
-        // Optional WHERE id STARTS WITH '...'
-        let (id_prefix, rest) = if starts_with_keyword(rest, "WHERE") {
+        // Optional WHERE id <op> '...'
+        let (id_filter, rest) = if starts_with_keyword(rest, "WHERE") {
             let after_where = skip_keyword(rest, "WHERE");
-            let prefix = parse_where_id_prefix(after_where)?;
-            (Some(prefix.0), prefix.1)
+            let (filter, remaining) = parse_where_id_filter(after_where)?;
+            (Some(filter), remaining)
         } else {
             (None, rest)
         };
@@ -226,7 +239,7 @@ impl SqlAggregateQuery {
             namespace,
             group_by,
             needs_value,
-            id_prefix,
+            id_filter,
             having,
             order_by,
             limit,
@@ -284,29 +297,34 @@ fn parse_quoted(s: &str) -> Result<(String, &str), SqlAggError> {
     Ok((ns, &rest[end + quote.len_utf8()..]))
 }
 
-fn parse_where_id_prefix(s: &str) -> Result<(String, &str), SqlAggError> {
+fn parse_where_id_filter(s: &str) -> Result<(SqlIdFilter, &str), SqlAggError> {
     let s = s.trim_start();
-    // id STARTS WITH '…'
     if !starts_with_keyword(s, "id") {
         return Err(SqlAggError::Unsupported(
-            "WHERE clause must be: id STARTS WITH '…'".into(),
+            "WHERE clause must be: id STARTS WITH / ENDS WITH / CONTAINS / = '…'".into(),
         ));
     }
     let after_id = skip_keyword(s, "id");
-    if !starts_with_keyword(after_id, "STARTS") {
-        return Err(SqlAggError::Unsupported(
-            "expected STARTS WITH after id".into(),
-        ));
+    if starts_with_keyword(after_id, "STARTS WITH") {
+        let after_kw = skip_keyword(after_id, "STARTS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((SqlIdFilter::StartsWith(val), rest.trim_start()))
+    } else if starts_with_keyword(after_id, "ENDS WITH") {
+        let after_kw = skip_keyword(after_id, "ENDS WITH");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((SqlIdFilter::EndsWith(val), rest.trim_start()))
+    } else if starts_with_keyword(after_id, "CONTAINS") {
+        let after_kw = skip_keyword(after_id, "CONTAINS");
+        let (val, rest) = parse_quoted(after_kw)?;
+        Ok((SqlIdFilter::Contains(val), rest.trim_start()))
+    } else if let Some(after_eq) = after_id.trim_start().strip_prefix('=') {
+        let (val, rest) = parse_quoted(after_eq)?;
+        Ok((SqlIdFilter::Equals(val), rest.trim_start()))
+    } else {
+        Err(SqlAggError::Unsupported(
+            "WHERE id must be followed by STARTS WITH, ENDS WITH, CONTAINS, or =".into(),
+        ))
     }
-    let after_starts = skip_keyword(after_id, "STARTS");
-    if !starts_with_keyword(after_starts, "WITH") {
-        return Err(SqlAggError::Unsupported(
-            "expected WITH after STARTS".into(),
-        ));
-    }
-    let after_with = skip_keyword(after_starts, "WITH");
-    let (prefix, rest) = parse_quoted(after_with)?;
-    Ok((prefix, rest.trim_start()))
 }
 
 /// Returns `(SqlGroupBy, remaining_text)`.
@@ -519,9 +537,22 @@ impl BinderStore {
             builder = builder.extract_f64(extract_value);
         }
 
-        if let Some(prefix) = &q.id_prefix {
-            let prefix = prefix.clone();
-            builder = builder.filter(move |v| v.object_id.0.contains(prefix.as_str()));
+        if let Some(filter) = &q.id_filter {
+            let filter = filter.clone();
+            let ns_prefix = format!("{}:", q.namespace);
+            builder = builder.filter(move |v| {
+                let id = v
+                    .object_id
+                    .0
+                    .strip_prefix(ns_prefix.as_str())
+                    .unwrap_or(&v.object_id.0);
+                match &filter {
+                    SqlIdFilter::StartsWith(s) => id.starts_with(s.as_str()),
+                    SqlIdFilter::EndsWith(s) => id.ends_with(s.as_str()),
+                    SqlIdFilter::Contains(s) => id.contains(s.as_str()),
+                    SqlIdFilter::Equals(s) => id == s.as_str(),
+                }
+            });
         }
 
         builder = match &q.group_by {
@@ -671,8 +702,14 @@ impl SqlProjectQuery {
 
         let id_prefix = if starts_with_keyword(s, "WHERE") {
             let after_where = skip_keyword(s, "WHERE");
-            let (prefix, rest2) = parse_where_id_prefix(after_where)?;
+            let (filter, rest2) = parse_where_id_filter(after_where)?;
             s = rest2.trim_start();
+            let prefix = match filter {
+                SqlIdFilter::StartsWith(p) => p,
+                SqlIdFilter::Equals(p) => p,
+                SqlIdFilter::EndsWith(p) => p,
+                SqlIdFilter::Contains(p) => p,
+            };
             Some(prefix)
         } else {
             None
@@ -781,7 +818,7 @@ mod tests {
         assert_eq!(q.namespace, "obs://sleep");
         assert!(!q.needs_value);
         assert_eq!(q.group_by, SqlGroupBy::None);
-        assert_eq!(q.id_prefix, None);
+        assert_eq!(q.id_filter, None);
     }
 
     #[test]
@@ -793,18 +830,18 @@ mod tests {
         assert_eq!(q.aggregate, Aggregate::Avg);
         assert!(q.needs_value);
         assert_eq!(q.group_by, SqlGroupBy::PathSegment(1));
-        assert_eq!(q.id_prefix, None);
+        assert_eq!(q.id_filter, None);
     }
 
     #[test]
-    fn parses_where_id_prefix() {
+    fn parses_where_id_filter() {
         let q = SqlAggregateQuery::parse(
             "SELECT AVG(VALUE) FROM 'obs://sleep' WHERE id STARTS WITH '2024'",
         )
         .unwrap();
         assert_eq!(q.aggregate, Aggregate::Avg);
         assert_eq!(q.namespace, "obs://sleep");
-        assert_eq!(q.id_prefix, Some("2024".into()));
+        assert_eq!(q.id_filter, Some(SqlIdFilter::StartsWith("2024".into())));
         assert_eq!(q.group_by, SqlGroupBy::None);
     }
 
@@ -814,7 +851,7 @@ mod tests {
             "SELECT COUNT(*) FROM 'obs://sleep' WHERE id STARTS WITH '2024' GROUP BY PATH_SEGMENT(1)",
         )
         .unwrap();
-        assert_eq!(q.id_prefix, Some("2024".into()));
+        assert_eq!(q.id_filter, Some(SqlIdFilter::StartsWith("2024".into())));
         assert_eq!(q.group_by, SqlGroupBy::PathSegment(1));
     }
 
