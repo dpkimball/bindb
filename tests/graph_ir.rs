@@ -2522,3 +2522,121 @@ fn edge_pred_rel_var_in_pattern_accepted() {
     assert_eq!(matches.len(), 2, "same result with or without r in pattern");
     store.close().unwrap();
 }
+
+// ── RETURN r.field — edge payload projection (issue #2) ──────────────────────
+
+#[test]
+fn edge_return_parse_captures_r_fields() {
+    // Parser: RETURN r.weight, b.label → edge_return_fields=["weight"], return_fields=["label"]
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' RETURN r.weight, b.label",
+    )
+    .unwrap();
+    assert_eq!(q.edge_return_fields, vec!["weight"]);
+    assert_eq!(q.return_fields, vec!["label"]);
+}
+
+#[test]
+fn edge_return_projects_edge_field() {
+    // RETURN r.weight populates GraphIrRow::edge_fields["weight"].
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' RETURN r.weight, b.label",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    let strong1 = rows
+        .iter()
+        .find(|r| r.object_id.0 == "n://strong1")
+        .expect("strong1 row");
+    assert_eq!(
+        strong1.edge_fields.get("weight").and_then(|v| v.as_f64()),
+        Some(0.9)
+    );
+    assert_eq!(
+        strong1.fields.get("label").and_then(|v| v.as_str()),
+        Some("s1")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_return_missing_field_is_null() {
+    // Edge with no payload → edge_fields["weight"] = null.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let q = GraphIrQuery::parse("MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' RETURN r.weight")
+        .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    let untyped = rows
+        .iter()
+        .find(|r| r.object_id.0 == "n://untyped")
+        .expect("untyped row");
+    assert!(
+        untyped
+            .edge_fields
+            .get("weight")
+            .map(|v| v.is_null())
+            .unwrap_or(false),
+        "no-payload edge produces null for r.weight"
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_return_combined_with_edge_pred() {
+    // AND r.weight > 0.5 RETURN r.weight, b.label — filter + project from same edge.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' \
+         AND r.weight > 0.5 RETURN r.weight, r.kind, b.label",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 2, "only strong1 + strong2");
+    for row in &rows {
+        let w = row
+            .edge_fields
+            .get("weight")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        assert!(w > 0.5);
+        assert_eq!(
+            row.edge_fields.get("kind").and_then(|v| v.as_str()),
+            Some("strong")
+        );
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn edge_return_r_only_no_b_fields() {
+    // RETURN r.weight with no b.field — fields empty, edge_fields populated.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_weighted_graph(&store);
+
+    let q = GraphIrQuery::parse("MATCH (a)-[:REL]->(b) WHERE id(a) = 'h://wroot' RETURN r.kind")
+        .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+
+    assert_eq!(rows.len(), 4);
+    let kinds: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.edge_fields.get("kind")?.as_str())
+        .collect();
+    assert!(kinds.contains(&"strong"));
+    assert!(kinds.contains(&"weak"));
+    store.close().unwrap();
+}

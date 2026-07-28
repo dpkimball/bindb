@@ -1005,6 +1005,7 @@ impl BinderStore {
                     results.push(GraphQueryMatch {
                         object: obj.clone(),
                         depth: depth + 1,
+                        via_edge: Some(edge.clone()),
                     });
                 }
 
@@ -1119,6 +1120,7 @@ impl BinderStore {
                     results.push(GraphQueryMatch {
                         object: obj.clone(),
                         depth: depth + 1,
+                        via_edge: Some(edge.clone()),
                     });
                 }
                 queue.push_back((neighbor.clone(), depth + 1));

@@ -225,19 +225,18 @@ pub struct GraphIrWithClause {
 /// One row returned by `graph_ir_projected`.
 ///
 /// `fields` contains only the keys requested in `RETURN b.field1, b.field2`.
-/// Missing or non-JSON payloads produce no entries for that key.
-///
-/// `path` is the sequence of node IDs from the start node to `object_id`
-/// (inclusive of both endpoints) when `RETURN path` was requested; otherwise empty.
-///
-/// `optional` is populated when the query contains an `OPTIONAL MATCH` clause.
-/// It is `None` when the optional pattern found no matches for this mandatory row,
-/// and `Some` for each individually matched optional node.
+/// `edge_fields` contains keys requested in `RETURN r.field1, r.field2`, from
+/// the edge traversed to reach this node; missing fields are `null`.
+/// `path` is populated when `RETURN path` is requested; otherwise empty.
+/// `optional` is populated by an `OPTIONAL MATCH` clause if present.
 #[derive(Debug, Clone)]
 pub struct GraphIrRow {
     pub object_id: ObjectId,
     pub depth: usize,
     pub fields: HashMap<String, serde_json::Value>,
+    /// Fields projected from the via-edge (`RETURN r.field`). Empty when no
+    /// `r.` fields were requested.
+    pub edge_fields: HashMap<String, serde_json::Value>,
     pub path: Vec<ObjectId>,
     /// Result of the `OPTIONAL MATCH` clause, if present in the query.
     pub optional: Option<GraphIrOptionalMatch>,
@@ -289,6 +288,9 @@ pub struct GraphIrQuery {
     /// Fields to project from each matched node's JSON payload (`RETURN b.f1, b.f2`).
     /// Empty = plain node return via `graph_ir` / `graph_ir_parsed`.
     pub return_fields: Vec<String>,
+    /// Fields to project from the via-edge's JSON payload (`RETURN r.f1, r.f2`).
+    /// Empty = no edge projection. Populated into `GraphIrRow::edge_fields`.
+    pub edge_return_fields: Vec<String>,
     /// When true, `graph_ir_projected` populates `GraphIrRow::path` with the
     /// sequence of node IDs from the start node to each matched node.
     pub return_path: bool,
@@ -432,7 +434,8 @@ impl GraphIrQuery {
         }
         let after_return = skip_keyword(after_preds3, "RETURN");
         let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
-        let (return_fields, c_return_fields, return_path) = parse_return_spec(ret_spec);
+        let (return_fields, edge_return_fields, c_return_fields, return_path) =
+            parse_return_spec(ret_spec);
         let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
 
         let optional_clause = optional_clause_raw.map(|mut oc| {
@@ -450,6 +453,7 @@ impl GraphIrQuery {
             payload_preds,
             edge_preds,
             return_fields,
+            edge_return_fields,
             return_path,
             order_by,
             limit,
@@ -1286,18 +1290,20 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 
 /// Parse the RETURN spec.
 ///
-/// Returns `(b_fields, c_fields, return_path)` where:
+/// Returns `(b_fields, r_fields, c_fields, return_path)` where:
 /// - `b_fields`: fields projected from the mandatory `b` node (`RETURN b.f1, b.f2`)
+/// - `r_fields`: fields projected from the via-edge `r` (`RETURN r.weight`)
 /// - `c_fields`: fields projected from the optional `c` node (`RETURN c.f1`)
 /// - `return_path`: true when `path` appears in the RETURN list
 ///
-/// Plain `RETURN b` and `RETURN c` (variable name only) are valid but produce no fields.
-fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, bool) {
+/// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
+fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
     let s = s.trim();
     if s.is_empty() {
-        return (vec![], vec![], false);
+        return (vec![], vec![], vec![], false);
     }
     let mut b_fields = Vec::new();
+    let mut r_fields = Vec::new();
     let mut c_fields = Vec::new();
     let mut return_path = false;
     for part in s.split(',') {
@@ -1309,15 +1315,20 @@ fn parse_return_spec(s: &str) -> (Vec<String>, Vec<String>, bool) {
             if !f.is_empty() {
                 b_fields.push(f);
             }
+        } else if let Some(field) = p.strip_prefix("r.").or_else(|| p.strip_prefix("R.")) {
+            let f = field.trim().to_string();
+            if !f.is_empty() {
+                r_fields.push(f);
+            }
         } else if let Some(field) = p.strip_prefix("c.").or_else(|| p.strip_prefix("C.")) {
             let f = field.trim().to_string();
             if !f.is_empty() {
                 c_fields.push(f);
             }
         }
-        // "b", "c" alone → plain return; ignore
+        // "b", "r", "c" alone → plain return; ignore
     }
-    (b_fields, c_fields, return_path)
+    (b_fields, r_fields, c_fields, return_path)
 }
 
 enum SortKey {
@@ -1464,6 +1475,25 @@ impl BinderStore {
                     }
                 }
             }
+
+            let mut r_fields = HashMap::new();
+            if !q.edge_return_fields.is_empty() {
+                let edge_json = m
+                    .via_edge
+                    .as_ref()
+                    .and_then(|e| e.payload.as_deref())
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+                for key in &q.edge_return_fields {
+                    let val = edge_json
+                        .as_ref()
+                        .and_then(|v| v.get(key))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    r_fields.insert(key.clone(), val);
+                }
+            }
+
             let path = if q.return_path {
                 reconstruct_path(start, &m.object.object_id, &parent_map)
             } else {
@@ -1477,6 +1507,7 @@ impl BinderStore {
                         object_id: m.object.object_id,
                         depth: m.depth,
                         fields: b_fields,
+                        edge_fields: r_fields,
                         path,
                         optional: None,
                     });
@@ -1486,6 +1517,7 @@ impl BinderStore {
                             object_id: m.object.object_id.clone(),
                             depth: m.depth,
                             fields: b_fields.clone(),
+                            edge_fields: r_fields.clone(),
                             path: path.clone(),
                             optional: Some(opt),
                         });
@@ -1496,6 +1528,7 @@ impl BinderStore {
                     object_id: m.object.object_id,
                     depth: m.depth,
                     fields: b_fields,
+                    edge_fields: r_fields,
                     path,
                     optional: None,
                 });
