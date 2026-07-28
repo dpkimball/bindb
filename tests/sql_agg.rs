@@ -1510,7 +1510,6 @@ fn agg_chained_payload_filter_parse_roundtrip() {
 #[test]
 fn project_chained_payload_filter_narrows_results() {
     // SELECT name WHERE type = 'cpu' AND region = 'us' → 2 rows
-    use bindb::SqlProjectQuery;
     let (store, _dir) = build_agg_payload_filter_store();
     let rows = store
         .sql_project(
