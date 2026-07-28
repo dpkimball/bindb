@@ -966,13 +966,14 @@ fn project_payload_filter_parse_roundtrip() {
         "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' WHERE PAYLOAD_FIELD('score') >= 10",
     )
     .unwrap();
+    assert_eq!(q.payload_filters.len(), 1);
     assert_eq!(
-        q.payload_filter,
-        Some(SqlPayloadFilter {
+        q.payload_filters[0],
+        SqlPayloadFilter {
             field: "score".into(),
             op: SqlPayloadOp::Gte,
             value: SqlPayloadValue::Num(10.0),
-        })
+        }
     );
     assert_eq!(q.id_filter, None);
 }
@@ -1073,13 +1074,14 @@ fn agg_payload_filter_parse_roundtrip() {
         "SELECT COUNT(*) FROM 'obs://x' WHERE PAYLOAD_FIELD('status') = 'ok'",
     )
     .unwrap();
+    assert_eq!(q.payload_filters.len(), 1);
     assert_eq!(
-        q.payload_filter,
-        Some(SqlPayloadFilter {
+        q.payload_filters[0],
+        SqlPayloadFilter {
             field: "status".into(),
             op: SqlPayloadOp::Eq,
             value: SqlPayloadValue::Str("ok".into()),
-        })
+        }
     );
     assert_eq!(q.id_filter, None);
 }
@@ -1413,13 +1415,14 @@ fn project_like_parse_roundtrip() {
         "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' WHERE PAYLOAD_FIELD('name') LIKE 'a%'",
     )
     .unwrap();
+    assert_eq!(q.payload_filters.len(), 1);
     assert_eq!(
-        q.payload_filter,
-        Some(SqlPayloadFilter {
+        q.payload_filters[0],
+        SqlPayloadFilter {
             field: "name".into(),
             op: SqlPayloadOp::Like,
             value: SqlPayloadValue::Str("a%".into()),
-        })
+        }
     );
 }
 
@@ -1433,4 +1436,116 @@ fn agg_like_counts_matching() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].count, 2);
     store.close().unwrap();
+}
+
+// ── Chained AND PAYLOAD_FIELD filters (sql_aggregate + sql_project) ──────────
+
+#[test]
+fn agg_chained_payload_filter_two_conditions() {
+    // WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'us' → 2
+    let (store, _dir) = build_agg_payload_filter_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'us'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_chained_payload_filter_no_match() {
+    // WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'au' → 0
+    let (store, _dir) = build_agg_payload_filter_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'au'",
+        )
+        .unwrap();
+    assert!(results.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_chained_payload_filter_with_id_filter() {
+    // WHERE id STARTS WITH 'h1' AND PAYLOAD_FIELD('type') = 'cpu' → 2 (h1:c1, h1:c2)
+    let (store, _dir) = build_agg_payload_filter_store();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://metrics' WHERE id STARTS WITH 'h1' AND PAYLOAD_FIELD('type') = 'cpu'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_chained_payload_filter_parse_roundtrip() {
+    use bindb::{SqlAggregateQuery, SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue};
+    let q = SqlAggregateQuery::parse(
+        "SELECT COUNT(*) FROM 'obs://x' WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'us'",
+    )
+    .unwrap();
+    assert_eq!(q.payload_filters.len(), 2);
+    assert_eq!(
+        q.payload_filters[0],
+        SqlPayloadFilter {
+            field: "type".into(),
+            op: SqlPayloadOp::Eq,
+            value: SqlPayloadValue::Str("cpu".into()),
+        }
+    );
+    assert_eq!(
+        q.payload_filters[1],
+        SqlPayloadFilter {
+            field: "region".into(),
+            op: SqlPayloadOp::Eq,
+            value: SqlPayloadValue::Str("us".into()),
+        }
+    );
+}
+
+#[test]
+fn project_chained_payload_filter_narrows_results() {
+    // SELECT name WHERE type = 'cpu' AND region = 'us' → 2 rows
+    use bindb::SqlProjectQuery;
+    let (store, _dir) = build_agg_payload_filter_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('type') FROM 'obs://metrics' WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'us'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row["type"], serde_json::Value::String("cpu".into()));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn project_chained_payload_filter_parse_roundtrip() {
+    use bindb::{SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' WHERE PAYLOAD_FIELD('type') = 'cpu' AND PAYLOAD_FIELD('region') = 'us'",
+    )
+    .unwrap();
+    assert_eq!(q.payload_filters.len(), 2);
+    assert_eq!(
+        q.payload_filters[0],
+        SqlPayloadFilter {
+            field: "type".into(),
+            op: SqlPayloadOp::Eq,
+            value: SqlPayloadValue::Str("cpu".into()),
+        }
+    );
+    assert_eq!(
+        q.payload_filters[1],
+        SqlPayloadFilter {
+            field: "region".into(),
+            op: SqlPayloadOp::Eq,
+            value: SqlPayloadValue::Str("us".into()),
+        }
+    );
 }
