@@ -136,6 +136,8 @@ pub enum CmpOp {
     In,
     /// `b.field NOT IN ['v1', 'v2']` — field value is not in the list
     NotIn,
+    /// `b.field BETWEEN lo AND hi` — numeric range, inclusive on both ends
+    Between,
 }
 
 /// Right-hand side of a payload predicate.
@@ -147,6 +149,8 @@ pub enum CmpValue {
     Null,
     /// List of string values for IN / NOT IN.
     StringList(Vec<String>),
+    /// Inclusive numeric range for BETWEEN.
+    NumberRange(f64, f64),
 }
 
 /// Predicate on a JSON field of the matched end node's payload.
@@ -743,6 +747,49 @@ fn parse_payload_pred_inner<'a>(
     }
     let field = s[..field_end].to_string();
     let rest = s[field_end..].trim_start();
+
+    // BETWEEN lo AND hi — numeric inclusive range
+    if starts_with_keyword(rest, "BETWEEN") {
+        let after_kw = skip_keyword(rest, "BETWEEN").trim_start();
+        let lo_end = after_kw
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_kw.len());
+        if lo_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "BETWEEN requires a numeric lower bound".into(),
+            ));
+        }
+        let lo: f64 = after_kw[..lo_end]
+            .parse()
+            .map_err(|_| GraphIrError::Unsupported("invalid lower bound in BETWEEN".into()))?;
+        let after_lo = after_kw[lo_end..].trim_start();
+        if !starts_with_keyword(after_lo, "AND") {
+            return Err(GraphIrError::Unsupported(
+                "BETWEEN requires AND between bounds".into(),
+            ));
+        }
+        let after_and = skip_keyword(after_lo, "AND").trim_start();
+        let hi_end = after_and
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_and.len());
+        if hi_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "BETWEEN requires a numeric upper bound".into(),
+            ));
+        }
+        let hi: f64 = after_and[..hi_end]
+            .parse()
+            .map_err(|_| GraphIrError::Unsupported("invalid upper bound in BETWEEN".into()))?;
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::Between,
+                value: CmpValue::NumberRange(lo, hi),
+                negated: false,
+            },
+            after_and[hi_end..].trim_start(),
+        ));
+    }
 
     // IS NOT NULL and IS NULL must be checked before other operators (no RHS)
     if starts_with_keyword(rest, "IS NOT NULL") {
@@ -1354,8 +1401,18 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
                 // Already handled above
                 CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
-                // IN/NOT IN handled via StringList arm
-                CmpOp::In | CmpOp::NotIn => false,
+                // IN/NOT IN handled via StringList arm; Between via NumberRange
+                CmpOp::In | CmpOp::NotIn | CmpOp::Between => false,
+            }
+        }
+        CmpValue::NumberRange(lo, hi) => {
+            let lhs = match field_val.as_f64() {
+                Some(n) => n,
+                None => return false,
+            };
+            match pred.op {
+                CmpOp::Between => lhs >= *lo && lhs <= *hi,
+                _ => false,
             }
         }
         CmpValue::Text(rhs) => {
@@ -1378,6 +1435,8 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 // IN/NOT IN with a single Text value: treat as 1-element list
                 CmpOp::In => lhs == rhs.as_str(),
                 CmpOp::NotIn => lhs != rhs.as_str(),
+                // BETWEEN on a text field never matches
+                CmpOp::Between => false,
             }
         }
         CmpValue::Null => false,

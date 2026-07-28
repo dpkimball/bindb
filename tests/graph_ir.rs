@@ -3463,3 +3463,151 @@ fn end_pred_parse_contains() {
     .unwrap();
     assert_eq!(q.end_pred, NodeIdPred::Contains("mid".into()));
 }
+
+// ── BETWEEN predicate (issue #2) ─────────────────────────────────────────────
+
+fn build_between_graph(store: &BinderStore) {
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://root"), b"{}".to_vec());
+    tx.put_object(obj("item://low"), br#"{"price":5.0}"#.to_vec());
+    tx.put_object(obj("item://mid"), br#"{"price":50.0}"#.to_vec());
+    tx.put_object(obj("item://high"), br#"{"price":150.0}"#.to_vec());
+    tx.put_object(obj("item://no-price"), b"{}".to_vec());
+    tx.put_edge(eid("e1"), obj("hub://root"), obj("item://low"), "HAS", None);
+    tx.put_edge(eid("e2"), obj("hub://root"), obj("item://mid"), "HAS", None);
+    tx.put_edge(
+        eid("e3"),
+        obj("hub://root"),
+        obj("item://high"),
+        "HAS",
+        None,
+    );
+    tx.put_edge(
+        eid("e4"),
+        obj("hub://root"),
+        obj("item://no-price"),
+        "HAS",
+        None,
+    );
+    store.commit(tx, "test", "seed").unwrap();
+}
+
+#[test]
+fn between_matches_nodes_in_range() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_between_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.price BETWEEN 10 AND 100 RETURN b",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "item://mid");
+    store.close().unwrap();
+}
+
+#[test]
+fn between_boundary_inclusive() {
+    // Boundaries (10.0 and 100.0) are included.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_between_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.price BETWEEN 5 AND 150 RETURN b",
+        )
+        .unwrap();
+
+    // low(5), mid(50), high(150) all included; no-price excluded (missing field)
+    assert_eq!(results.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn between_outside_range_excluded() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_between_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.price BETWEEN 200 AND 999 RETURN b",
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn between_combined_with_other_pred() {
+    // price BETWEEN 10 AND 100 AND b.price < 60 → only item://mid (50)
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_between_graph(&store);
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.price BETWEEN 10 AND 100 AND b.price < 60 RETURN b",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "item://mid");
+    store.close().unwrap();
+}
+
+#[test]
+fn between_parse_roundtrip() {
+    use bindb::{CmpOp, CmpValue, GraphIrQuery};
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:HAS]->(b) WHERE id(a) = 'hub://root' AND b.price BETWEEN 10 AND 100 RETURN b",
+    )
+    .unwrap();
+    assert_eq!(q.payload_preds.len(), 1);
+    let pred = &q.payload_preds[0];
+    assert_eq!(pred.field, "price");
+    assert_eq!(pred.op, CmpOp::Between);
+    assert_eq!(pred.value, CmpValue::NumberRange(10.0, 100.0));
+    assert!(!pred.negated);
+}
+
+#[test]
+fn between_on_edge_payload() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+
+    let mut tx = Transaction::new();
+    tx.put_object(obj("hub://r"), b"{}".to_vec());
+    tx.put_object(obj("item://a"), b"{}".to_vec());
+    tx.put_object(obj("item://b"), b"{}".to_vec());
+    tx.put_edge(
+        eid("cheap"),
+        obj("hub://r"),
+        obj("item://a"),
+        "SOLD",
+        Some(br#"{"weight":3.0}"#.to_vec()),
+    );
+    tx.put_edge(
+        eid("heavy"),
+        obj("hub://r"),
+        obj("item://b"),
+        "SOLD",
+        Some(br#"{"weight":20.0}"#.to_vec()),
+    );
+    store.commit(tx, "test", "seed").unwrap();
+
+    let results = store
+        .graph_ir(
+            "MATCH (a)-[r:SOLD]->(b) WHERE id(a) = 'hub://r' AND r.weight BETWEEN 1 AND 5 RETURN b",
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].object.object_id.0, "item://a");
+    store.close().unwrap();
+}
