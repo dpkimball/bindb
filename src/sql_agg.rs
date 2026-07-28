@@ -913,6 +913,8 @@ pub struct SqlProjectQuery {
     pub payload_filter: Option<SqlPayloadFilter>,
     /// Optional `ORDER BY PAYLOAD_FIELD('f') [ASC|DESC]` sort.
     pub order_by: Option<SqlProjectOrderBy>,
+    /// Number of rows to skip before applying LIMIT (applied after ORDER BY).
+    pub offset: Option<usize>,
     pub limit: Option<usize>,
 }
 
@@ -1030,6 +1032,20 @@ impl SqlProjectQuery {
             None
         };
 
+        let offset = if starts_with_keyword(s, "OFFSET") {
+            let after_offset = skip_keyword(s, "OFFSET").trim_start();
+            let end = after_offset
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_offset.len());
+            let n: usize = after_offset[..end].parse().map_err(|_| {
+                SqlAggError::Unsupported("OFFSET must be a non-negative integer".into())
+            })?;
+            s = after_offset[end..].trim_start();
+            Some(n)
+        } else {
+            None
+        };
+
         let limit = if starts_with_keyword(s, "LIMIT") {
             let after_limit = skip_keyword(s, "LIMIT").trim_start();
             let end = after_limit
@@ -1056,6 +1072,7 @@ impl SqlProjectQuery {
             id_filter,
             payload_filter,
             order_by,
+            offset,
             limit,
         })
     }
@@ -1166,6 +1183,14 @@ impl BinderStore {
         if let Some(ref sk) = sort_key_extra {
             for row in &mut rows {
                 row.remove(sk);
+            }
+        }
+
+        if let Some(n) = q.offset {
+            if n >= rows.len() {
+                rows.clear();
+            } else {
+                rows.drain(..n);
             }
         }
 

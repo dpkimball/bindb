@@ -1224,3 +1224,52 @@ fn project_order_by_parse_roundtrip() {
     assert_eq!(q.limit, Some(10));
     assert_eq!(q.id_filter, None);
 }
+
+// ── OFFSET for sql_project (issue #5) ────────────────────────────────────────
+
+#[test]
+fn project_offset_skips_rows() {
+    // 4 items ordered by price ASC: cherry(0.5), banana(1.5), date(2.0), apple(3.0)
+    // OFFSET 2 → date and apple
+    let (store, _dir) = build_order_by_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('price') ASC OFFSET 2",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["date", "apple"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_offset_and_limit_windowed() {
+    // OFFSET 1 LIMIT 2 → banana(1.5), date(2.0) (middle window)
+    let (store, _dir) = build_order_by_store();
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://items' ORDER BY PAYLOAD_FIELD('price') ASC OFFSET 1 LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["banana", "date"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_offset_beyond_end_returns_empty() {
+    let (store, _dir) = build_order_by_store();
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('name') FROM 'obs://items' OFFSET 100")
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
