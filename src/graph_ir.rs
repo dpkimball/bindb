@@ -99,6 +99,8 @@ pub enum GraphIrError {
     MissingStart,
     #[error("invalid hop bound")]
     BadHops,
+    #[error("no aggregating WITH clause; use graph_ir_projected instead")]
+    NoAggregation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,13 +171,37 @@ pub struct GraphIrOptionalMatch {
     pub fields: HashMap<String, serde_json::Value>,
 }
 
+/// Aggregation function for a `WITH` aggregation clause.
+///
+/// Used in `WITH count(b) AS cnt` / `WITH sum(b.score) AS s` forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// One aggregation item in a `WITH count(b) AS alias` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithAggregation {
+    pub func: AggFunc,
+    /// Payload field name (`b.field`) for sum/avg/min/max; `None` for `count(b)`.
+    pub field: Option<String>,
+    pub alias: String,
+}
+
 /// The `WITH b` clause between a mandatory MATCH and a subsequent OPTIONAL MATCH
 /// or RETURN.
 ///
-/// Filters, sorts, and pages mandatory `b` results before they fan out into
-/// optional expansion. When a WITH clause is present, `RETURN ORDER BY / LIMIT /
-/// SKIP` apply to the final expanded rows; when absent, they apply pre-expansion
-/// (backward compatible with queries that have no WITH clause).
+/// Two forms:
+/// - **Pass-through** (`WITH b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]`): filters,
+///   sorts, and pages mandatory `b` results before optional expansion. When present,
+///   `RETURN ORDER BY / LIMIT / SKIP` apply to the final expanded rows.
+/// - **Aggregating** (`WITH count(b) AS cnt [, sum(b.score) AS s …]`): collapses all
+///   matched `b` nodes into scalar values via `graph_ir_aggregated`. When
+///   `aggregations` is non-empty the other fields are unused.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphIrWithClause {
     /// Additional id predicate on matched `b` nodes, applied after the MATCH.
@@ -188,6 +214,12 @@ pub struct GraphIrWithClause {
     pub limit: Option<usize>,
     /// Skip applied to mandatory results after ordering (before optional expansion).
     pub skip: Option<usize>,
+    /// Aggregation items. Non-empty → aggregating WITH; use `graph_ir_aggregated`.
+    pub aggregations: Vec<WithAggregation>,
+    /// Fields to group by (`b.f1, b.f2` → `["f1", "f2"]`). Non-empty → grouped
+    /// aggregation; each unique combination of values produces a separate row.
+    /// Single-field case is `["field"]`; replaces the former `Option<String>`.
+    pub group_by_fields: Vec<String>,
 }
 
 /// One row returned by `graph_ir_projected`.
@@ -315,26 +347,46 @@ impl GraphIrQuery {
             break;
         }
 
-        // Optional WITH clause: WITH b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]
+        // Optional WITH clause: aggregating form or pass-through form.
         let (with_clause, after_with) = if starts_with_keyword(after_preds2, "WITH") {
             let after_with_kw = skip_keyword(after_preds2, "WITH");
-            if !starts_with_keyword(after_with_kw, "b") {
-                return Err(GraphIrError::Unsupported(
-                    "WITH must project variable 'b'".into(),
-                ));
+            if is_agg_func_start(after_with_kw) {
+                // Aggregating: WITH count(b) AS cnt [, …] [GROUP BY b.f1 [, b.f2 …]]
+                let (aggs, group_by_fields, after_aggs) =
+                    parse_with_aggregations(after_with_kw)?;
+                let wc = GraphIrWithClause {
+                    end_pred: NodeIdPred::Any,
+                    payload_preds: vec![],
+                    order_by: None,
+                    limit: None,
+                    skip: None,
+                    aggregations: aggs,
+                    group_by_fields,
+                };
+                (Some(wc), after_aggs.trim_start())
+            } else {
+                // Pass-through: WITH b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]
+                if !starts_with_keyword(after_with_kw, "b") {
+                    return Err(GraphIrError::Unsupported(
+                        "WITH must project variable 'b' or start with an aggregation function"
+                            .into(),
+                    ));
+                }
+                let after_b = skip_keyword(after_with_kw, "b").trim_start();
+                let (wc_end_pred, wc_preds, after_wc_where) = parse_with_where(after_b)?;
+                let (wc_ob, wc_limit, wc_skip, after_wc_ordering) =
+                    parse_ordering_tail_rest(after_wc_where)?;
+                let wc = GraphIrWithClause {
+                    end_pred: wc_end_pred,
+                    payload_preds: wc_preds,
+                    order_by: wc_ob,
+                    limit: wc_limit,
+                    skip: wc_skip,
+                    aggregations: vec![],
+                    group_by_fields: vec![],
+                };
+                (Some(wc), after_wc_ordering.trim_start())
             }
-            let after_b = skip_keyword(after_with_kw, "b").trim_start();
-            let (wc_end_pred, wc_preds, after_wc_where) = parse_with_where(after_b)?;
-            let (wc_ob, wc_limit, wc_skip, after_wc_ordering) =
-                parse_ordering_tail_rest(after_wc_where)?;
-            let wc = GraphIrWithClause {
-                end_pred: wc_end_pred,
-                payload_preds: wc_preds,
-                order_by: wc_ob,
-                limit: wc_limit,
-                skip: wc_skip,
-            };
-            (Some(wc), after_wc_ordering.trim_start())
         } else {
             (None, after_preds2)
         };
@@ -806,6 +858,157 @@ fn parse_with_where(s: &str) -> Result<(NodeIdPred, Vec<PayloadPred>, &str), Gra
     }
 
     Ok((end_pred, payload_preds, rest))
+}
+
+/// Return true if `s` starts with a known aggregation function name followed by `(`.
+fn is_agg_func_start(s: &str) -> bool {
+    let s = s.trim_start();
+    for prefix in &["count(", "sum(", "avg(", "min(", "max("] {
+        if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a comma-separated list of aggregation items plus an optional GROUP BY clause:
+/// `count(b) AS cnt [, sum(b.field) AS s …] [GROUP BY b.f1 [, b.f2 …]]`
+///
+/// Returns `(aggregations, group_by_fields, remaining)`.
+fn parse_with_aggregations(
+    s: &str,
+) -> Result<(Vec<WithAggregation>, Vec<String>, &str), GraphIrError> {
+    let mut aggs = Vec::new();
+    let mut s = s.trim_start();
+    loop {
+        let (agg, rest) = parse_one_aggregation(s)?;
+        aggs.push(agg);
+        s = rest.trim_start();
+        if s.starts_with(',') {
+            s = s[1..].trim_start();
+        } else {
+            break;
+        }
+    }
+
+    // Optional GROUP BY b.f1 [, b.f2 …]
+    let (group_by_fields, s) = if starts_with_keyword(s, "GROUP") {
+        let after_group = skip_keyword(s, "GROUP");
+        if !starts_with_keyword(after_group, "BY") {
+            return Err(GraphIrError::Unsupported("expected GROUP BY".into()));
+        }
+        let mut rest = skip_keyword(after_group, "BY").trim_start();
+        let mut fields = Vec::new();
+        loop {
+            if !rest.starts_with("b.") && !rest.starts_with("B.") {
+                return Err(GraphIrError::Unsupported(
+                    "GROUP BY fields must be b.field".into(),
+                ));
+            }
+            let after_dot = &rest[2..];
+            let field_end = after_dot
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_dot.len());
+            if field_end == 0 {
+                return Err(GraphIrError::Unsupported(
+                    "expected field name after GROUP BY b.".into(),
+                ));
+            }
+            fields.push(after_dot[..field_end].to_string());
+            rest = after_dot[field_end..].trim_start();
+            if rest.starts_with(',') {
+                rest = rest[1..].trim_start();
+            } else {
+                break;
+            }
+        }
+        (fields, rest)
+    } else {
+        (vec![], s)
+    };
+
+    Ok((aggs, group_by_fields, s))
+}
+
+/// Parse one aggregation item: `aggfunc(b[.field]) AS alias`.
+fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrError> {
+    let s = s.trim_start();
+    // Match function name + opening paren.
+    let (func, after_paren) = if s.len() >= 6 && s[..6].eq_ignore_ascii_case("count(") {
+        (AggFunc::Count, &s[6..])
+    } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("sum(") {
+        (AggFunc::Sum, &s[4..])
+    } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("avg(") {
+        (AggFunc::Avg, &s[4..])
+    } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("min(") {
+        (AggFunc::Min, &s[4..])
+    } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("max(") {
+        (AggFunc::Max, &s[4..])
+    } else {
+        return Err(GraphIrError::Unsupported(format!(
+            "expected aggregation function (count/sum/avg/min/max) near: {}",
+            &s[..s.len().min(20)]
+        )));
+    };
+
+    let after_paren = after_paren.trim_start();
+
+    // Parse argument: b.field (for sum/avg/min/max) or b (for count).
+    let (field, after_arg) =
+        if after_paren.starts_with("b.") || after_paren.starts_with("B.") {
+            let rest = &after_paren[2..];
+            let field_end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if field_end == 0 {
+                return Err(GraphIrError::Unsupported(
+                    "expected field name after b. in aggregation argument".into(),
+                ));
+            }
+            (Some(rest[..field_end].to_string()), &rest[field_end..])
+        } else if after_paren.starts_with('b') || after_paren.starts_with('B') {
+            (None, &after_paren[1..])
+        } else {
+            return Err(GraphIrError::Unsupported(
+                "aggregation argument must be 'b' or 'b.field'".into(),
+            ));
+        };
+
+    let after_arg = after_arg.trim_start();
+    if !after_arg.starts_with(')') {
+        return Err(GraphIrError::Unsupported(
+            "expected ')' after aggregation argument".into(),
+        ));
+    }
+    let after_close = after_arg[1..].trim_start();
+
+    // Require field for sum/avg/min/max.
+    if matches!(func, AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max) && field.is_none()
+    {
+        return Err(GraphIrError::Unsupported(
+            "sum/avg/min/max require a field argument, e.g. sum(b.score)".into(),
+        ));
+    }
+
+    if !starts_with_keyword(after_close, "AS") {
+        return Err(GraphIrError::Unsupported(
+            "expected AS after aggregation function".into(),
+        ));
+    }
+    let after_as = skip_keyword(after_close, "AS").trim_start();
+
+    let alias_end = after_as
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(after_as.len());
+    if alias_end == 0 {
+        return Err(GraphIrError::Unsupported(
+            "expected alias name after AS".into(),
+        ));
+    }
+    let alias = after_as[..alias_end].to_string();
+    let rest = &after_as[alias_end..];
+
+    Ok((WithAggregation { func, field, alias }, rest))
 }
 
 /// Like `parse_ordering_tail` but returns the remaining unparsed string as the
@@ -1428,6 +1631,172 @@ fn execute_optional_clause(
     Ok(results)
 }
 
+// ── aggregation helpers ───────────────────────────────────────────────────────
+
+/// Apply only the filter portion of a WITH clause (id predicate + payload preds).
+/// Used by `graph_ir_aggregated` before computing aggregate values.
+fn apply_with_clause_filter(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause) {
+    match &wc.end_pred {
+        NodeIdPred::Any => {}
+        NodeIdPred::StartsWith(pfx) => {
+            matches.retain(|m| m.object.object_id.0.starts_with(pfx.as_str()));
+        }
+        NodeIdPred::Equals(id) => {
+            matches.retain(|m| m.object.object_id.0 == id.as_str());
+        }
+    }
+    if !wc.payload_preds.is_empty() {
+        matches.retain(|m| {
+            let payload = m.object.payload.as_deref().unwrap_or(&[]);
+            wc.payload_preds
+                .iter()
+                .all(|pred| apply_payload_pred(payload, pred))
+        });
+    }
+}
+
+/// Extract a numeric field value from a JSON payload.
+fn extract_numeric_field(payload: Option<&[u8]>, field: &str) -> Option<f64> {
+    let bytes = payload?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.get(field)?.as_f64()
+}
+
+/// Compute a single aggregation over the matched nodes.
+fn compute_aggregation(matches: &[GraphQueryMatch], agg: &WithAggregation) -> serde_json::Value {
+    match &agg.func {
+        AggFunc::Count => {
+            serde_json::Value::Number(serde_json::Number::from(matches.len() as u64))
+        }
+        AggFunc::Sum => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let sum: f64 = matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .sum();
+            serde_json::json!(sum)
+        }
+        AggFunc::Avg => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let values: Vec<f64> = matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            if values.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(values.iter().sum::<f64>() / values.len() as f64)
+            }
+        }
+        AggFunc::Min => {
+            let field = agg.field.as_deref().unwrap_or("");
+            matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .reduce(f64::min)
+                .map(|v| serde_json::json!(v))
+                .unwrap_or(serde_json::Value::Null)
+        }
+        AggFunc::Max => {
+            let field = agg.field.as_deref().unwrap_or("");
+            matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .reduce(f64::max)
+                .map(|v| serde_json::json!(v))
+                .unwrap_or(serde_json::Value::Null)
+        }
+    }
+}
+
+/// Extract a single JSON field as a `serde_json::Value` (Null when absent/non-JSON).
+fn extract_json_field_value(payload: Option<&[u8]>, field: &str) -> serde_json::Value {
+    let key_str = json_field_as_group_key(payload, field);
+    serde_json::from_str(&key_str).unwrap_or(serde_json::Value::Null)
+}
+
+/// Serialize a node's JSON payload field to a stable string key for grouping.
+/// Returns `"null"` when the payload is missing, non-JSON, or lacks the field.
+fn json_field_as_group_key(payload: Option<&[u8]>, field: &str) -> String {
+    let Some(bytes) = payload else {
+        return "null".into();
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return "null".into();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return "null".into();
+    };
+    match v.get(field) {
+        Some(val) => serde_json::to_string(val).unwrap_or_else(|_| "null".into()),
+        None => "null".into(),
+    }
+}
+
+/// Build a stable composite group key for all `fields` from a JSON payload.
+/// Single field: raw JSON-serialized value. Multiple fields: JSON array `["v1","v2"]`.
+fn composite_group_key(payload: Option<&[u8]>, fields: &[String]) -> String {
+    if fields.len() == 1 {
+        return json_field_as_group_key(payload, &fields[0]);
+    }
+    let vals: Vec<serde_json::Value> = fields
+        .iter()
+        .map(|f| extract_json_field_value(payload, f))
+        .collect();
+    serde_json::to_string(&vals).unwrap_or_else(|_| "null".into())
+}
+
+/// Like `compute_aggregation` but operates on a borrowed slice of match references.
+fn compute_aggregation_slice(
+    group: &[&GraphQueryMatch],
+    agg: &WithAggregation,
+) -> serde_json::Value {
+    match &agg.func {
+        AggFunc::Count => {
+            serde_json::Value::Number(serde_json::Number::from(group.len() as u64))
+        }
+        AggFunc::Sum => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let sum: f64 = group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .sum();
+            serde_json::json!(sum)
+        }
+        AggFunc::Avg => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let values: Vec<f64> = group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            if values.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(values.iter().sum::<f64>() / values.len() as f64)
+            }
+        }
+        AggFunc::Min => {
+            let field = agg.field.as_deref().unwrap_or("");
+            group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .reduce(f64::min)
+                .map(|v| serde_json::json!(v))
+                .unwrap_or(serde_json::Value::Null)
+        }
+        AggFunc::Max => {
+            let field = agg.field.as_deref().unwrap_or("");
+            group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .reduce(f64::max)
+                .map(|v| serde_json::json!(v))
+                .unwrap_or(serde_json::Value::Null)
+        }
+    }
+}
+
 // ── write IR (issue #2 — write clauses) ──────────────────────────────────────
 
 /// A single graph mutation in the write IR.
@@ -1659,6 +2028,107 @@ impl BinderStore {
             return Ok(None);
         }
         Ok(Some(self.commit(tx, "graph_ir_write", "")?))
+    }
+
+    /// Execute a graph IR query that has an aggregating WITH clause.
+    ///
+    /// Returns one row per group (or one row total when no GROUP BY is present).
+    /// Each row is a `HashMap<alias, value>`. When a `GROUP BY b.field` clause is
+    /// present the group field value is included under its bare field name.
+    ///
+    /// ```text
+    /// -- Ungrouped (returns Vec with one row):
+    /// MATCH (a)-[:KNOWS*1..3]->(b)
+    /// WHERE id(a) = 'person://alice'
+    /// WITH count(b) AS total, avg(b.score) AS avg_score
+    /// RETURN total, avg_score
+    ///
+    /// -- Grouped (returns Vec with one row per unique value of b.type):
+    /// MATCH (a)-[:KNOWS*1..3]->(b)
+    /// WHERE id(a) = 'person://alice'
+    /// WITH count(b) AS cnt GROUP BY b.type
+    /// RETURN b.type, cnt
+    /// ```
+    ///
+    /// - `count(b)` always returns a JSON integer.
+    /// - `sum(b.field)` returns 0.0 when no nodes contribute.
+    /// - `avg/min/max(b.field)` return JSON null when no nodes contribute.
+    /// - Nodes missing the GROUP BY field form a group whose key is JSON null.
+    ///
+    /// Use [`graph_ir_projected`] for non-aggregating queries.
+    pub fn graph_ir_aggregated(
+        &self,
+        query: &str,
+    ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError> {
+        let q = GraphIrQuery::parse(query).map_err(|e| StoreError::InvalidArgument {
+            message: e.to_string(),
+        })?;
+
+        let with_clause = q.with_clause.as_ref().ok_or_else(|| StoreError::InvalidArgument {
+            message: GraphIrError::NoAggregation.to_string(),
+        })?;
+
+        if with_clause.aggregations.is_empty() {
+            return Err(StoreError::InvalidArgument {
+                message: GraphIrError::NoAggregation.to_string(),
+            });
+        }
+
+        let mut matches = build_graph_query(self, &q).execute()?;
+        if q.min_depth > 1 {
+            matches.retain(|m| m.depth >= q.min_depth);
+        }
+        apply_with_clause_filter(&mut matches, with_clause);
+
+        if !with_clause.group_by_fields.is_empty() {
+            // Grouped: partition matches by the composite key of all GROUP BY fields,
+            // preserving insertion order of unique key combinations.
+            let fields = &with_clause.group_by_fields;
+            let mut group_keys: Vec<String> = Vec::new();
+            let mut group_indices: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+
+            for (i, m) in matches.iter().enumerate() {
+                let key = composite_group_key(m.object.payload.as_deref(), fields);
+                if !group_indices.contains_key(&key) {
+                    group_keys.push(key.clone());
+                }
+                group_indices.entry(key).or_default().push(i);
+            }
+
+            let mut rows = Vec::with_capacity(group_keys.len());
+            for key in &group_keys {
+                let indices = &group_indices[key];
+                let group: Vec<&GraphQueryMatch> =
+                    indices.iter().map(|&i| &matches[i]).collect();
+
+                let mut row = std::collections::HashMap::new();
+                // Re-extract each individual field value from the first member of
+                // the group and include it under the bare field name.
+                if let Some(&first_idx) = indices.first() {
+                    let payload = matches[first_idx].object.payload.as_deref();
+                    for field in fields {
+                        let val = extract_json_field_value(payload, field);
+                        row.insert(field.clone(), val);
+                    }
+                }
+                for agg in &with_clause.aggregations {
+                    row.insert(
+                        agg.alias.clone(),
+                        compute_aggregation_slice(&group, agg),
+                    );
+                }
+                rows.push(row);
+            }
+            Ok(rows)
+        } else {
+            // Ungrouped: single output row.
+            let mut row = std::collections::HashMap::new();
+            for agg in &with_clause.aggregations {
+                row.insert(agg.alias.clone(), compute_aggregation(&matches, agg));
+            }
+            Ok(vec![row])
+        }
     }
 }
 
