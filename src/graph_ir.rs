@@ -169,6 +169,14 @@ pub enum ReturnTransform {
     Upper,
     Lower,
     Trim,
+    /// `ABS(b.field)` — absolute value of a numeric field.
+    Abs,
+    /// `ROUND(b.field)` — round numeric field to nearest integer.
+    Round,
+    /// `CEIL(b.field)` — ceiling of a numeric field.
+    Ceil,
+    /// `FLOOR(b.field)` — floor of a numeric field.
+    Floor,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -261,8 +269,8 @@ pub struct GraphIrWithClause {
     pub end_pred: NodeIdPred,
     /// Additional payload predicates on `b` nodes (AND-combined), applied after the MATCH.
     pub payload_preds: Vec<PayloadPred>,
-    /// Sort mandatory `b` results before optional expansion.
-    pub order_by: Option<GraphIrOrderBy>,
+    /// Sort mandatory `b` results before optional expansion (multi-key, left-to-right priority).
+    pub order_by: Vec<GraphIrOrderBy>,
     /// Limit applied to mandatory results after ordering (before optional expansion).
     pub limit: Option<usize>,
     /// Skip applied to mandatory results after ordering (before optional expansion).
@@ -490,7 +498,7 @@ impl GraphIrQuery {
                 let wc = GraphIrWithClause {
                     end_pred: NodeIdPred::Any,
                     payload_preds: vec![],
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
                     skip: None,
                     aggregations: aggs,
@@ -1349,15 +1357,14 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
     Ok((WithAggregation { func, field, alias }, rest))
 }
 
-/// Like `parse_ordering_tail` but returns the remaining unparsed string as the
-/// fourth element.  Used when ORDER BY / SKIP / LIMIT must be followed by more
-/// clauses (e.g. WITH followed by OPTIONAL MATCH or RETURN).
-#[allow(clippy::type_complexity)]
-fn parse_ordering_tail_rest(
-    s: &str,
-) -> Result<(Option<GraphIrOrderBy>, Option<usize>, Option<usize>, &str), GraphIrError> {
+type OrderingTailRest<'a> =
+    Result<(Vec<GraphIrOrderBy>, Option<usize>, Option<usize>, &'a str), GraphIrError>;
+
+/// Like `parse_multi_ordering_tail` but also returns the remaining unparsed string.
+/// Used when ORDER BY / SKIP / LIMIT must be followed by more clauses (WITH → OPTIONAL MATCH or RETURN).
+fn parse_ordering_tail_rest(s: &str) -> OrderingTailRest<'_> {
     let mut s = s.trim_start();
-    let mut order_by = None;
+    let mut order_by: Vec<GraphIrOrderBy> = Vec::new();
     let mut limit = None;
     let mut skip = None;
 
@@ -1366,18 +1373,45 @@ fn parse_ordering_tail_rest(
         if !starts_with_keyword(after_order, "BY") {
             return Err(GraphIrError::Unsupported("expected ORDER BY".into()));
         }
-        let after_by = skip_keyword(after_order, "BY");
-        let (field, rest) = parse_order_field(after_by)?;
-        let rest = rest.trim_start();
-        let (direction, rest) = if starts_with_keyword(rest, "DESC") {
-            (OrderDirection::Desc, skip_keyword(rest, "DESC"))
-        } else if starts_with_keyword(rest, "ASC") {
-            (OrderDirection::Asc, skip_keyword(rest, "ASC"))
-        } else {
-            (OrderDirection::Asc, rest)
-        };
-        order_by = Some(GraphIrOrderBy { field, direction });
-        s = rest.trim_start();
+        let mut rest = skip_keyword(after_order, "BY");
+        loop {
+            let (field, after_field) = parse_order_field(rest)?;
+            let after_field = after_field.trim_start();
+            let au = after_field.to_ascii_uppercase();
+            let (direction, after_dir) = if au.starts_with("DESC")
+                && (after_field.len() == 4
+                    || !after_field
+                        .as_bytes()
+                        .get(4)
+                        .is_some_and(|b| b.is_ascii_alphanumeric()))
+            {
+                (OrderDirection::Desc, after_field[4..].trim_start())
+            } else if au.starts_with("ASC")
+                && (after_field.len() == 3
+                    || !after_field
+                        .as_bytes()
+                        .get(3)
+                        .is_some_and(|b| b.is_ascii_alphanumeric()))
+            {
+                (OrderDirection::Asc, after_field[3..].trim_start())
+            } else {
+                (OrderDirection::Asc, after_field)
+            };
+            order_by.push(GraphIrOrderBy { field, direction });
+            if let Some(after_comma) = after_dir.strip_prefix(',') {
+                rest = after_comma.trim_start();
+                if starts_with_keyword(rest, "SKIP")
+                    || starts_with_keyword(rest, "LIMIT")
+                    || rest.is_empty()
+                {
+                    s = rest;
+                    break;
+                }
+            } else {
+                s = after_dir;
+                break;
+            }
+        }
     }
 
     if starts_with_keyword(s, "SKIP") {
@@ -1619,13 +1653,39 @@ fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
 /// Apply a `ReturnTransform` to a JSON value. Only `String` values are affected.
 fn apply_return_transform(val: serde_json::Value, t: ReturnTransform) -> serde_json::Value {
-    match val {
-        serde_json::Value::String(s) => serde_json::Value::String(match t {
-            ReturnTransform::Upper => s.to_uppercase(),
-            ReturnTransform::Lower => s.to_lowercase(),
-            ReturnTransform::Trim => s.trim().to_string(),
-        }),
-        other => other,
+    match t {
+        ReturnTransform::Upper | ReturnTransform::Lower | ReturnTransform::Trim => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(match t {
+                    ReturnTransform::Upper => s.to_uppercase(),
+                    ReturnTransform::Lower => s.to_lowercase(),
+                    ReturnTransform::Trim => s.trim().to_string(),
+                    _ => unreachable!(),
+                })
+            } else {
+                val
+            }
+        }
+        ReturnTransform::Abs
+        | ReturnTransform::Round
+        | ReturnTransform::Ceil
+        | ReturnTransform::Floor => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    let result = match t {
+                        ReturnTransform::Abs => f.abs(),
+                        ReturnTransform::Round => f.round(),
+                        ReturnTransform::Ceil => f.ceil(),
+                        ReturnTransform::Floor => f.floor(),
+                        _ => unreachable!(),
+                    };
+                    if let Some(n) = serde_json::Number::from_f64(result) {
+                        return serde_json::Value::Number(n);
+                    }
+                }
+            }
+            val
+        }
     }
 }
 
@@ -1882,20 +1942,23 @@ type ReturnSpec = (
     bool,
 );
 
-/// Detect `UPPER(b.field)`, `LOWER(b.field)`, `TRIM(b.field)` in a RETURN selector.
+/// Detect `UPPER/LOWER/TRIM/ABS/ROUND/CEIL/FLOOR(b.field)` in a RETURN selector.
 /// Returns `(field_name, transform)` if recognized, otherwise `None`.
 fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
     let su = s.to_ascii_uppercase();
-    let (transform, inner) = if su.starts_with("UPPER(") && s.ends_with(')') {
-        (ReturnTransform::Upper, &s["UPPER(".len()..s.len() - 1])
-    } else if su.starts_with("LOWER(") && s.ends_with(')') {
-        (ReturnTransform::Lower, &s["LOWER(".len()..s.len() - 1])
-    } else if su.starts_with("TRIM(") && s.ends_with(')') {
-        (ReturnTransform::Trim, &s["TRIM(".len()..s.len() - 1])
-    } else {
-        return None;
-    };
-    // inner must be b.fieldname
+    let prefixes: &[(&str, ReturnTransform)] = &[
+        ("UPPER(", ReturnTransform::Upper),
+        ("LOWER(", ReturnTransform::Lower),
+        ("TRIM(", ReturnTransform::Trim),
+        ("ABS(", ReturnTransform::Abs),
+        ("ROUND(", ReturnTransform::Round),
+        ("CEIL(", ReturnTransform::Ceil),
+        ("FLOOR(", ReturnTransform::Floor),
+    ];
+    let &(pfx, t) = prefixes
+        .iter()
+        .find(|(pfx, _)| su.starts_with(pfx) && s.ends_with(')'))?;
+    let inner = &s[pfx.len()..s.len() - 1];
     let field = inner
         .strip_prefix("b.")
         .or_else(|| inner.strip_prefix("B."))?;
@@ -1903,7 +1966,7 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
     if field.is_empty() {
         None
     } else {
-        Some((field, transform))
+        Some((field, t))
     }
 }
 
@@ -2288,22 +2351,28 @@ fn apply_with_clause(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause)
                 .all(|pred| apply_payload_pred(payload, pred))
         });
     }
-    if let Some(ob) = &wc.order_by {
+    if !wc.order_by.is_empty() {
         matches.sort_by(|a, b| {
-            let ord = match &ob.field {
-                OrderByField::ObjectId => a.object.object_id.0.cmp(&b.object.object_id.0),
-                OrderByField::Depth => a.depth.cmp(&b.depth),
-                OrderByField::PayloadField(field) => {
-                    let ak = extract_sort_key(a.object.payload.as_deref(), field);
-                    let bk = extract_sort_key(b.object.payload.as_deref(), field);
-                    ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+            for ob in &wc.order_by {
+                let ord = match &ob.field {
+                    OrderByField::ObjectId => a.object.object_id.0.cmp(&b.object.object_id.0),
+                    OrderByField::Depth => a.depth.cmp(&b.depth),
+                    OrderByField::PayloadField(field) => {
+                        let ak = extract_sort_key(a.object.payload.as_deref(), field);
+                        let bk = extract_sort_key(b.object.payload.as_deref(), field);
+                        ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                };
+                let ord = if ob.direction == OrderDirection::Desc {
+                    ord.reverse()
+                } else {
+                    ord
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
                 }
-            };
-            if ob.direction == OrderDirection::Desc {
-                ord.reverse()
-            } else {
-                ord
             }
+            std::cmp::Ordering::Equal
         });
     }
     if let Some(n) = wc.skip.filter(|&n| n > 0) {

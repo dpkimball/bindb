@@ -2758,3 +2758,134 @@ fn payload_numeric_in_parses_correctly() {
         SqlPayloadValue::NumList(ns) if ns.len() == 3
     ));
 }
+
+// ── ABS/ROUND/CEIL/FLOOR(PAYLOAD_FIELD) and LENGTH(PAYLOAD_FIELD) tests ──────
+
+#[test]
+fn select_abs_of_negative() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sabn:a"), br#"{"delta":-7.5}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ABS(PAYLOAD_FIELD('delta')) FROM 'obs://sabn'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("delta").and_then(|v| v.as_f64()), Some(7.5));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_round_of_decimal() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srod:a"), br#"{"price":4.6}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ROUND(PAYLOAD_FIELD('price')) FROM 'obs://srod'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("price").and_then(|v| v.as_f64()), Some(5.0));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_ceil_and_floor() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scaf:a"), br#"{"val":3.2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let ceil_rows = store
+        .sql_project("SELECT CEIL(PAYLOAD_FIELD('val')) FROM 'obs://scaf'")
+        .unwrap();
+    assert_eq!(ceil_rows[0].get("val").and_then(|v| v.as_f64()), Some(4.0));
+
+    let floor_rows = store
+        .sql_project("SELECT FLOOR(PAYLOAD_FIELD('val')) FROM 'obs://scaf'")
+        .unwrap();
+    assert_eq!(floor_rows[0].get("val").and_then(|v| v.as_f64()), Some(3.0));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_numeric_transform_on_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sntsp:a"), br#"{"label":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ABS(PAYLOAD_FIELD('label')) FROM 'obs://sntsp'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("label").and_then(|v| v.as_str()), Some("hello"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_length_of_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slos:a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LENGTH(PAYLOAD_FIELD('word')) FROM 'obs://slos'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("word").and_then(|v| v.as_u64()), Some(5));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_length_of_multiple_rows() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slmr:a"), br#"{"tag":"hi"}"#.to_vec());
+    tx.put_object(oid("obs://slmr:b"), br#"{"tag":"world"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let mut rows = store
+        .sql_project("SELECT LENGTH(PAYLOAD_FIELD('tag')) FROM 'obs://slmr' ORDER BY PAYLOAD_FIELD('tag') ASC")
+        .unwrap();
+    rows.sort_by_key(|r| r.get("tag").and_then(|v| v.as_u64()).unwrap_or(0));
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(rows[1].get("tag").and_then(|v| v.as_u64()), Some(5));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_length_on_number_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slnp:a"), br#"{"count":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LENGTH(PAYLOAD_FIELD('count')) FROM 'obs://slnp'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("count").and_then(|v| v.as_u64()), Some(42));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_length_transform_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT LENGTH(PAYLOAD_FIELD('name')) FROM 'obs://x'").unwrap();
+    assert_eq!(q.field_transforms.len(), 1);
+    assert!(matches!(
+        q.field_transforms.get("name"),
+        Some(SqlFieldTransform::Length)
+    ));
+}
