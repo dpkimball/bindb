@@ -501,7 +501,10 @@ fn sla_open_wal_replay_lte_500ms_at_10k_commits() {
         store.close().unwrap();
     }
     let median_ms = percentile(
-        &mut samples_ms.iter().map(|&v| v * 1_000_000).collect::<Vec<_>>(),
+        &mut samples_ms
+            .iter()
+            .map(|&v| v * 1_000_000)
+            .collect::<Vec<_>>(),
         50.0,
     ) / 1_000_000;
 
