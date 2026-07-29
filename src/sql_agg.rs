@@ -1396,6 +1396,14 @@ pub enum SqlFieldTransform {
     Tan,
     /// `ATAN(PAYLOAD_FIELD('f'))` — arc tangent of a numeric field; result in [-π/2, π/2].
     Atan,
+    /// `ASIN(PAYLOAD_FIELD('f'))` — arc sine of a numeric field in [-1, 1]; out-of-domain passes through.
+    Asin,
+    /// `ACOS(PAYLOAD_FIELD('f'))` — arc cosine of a numeric field in [-1, 1]; out-of-domain passes through.
+    Acos,
+    /// `TRUNC(PAYLOAD_FIELD('f'))` — truncate toward zero (differs from FLOOR for negatives).
+    Trunc,
+    /// `CBRT(PAYLOAD_FIELD('f'))` — cube root of a numeric field.
+    Cbrt,
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -2130,6 +2138,10 @@ impl SqlProjectQuery {
                 ("COS(PAYLOAD_FIELD(", SqlFieldTransform::Cos),
                 ("TAN(PAYLOAD_FIELD(", SqlFieldTransform::Tan),
                 ("ATAN(PAYLOAD_FIELD(", SqlFieldTransform::Atan),
+                ("ASIN(PAYLOAD_FIELD(", SqlFieldTransform::Asin),
+                ("ACOS(PAYLOAD_FIELD(", SqlFieldTransform::Acos),
+                ("TRUNC(PAYLOAD_FIELD(", SqlFieldTransform::Trunc),
+                ("CBRT(PAYLOAD_FIELD(", SqlFieldTransform::Cbrt),
             ];
             let transform = transform_prefixes
                 .iter()
@@ -2708,6 +2720,46 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
             if let serde_json::Value::Number(n) = &val {
                 if let Some(f) = n.as_f64() {
                     if let Some(result) = serde_json::Number::from_f64(f.atan()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Asin => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.asin()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Acos => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.acos()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Trunc => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.trunc()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Cbrt => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.cbrt()) {
                         return serde_json::Value::Number(result);
                     }
                 }

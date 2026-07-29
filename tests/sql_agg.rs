@@ -4056,3 +4056,136 @@ fn select_atan_string_passes_through() {
     assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("arc"));
     store.close().unwrap();
 }
+
+#[test]
+fn select_asin_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sasin:a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ASIN(PAYLOAD_FIELD('n')) FROM 'obs://sasin'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_asin_out_of_domain_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sasinood:a"), br#"{"n":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ASIN(PAYLOAD_FIELD('n')) FROM 'obs://sasinood'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n").and_then(|v| v.as_i64()), Some(2));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_acos_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sacos:a"), br#"{"n":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ACOS(PAYLOAD_FIELD('n')) FROM 'obs://sacos'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_acos_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sacosstr:a"), br#"{"s":"arc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ACOS(PAYLOAD_FIELD('s')) FROM 'obs://sacosstr'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("arc"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_trunc_negative() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://struncn:a"), br#"{"n":-1.7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT TRUNC(PAYLOAD_FIELD('n')) FROM 'obs://struncn'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - (-1.0)).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_trunc_positive() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://struncp:a"), br#"{"n":1.7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT TRUNC(PAYLOAD_FIELD('n')) FROM 'obs://struncp'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_cbrt_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scbrt:a"), br#"{"n":8}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT CBRT(PAYLOAD_FIELD('n')) FROM 'obs://scbrt'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 2.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_cbrt_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scbrtstr:a"), br#"{"s":"root"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT CBRT(PAYLOAD_FIELD('s')) FROM 'obs://scbrtstr'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("root"));
+    store.close().unwrap();
+}
