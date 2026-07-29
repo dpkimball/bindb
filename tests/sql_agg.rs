@@ -3101,7 +3101,7 @@ fn select_cast_as_float_from_string() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();
     let mut tx = Transaction::new();
-    tx.put_object(oid("obs://scaff:a"), br#"{"temp":"3.14"}"#.to_vec());
+    tx.put_object(oid("obs://scaff:a"), br#"{"temp":"2.5"}"#.to_vec());
     store.commit(tx, "test", "").unwrap();
 
     let rows = store
@@ -3109,7 +3109,7 @@ fn select_cast_as_float_from_string() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     let v = rows[0].get("temp").and_then(|v| v.as_f64()).unwrap();
-    assert!((v - 3.14).abs() < 1e-9);
+    assert!((v - 2.5).abs() < 1e-9);
     store.close().unwrap();
 }
 
