@@ -335,6 +335,9 @@ pub struct GraphIrQuery {
     /// Fields to project from each matched node's JSON payload (`RETURN b.f1, b.f2`).
     /// Empty = plain node return via `graph_ir` / `graph_ir_parsed`.
     pub return_fields: Vec<String>,
+    /// Optional output-key aliases for projected node fields (`RETURN b.name AS n`).
+    /// Key = raw field name, value = alias used in `GraphIrRow::fields`.
+    pub return_field_aliases: HashMap<String, String>,
     /// Fields to project from the via-edge's JSON payload (`RETURN r.f1, r.f2`).
     /// Empty = no edge projection. Populated into `GraphIrRow::edge_fields`.
     pub edge_return_fields: Vec<String>,
@@ -538,8 +541,14 @@ impl GraphIrQuery {
             (false, after_return)
         };
         let (ret_spec, ordering_tail) = split_at_ordering_clause(after_return);
-        let (return_fields, edge_return_fields, c_return_fields, return_path, return_id) =
-            parse_return_spec(ret_spec, path_var.as_deref());
+        let (
+            return_fields,
+            return_field_aliases,
+            edge_return_fields,
+            c_return_fields,
+            return_path,
+            return_id,
+        ) = parse_return_spec(ret_spec, path_var.as_deref());
         let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
 
         let optional_clause = optional_clause_raw.map(|mut oc| {
@@ -558,6 +567,7 @@ impl GraphIrQuery {
             pred_combinator,
             edge_preds,
             return_fields,
+            return_field_aliases,
             edge_return_fields,
             return_path,
             return_id,
@@ -1713,38 +1723,65 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 /// - `c_fields`: fields projected from the optional `c` node (`RETURN c.f1`)
 /// - `return_path`: true when `path` appears in the RETURN list, or the named path variable does
 ///
+/// `(b_fields, b_aliases, r_fields, c_fields, return_path, return_id)`
+type ReturnSpec = (
+    Vec<String>,
+    HashMap<String, String>,
+    Vec<String>,
+    Vec<String>,
+    bool,
+    bool,
+);
+
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
-fn parse_return_spec(
-    s: &str,
-    path_var: Option<&str>,
-) -> (Vec<String>, Vec<String>, Vec<String>, bool, bool) {
+fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let s = s.trim();
     if s.is_empty() {
-        return (vec![], vec![], vec![], false, false);
+        return (vec![], HashMap::new(), vec![], vec![], false, false);
     }
     let mut b_fields = Vec::new();
+    let mut b_aliases: HashMap<String, String> = HashMap::new();
     let mut r_fields = Vec::new();
     let mut c_fields = Vec::new();
     let mut return_path = false;
     let mut return_id = false;
     for part in s.split(',') {
         let p = part.trim();
-        let is_path_var = path_var.is_some_and(|v| p.eq_ignore_ascii_case(v));
-        if p.eq_ignore_ascii_case("path") || is_path_var {
+        // Detect optional `AS alias` suffix (e.g. `b.name AS n`).
+        let tokens: Vec<&str> = p.split_whitespace().collect();
+        let (selector, alias) = if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("AS") {
+            (tokens[0], Some(tokens[2].to_string()))
+        } else {
+            (p, None)
+        };
+        let is_path_var = path_var.is_some_and(|v| selector.eq_ignore_ascii_case(v));
+        if selector.eq_ignore_ascii_case("path") || is_path_var {
             return_path = true;
-        } else if p.eq_ignore_ascii_case("id(b)") || p.eq_ignore_ascii_case("id(a)") {
+        } else if selector.eq_ignore_ascii_case("id(b)") || selector.eq_ignore_ascii_case("id(a)") {
             return_id = true;
-        } else if let Some(field) = p.strip_prefix("b.").or_else(|| p.strip_prefix("B.")) {
+        } else if let Some(field) = selector
+            .strip_prefix("b.")
+            .or_else(|| selector.strip_prefix("B."))
+        {
             let f = field.trim().to_string();
             if !f.is_empty() {
+                if let Some(a) = alias {
+                    b_aliases.insert(f.clone(), a);
+                }
                 b_fields.push(f);
             }
-        } else if let Some(field) = p.strip_prefix("r.").or_else(|| p.strip_prefix("R.")) {
+        } else if let Some(field) = selector
+            .strip_prefix("r.")
+            .or_else(|| selector.strip_prefix("R."))
+        {
             let f = field.trim().to_string();
             if !f.is_empty() {
                 r_fields.push(f);
             }
-        } else if let Some(field) = p.strip_prefix("c.").or_else(|| p.strip_prefix("C.")) {
+        } else if let Some(field) = selector
+            .strip_prefix("c.")
+            .or_else(|| selector.strip_prefix("C."))
+        {
             let f = field.trim().to_string();
             if !f.is_empty() {
                 c_fields.push(f);
@@ -1752,7 +1789,14 @@ fn parse_return_spec(
         }
         // "b", "r", "c" alone → plain return; ignore
     }
-    (b_fields, r_fields, c_fields, return_path, return_id)
+    (
+        b_fields,
+        b_aliases,
+        r_fields,
+        c_fields,
+        return_path,
+        return_id,
+    )
 }
 
 enum SortKey {
@@ -1893,7 +1937,12 @@ impl BinderStore {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
                             for key in &q.return_fields {
                                 if let Some(val) = v.get(key) {
-                                    b_fields.insert(key.clone(), val.clone());
+                                    let out_key = q
+                                        .return_field_aliases
+                                        .get(key)
+                                        .cloned()
+                                        .unwrap_or_else(|| key.clone());
+                                    b_fields.insert(out_key, val.clone());
                                 }
                             }
                         }

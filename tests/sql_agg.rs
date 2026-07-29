@@ -2078,3 +2078,195 @@ fn payload_field_not_like_parse_op() {
     .unwrap();
     assert_eq!(q.payload_filters[0].op, SqlPayloadOp::NotLike);
 }
+
+// ── SELECT PAYLOAD_FIELD('f') AS alias ────────────────────────────────────────
+
+#[test]
+fn select_payload_field_alias_renames_output_key() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://alias:a"), br#"{"name":"alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('name') AS n FROM 'obs://alias'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n").and_then(|v| v.as_str()), Some("alice"));
+    assert!(!rows[0].contains_key("name"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_payload_field_alias_multiple_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://malias:a"),
+        br#"{"first":"bob","score":42}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('first') AS fname, PAYLOAD_FIELD('score') AS pts FROM 'obs://malias'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("fname").and_then(|v| v.as_str()), Some("bob"));
+    assert_eq!(rows[0].get("pts").and_then(|v| v.as_i64()), Some(42));
+    assert!(!rows[0].contains_key("first"));
+    assert!(!rows[0].contains_key("score"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_payload_field_alias_parse_stored() {
+    use bindb::SqlProjectQuery;
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('name') AS n, PAYLOAD_FIELD('age') AS years FROM 'obs://x'",
+    )
+    .unwrap();
+    assert_eq!(q.fields, vec!["name", "age"]);
+    assert_eq!(q.field_aliases.get("name"), Some(&"n".to_string()));
+    assert_eq!(q.field_aliases.get("age"), Some(&"years".to_string()));
+}
+
+#[test]
+fn select_payload_field_no_alias_uses_raw_name() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://noalias:a"), br#"{"score":7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('score') FROM 'obs://noalias'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(7));
+    store.close().unwrap();
+}
+
+// ── GROUP BY PAYLOAD_FIELD('f1'), PAYLOAD_FIELD('f2') ────────────────────────
+
+#[test]
+fn multi_payload_group_by_two_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://mgb:a"),
+        br#"{"region":"us","tier":"free"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://mgb:b"),
+        br#"{"region":"us","tier":"free"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://mgb:c"),
+        br#"{"region":"eu","tier":"pro"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://mgb:d"),
+        br#"{"region":"us","tier":"pro"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://mgb' GROUP BY PAYLOAD_FIELD('region'), PAYLOAD_FIELD('tier')",
+        )
+        .unwrap();
+    // Groups: ["us","free"]:2, ["eu","pro"]:1, ["us","pro"]:1
+    assert_eq!(results.len(), 3);
+    let us_free = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some(r#"["us","free"]"#))
+        .expect("us/free group");
+    assert_eq!(us_free.count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_payload_group_by_missing_field_uses_null() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://mnull:a"), br#"{"f1":"x","f2":"y"}"#.to_vec());
+    tx.put_object(oid("obs://mnull:b"), br#"{"f1":"x"}"#.to_vec()); // f2 missing
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://mnull' GROUP BY PAYLOAD_FIELD('f1'), PAYLOAD_FIELD('f2')",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let null_group = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some(r#"["x",null]"#))
+        .expect("null group for missing f2");
+    assert_eq!(null_group.count, 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_payload_group_by_parse_produces_variant() {
+    use bindb::{SqlAggregateQuery, SqlGroupBy};
+    let q = SqlAggregateQuery::parse(
+        "SELECT COUNT(*) FROM 'obs://x' GROUP BY PAYLOAD_FIELD('region'), PAYLOAD_FIELD('tier')",
+    )
+    .unwrap();
+    assert_eq!(
+        q.group_by,
+        SqlGroupBy::MultiPayloadField(vec!["region".into(), "tier".into()])
+    );
+}
+
+#[test]
+fn multi_payload_group_by_single_field_unchanged() {
+    use bindb::{SqlAggregateQuery, SqlGroupBy};
+    let q =
+        SqlAggregateQuery::parse("SELECT COUNT(*) FROM 'obs://x' GROUP BY PAYLOAD_FIELD('region')")
+            .unwrap();
+    assert_eq!(q.group_by, SqlGroupBy::PayloadField("region".into()));
+}
+
+#[test]
+fn multi_payload_group_by_with_having() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for _ in 0..3 {
+        tx.put_object(
+            oid(&format!("obs://mhav:{}", uuid())),
+            br#"{"env":"prod","svc":"api"}"#.to_vec(),
+        );
+    }
+    tx.put_object(
+        oid("obs://mhav:single"),
+        br#"{"env":"prod","svc":"db"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://mhav' GROUP BY PAYLOAD_FIELD('env'), PAYLOAD_FIELD('svc') HAVING COUNT(*) >= 2",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].group_key.as_deref().unwrap().contains("api"));
+    store.close().unwrap();
+}
+
+fn uuid() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos()
+        .to_string()
+}

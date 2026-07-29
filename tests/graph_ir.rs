@@ -4222,3 +4222,106 @@ fn not_like_all_excluded_returns_empty() {
     assert!(rows.is_empty());
     store.close().unwrap();
 }
+
+// ── RETURN b.field AS alias ───────────────────────────────────────────────────
+
+#[test]
+fn return_field_alias_renames_output_key() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("al://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("al://a"), br#"{"name":"alice"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("al_e1"), obj("al://hub"), obj("al://a"), "AL", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:AL]->(b) WHERE id(a) = 'al://hub' RETURN b.name AS n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // Alias "n" is used as the key, raw "name" is not present
+    assert_eq!(
+        rows[0].fields.get("n"),
+        Some(&serde_json::Value::String("alice".into()))
+    );
+    assert!(!rows[0].fields.contains_key("name"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_field_alias_multiple_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("alm://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("alm://a"), br#"{"first":"bob","age":30}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("alm_e1"), obj("alm://hub"), obj("alm://a"), "X", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'alm://hub' RETURN b.first AS fname, b.age AS years",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("fname"),
+        Some(&serde_json::Value::String("bob".into()))
+    );
+    assert_eq!(
+        rows[0].fields.get("years"),
+        Some(&serde_json::Value::Number(30.into()))
+    );
+    assert!(!rows[0].fields.contains_key("first"));
+    assert!(!rows[0].fields.contains_key("age"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_field_alias_parse_stored_in_struct() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:E]->(b) WHERE id(a) = 'x://a' RETURN b.color AS c, b.size AS s",
+    )
+    .unwrap();
+    assert_eq!(q.return_fields, vec!["color", "size"]);
+    assert_eq!(q.return_field_aliases.get("color"), Some(&"c".to_string()));
+    assert_eq!(q.return_field_aliases.get("size"), Some(&"s".to_string()));
+}
+
+#[test]
+fn return_field_no_alias_uses_raw_name() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nal://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nal://a"), br#"{"score":99}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("nal_e1"), obj("nal://hub"), obj("nal://a"), "R", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:R]->(b) WHERE id(a) = 'nal://hub' RETURN b.score")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("score"),
+        Some(&serde_json::Value::Number(99.into()))
+    );
+    store.close().unwrap();
+}
