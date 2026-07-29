@@ -7748,3 +7748,109 @@ fn union_projected_api() {
     assert!(ns.contains(&2));
     store.close().unwrap();
 }
+
+// --- SET NODE / DELETE NODE / DELETE EDGE write IR ---
+
+#[test]
+fn write_ir_set_node_replaces_payload() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    store
+        .graph_ir_write(r#"CREATE NODE id="upd://n1" payload={"v":1}"#)
+        .unwrap();
+    store
+        .graph_ir_write(r#"SET NODE id="upd://n1" payload={"v":99}"#)
+        .unwrap();
+    let raw = store.get(&obj("upd://n1")).unwrap().unwrap();
+    let val: serde_json::Value = serde_json::from_slice(raw.payload.unwrap().as_slice()).unwrap();
+    assert_eq!(val["v"], serde_json::json!(99));
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_set_node_merge_payload_merges_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    store
+        .graph_ir_write(r#"CREATE NODE id="mrg://n1" payload={"a":1,"b":2}"#)
+        .unwrap();
+    store
+        .graph_ir_write(r#"SET NODE id="mrg://n1" merge_payload={"b":20,"c":30}"#)
+        .unwrap();
+    let raw = store.get(&obj("mrg://n1")).unwrap().unwrap();
+    let val: serde_json::Value = serde_json::from_slice(raw.payload.unwrap().as_slice()).unwrap();
+    // 'a' preserved, 'b' overwritten, 'c' added.
+    assert_eq!(val["a"], serde_json::json!(1));
+    assert_eq!(val["b"], serde_json::json!(20));
+    assert_eq!(val["c"], serde_json::json!(30));
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_set_node_merge_creates_if_absent() {
+    // merge_payload on a non-existent node creates it.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    store
+        .graph_ir_write(r#"SET NODE id="new://n1" merge_payload={"x":7}"#)
+        .unwrap();
+    let raw = store.get(&obj("new://n1")).unwrap().unwrap();
+    let val: serde_json::Value = serde_json::from_slice(raw.payload.unwrap().as_slice()).unwrap();
+    assert_eq!(val["x"], serde_json::json!(7));
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_delete_node_removes_it() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    store
+        .graph_ir_write(r#"CREATE NODE id="del://n1" payload={"v":1}"#)
+        .unwrap();
+    assert!(store.get(&obj("del://n1")).unwrap().is_some());
+    store
+        .graph_ir_write(r#"DELETE NODE id="del://n1""#)
+        .unwrap();
+    assert!(store.get(&obj("del://n1")).unwrap().is_none());
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_delete_edge_removes_it() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    store
+        .graph_ir_write(
+            "CREATE NODE id=\"de://a\" payload={}\nCREATE NODE id=\"de://b\" payload={}",
+        )
+        .unwrap();
+    store
+        .graph_ir_write(r#"CREATE EDGE id="de://e1" from="de://a" to="de://b" label="LINK""#)
+        .unwrap();
+    // Verify edge exists via traversal.
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:LINK]->(b) WHERE id(a) = 'de://a' RETURN id(b)")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+
+    store.graph_ir_write(r#"DELETE EDGE id="de://e1""#).unwrap();
+
+    // Edge gone — no traversal results.
+    let rows2 = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:LINK]->(b) WHERE id(a) = 'de://a' RETURN id(b)")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows2.len(), 0);
+    store.close().unwrap();
+}
+
+#[test]
+fn write_ir_set_delete_parse_error_unknown_verb() {
+    let err = GraphIrWrite::parse("UPSERT NODE id=\"x://n\" payload={}");
+    assert!(err.is_err());
+}
