@@ -184,6 +184,31 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
                 val
             }
         }
+        ReturnTransform::Repeat(n) => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(s.repeat(*n))
+            } else {
+                val
+            }
+        }
+        ReturnTransform::Left(n) => {
+            if let serde_json::Value::String(s) = val {
+                let chars: Vec<char> = s.chars().collect();
+                let end = (*n).min(chars.len());
+                serde_json::Value::String(chars[..end].iter().collect())
+            } else {
+                val
+            }
+        }
+        ReturnTransform::Right(n) => {
+            if let serde_json::Value::String(s) = val {
+                let chars: Vec<char> = s.chars().collect();
+                let start = chars.len().saturating_sub(*n);
+                serde_json::Value::String(chars[start..].iter().collect())
+            } else {
+                val
+            }
+        }
     }
 }
 

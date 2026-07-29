@@ -115,6 +115,12 @@ pub enum ReturnTransform {
     Lpad(usize, String),
     /// `RPAD(b.field, n, 'c')` — right-pad string to width `n` with char `c`.
     Rpad(usize, String),
+    /// `REPEAT(b.field, n)` — repeat the string value `n` times.
+    Repeat(usize),
+    /// `LEFT(b.field, n)` — first `n` characters of a string field.
+    Left(usize),
+    /// `RIGHT(b.field, n)` — last `n` characters of a string field.
+    Right(usize),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.

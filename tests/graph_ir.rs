@@ -6127,3 +6127,188 @@ fn return_rpad_parses_correctly() {
         Some(ReturnTransform::Rpad(10, s)) if s == " "
     ));
 }
+
+// ── REPEAT / LEFT / RIGHT transform tests ────────────────────────────────────
+
+#[test]
+fn return_repeat_duplicates_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("grep://hub"), b"{}".to_vec());
+    tx.put_object(obj("grep://a"), br#"{"sep":"-"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("grep_e1"),
+        obj("grep://hub"),
+        obj("grep://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'grep://hub' RETURN REPEAT(b.sep, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["sep"], serde_json::json!("---"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_repeat_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN REPEAT(b.sep, 4)")
+        .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("sep"),
+        Some(ReturnTransform::Repeat(4))
+    ));
+}
+
+#[test]
+fn return_left_extracts_prefix() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gleft://hub"), b"{}".to_vec());
+    tx.put_object(obj("gleft://a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gleft_e1"),
+        obj("gleft://hub"),
+        obj("gleft://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gleft://hub' RETURN LEFT(b.word, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["word"], serde_json::json!("hel"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_left_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN LEFT(b.word, 3)")
+        .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("word"),
+        Some(ReturnTransform::Left(3))
+    ));
+}
+
+#[test]
+fn return_right_extracts_suffix() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("grght://hub"), b"{}".to_vec());
+    tx.put_object(obj("grght://a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("grght_e1"),
+        obj("grght://hub"),
+        obj("grght://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'grght://hub' RETURN RIGHT(b.word, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["word"], serde_json::json!("llo"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_right_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN RIGHT(b.word, 3)")
+        .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("word"),
+        Some(ReturnTransform::Right(3))
+    ));
+}
+
+#[test]
+fn return_left_beyond_length_returns_full_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gleftbl://hub"), b"{}".to_vec());
+    tx.put_object(obj("gleftbl://a"), br#"{"tag":"hi"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gleftbl_e1"),
+        obj("gleftbl://hub"),
+        obj("gleftbl://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gleftbl://hub' RETURN LEFT(b.tag, 100)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["tag"], serde_json::json!("hi"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_right_zero_gives_empty_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("grght0://hub"), b"{}".to_vec());
+    tx.put_object(obj("grght0://a"), br#"{"tag":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("grght0_e1"),
+        obj("grght0://hub"),
+        obj("grght0://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'grght0://hub' RETURN RIGHT(b.tag, 0)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["tag"], serde_json::json!(""));
+    store.close().unwrap();
+}

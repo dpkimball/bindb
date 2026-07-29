@@ -3374,3 +3374,116 @@ fn select_repeat_non_string_passes_through() {
     assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(42));
     store.close().unwrap();
 }
+
+// ── LEFT / RIGHT / SIGN(PAYLOAD_FIELD) in SELECT tests ──────────────────────
+
+#[test]
+fn select_left_extracts_prefix() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sleft:a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LEFT(PAYLOAD_FIELD('word'), 3) FROM 'obs://sleft'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("word").and_then(|v| v.as_str()), Some("hel"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_left_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT LEFT(PAYLOAD_FIELD('word'), 3) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("word"),
+        Some(SqlFieldTransform::Left(3))
+    ));
+}
+
+#[test]
+fn select_right_extracts_suffix() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srght:a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT RIGHT(PAYLOAD_FIELD('word'), 3) FROM 'obs://srght'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("word").and_then(|v| v.as_str()), Some("llo"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_right_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q =
+        SqlProjectQuery::parse("SELECT RIGHT(PAYLOAD_FIELD('word'), 3) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("word"),
+        Some(SqlFieldTransform::Right(3))
+    ));
+}
+
+#[test]
+fn select_sign_positive_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssignp:a"), br#"{"score":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SIGN(PAYLOAD_FIELD('score')) FROM 'obs://ssignp'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(1));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_sign_negative_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssignn:a"), br#"{"val":-7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SIGN(PAYLOAD_FIELD('val')) FROM 'obs://ssignn'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("val").and_then(|v| v.as_i64()), Some(-1));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_sign_zero() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssignz:a"), br#"{"val":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SIGN(PAYLOAD_FIELD('val')) FROM 'obs://ssignz'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("val").and_then(|v| v.as_i64()), Some(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_sign_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT SIGN(PAYLOAD_FIELD('score')) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("score"),
+        Some(SqlFieldTransform::Sign)
+    ));
+}

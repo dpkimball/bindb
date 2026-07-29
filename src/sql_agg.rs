@@ -1356,6 +1356,12 @@ pub enum SqlFieldTransform {
     InitCap,
     /// `REPEAT(PAYLOAD_FIELD('f'), n)` — repeat the string value `n` times.
     Repeat(usize),
+    /// `LEFT(PAYLOAD_FIELD('f'), n)` — first `n` characters of a string field.
+    Left(usize),
+    /// `RIGHT(PAYLOAD_FIELD('f'), n)` — last `n` characters of a string field.
+    Right(usize),
+    /// `SIGN(PAYLOAD_FIELD('f'))` — sign of a numeric field: -1, 0, or 1.
+    Sign,
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1702,6 +1708,62 @@ impl SqlProjectQuery {
                 }
                 continue;
             }
+            // Detect LEFT(PAYLOAD_FIELD('f'), n) / RIGHT(PAYLOAD_FIELD('f'), n)
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("LEFT(PAYLOAD_FIELD(") || su.starts_with("RIGHT(PAYLOAD_FIELD(") {
+                let is_left = su.starts_with("LEFT(");
+                let prefix = if is_left {
+                    "LEFT(PAYLOAD_FIELD("
+                } else {
+                    "RIGHT(PAYLOAD_FIELD("
+                };
+                let inner = &s[prefix.len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported(
+                        "expected ')' after PAYLOAD_FIELD in LEFT/RIGHT".into(),
+                    )
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected count after PAYLOAD_FIELD in LEFT/RIGHT".into(),
+                        )
+                    })?
+                    .trim_start();
+                let paren_end = rest.find(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' to close LEFT/RIGHT".into())
+                })?;
+                let n: usize = rest[..paren_end].trim().parse().map_err(|_| {
+                    SqlAggError::Unsupported(
+                        "LEFT/RIGHT count must be a non-negative integer".into(),
+                    )
+                })?;
+                s = rest[paren_end + 1..].trim_start();
+                let transform = if is_left {
+                    SqlFieldTransform::Left(n)
+                } else {
+                    SqlFieldTransform::Right(n)
+                };
+                field_transforms.insert(field.clone(), transform);
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
             // Detect COALESCE(PAYLOAD_FIELD('f'), 'fallback') and REPLACE(PAYLOAD_FIELD('f'), 'from', 'to')
             let su = s.to_ascii_uppercase();
             if su.starts_with("COALESCE(PAYLOAD_FIELD(") {
@@ -1830,6 +1892,7 @@ impl SqlProjectQuery {
                 ("LENGTH(PAYLOAD_FIELD(", SqlFieldTransform::Length),
                 ("REVERSE(PAYLOAD_FIELD(", SqlFieldTransform::Reverse),
                 ("INITCAP(PAYLOAD_FIELD(", SqlFieldTransform::InitCap),
+                ("SIGN(PAYLOAD_FIELD(", SqlFieldTransform::Sign),
             ];
             let transform = transform_prefixes
                 .iter()
@@ -2216,6 +2279,39 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
             } else {
                 val
             }
+        }
+        SqlFieldTransform::Left(n) => {
+            if let serde_json::Value::String(s) = val {
+                let chars: Vec<char> = s.chars().collect();
+                let end = (*n).min(chars.len());
+                serde_json::Value::String(chars[..end].iter().collect())
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Right(n) => {
+            if let serde_json::Value::String(s) = val {
+                let chars: Vec<char> = s.chars().collect();
+                let start = chars.len().saturating_sub(*n);
+                serde_json::Value::String(chars[start..].iter().collect())
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Sign => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    let sign: i64 = if f > 0.0 {
+                        1
+                    } else if f < 0.0 {
+                        -1
+                    } else {
+                        0
+                    };
+                    return serde_json::Value::Number(sign.into());
+                }
+            }
+            val
         }
     }
 }
