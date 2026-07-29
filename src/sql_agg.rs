@@ -1316,12 +1316,22 @@ pub struct SqlPayloadFilter {
     pub value: SqlPayloadValue,
 }
 
-/// String transform applied to a projected field: `UPPER(PAYLOAD_FIELD('f'))` etc.
+/// Transform applied to a projected field in SELECT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlFieldTransform {
     Upper,
     Lower,
     Trim,
+    /// `ABS(PAYLOAD_FIELD('f'))` — absolute value of a numeric field.
+    Abs,
+    /// `ROUND(PAYLOAD_FIELD('f'))` — round numeric field to nearest integer.
+    Round,
+    /// `CEIL(PAYLOAD_FIELD('f'))` — ceiling of a numeric field.
+    Ceil,
+    /// `FLOOR(PAYLOAD_FIELD('f'))` — floor of a numeric field.
+    Floor,
+    /// `LENGTH(PAYLOAD_FIELD('f'))` — character count of a string field (returned as a number).
+    Length,
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1419,20 +1429,26 @@ impl SqlProjectQuery {
                 }
                 continue;
             }
-            // Detect UPPER/LOWER/TRIM(PAYLOAD_FIELD('f')) wrappers
+            // Detect UPPER/LOWER/TRIM/ABS/ROUND/CEIL/FLOOR/LENGTH(PAYLOAD_FIELD('f')) wrappers
             let su = s.to_ascii_uppercase();
-            let transform = if su.starts_with("UPPER(PAYLOAD_FIELD(") {
-                s = &s["UPPER(".len()..];
-                Some(SqlFieldTransform::Upper)
-            } else if su.starts_with("LOWER(PAYLOAD_FIELD(") {
-                s = &s["LOWER(".len()..];
-                Some(SqlFieldTransform::Lower)
-            } else if su.starts_with("TRIM(PAYLOAD_FIELD(") {
-                s = &s["TRIM(".len()..];
-                Some(SqlFieldTransform::Trim)
-            } else {
-                None
-            };
+            let transform_prefixes: &[(&str, SqlFieldTransform)] = &[
+                ("UPPER(PAYLOAD_FIELD(", SqlFieldTransform::Upper),
+                ("LOWER(PAYLOAD_FIELD(", SqlFieldTransform::Lower),
+                ("TRIM(PAYLOAD_FIELD(", SqlFieldTransform::Trim),
+                ("ABS(PAYLOAD_FIELD(", SqlFieldTransform::Abs),
+                ("ROUND(PAYLOAD_FIELD(", SqlFieldTransform::Round),
+                ("CEIL(PAYLOAD_FIELD(", SqlFieldTransform::Ceil),
+                ("FLOOR(PAYLOAD_FIELD(", SqlFieldTransform::Floor),
+                ("LENGTH(PAYLOAD_FIELD(", SqlFieldTransform::Length),
+            ];
+            let transform = transform_prefixes
+                .iter()
+                .find(|(pfx, _)| su.starts_with(pfx))
+                .map(|(pfx, t)| {
+                    // strip the outer function name including its opening '('
+                    s = &s[pfx.len() - "PAYLOAD_FIELD(".len()..];
+                    *t
+                });
             let su = s.to_ascii_uppercase();
             if !su.starts_with("PAYLOAD_FIELD(") {
                 return Err(SqlAggError::Unsupported(
@@ -1627,13 +1643,46 @@ impl SqlProjectQuery {
 }
 
 fn apply_sql_field_transform(val: serde_json::Value, t: SqlFieldTransform) -> serde_json::Value {
-    match val {
-        serde_json::Value::String(s) => serde_json::Value::String(match t {
-            SqlFieldTransform::Upper => s.to_uppercase(),
-            SqlFieldTransform::Lower => s.to_lowercase(),
-            SqlFieldTransform::Trim => s.trim().to_string(),
-        }),
-        other => other,
+    match t {
+        SqlFieldTransform::Upper | SqlFieldTransform::Lower | SqlFieldTransform::Trim => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(match t {
+                    SqlFieldTransform::Upper => s.to_uppercase(),
+                    SqlFieldTransform::Lower => s.to_lowercase(),
+                    SqlFieldTransform::Trim => s.trim().to_string(),
+                    _ => unreachable!(),
+                })
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Length => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::Number((s.chars().count() as u64).into())
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Abs
+        | SqlFieldTransform::Round
+        | SqlFieldTransform::Ceil
+        | SqlFieldTransform::Floor => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    let result = match t {
+                        SqlFieldTransform::Abs => f.abs(),
+                        SqlFieldTransform::Round => f.round(),
+                        SqlFieldTransform::Ceil => f.ceil(),
+                        SqlFieldTransform::Floor => f.floor(),
+                        _ => unreachable!(),
+                    };
+                    if let Some(n) = serde_json::Number::from_f64(result) {
+                        return serde_json::Value::Number(n);
+                    }
+                }
+            }
+            val
+        }
     }
 }
 

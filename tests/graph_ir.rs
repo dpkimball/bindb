@@ -1556,11 +1556,8 @@ fn with_parse_captures_clause_fields() {
     assert_eq!(wc.payload_preds[0].field, "score");
     assert_eq!(wc.payload_preds[0].op, CmpOp::Gt);
     assert_eq!(wc.payload_preds[0].value, CmpValue::Number(5.0));
-    assert!(wc.order_by.is_some());
-    assert_eq!(
-        wc.order_by.as_ref().unwrap().direction,
-        OrderDirection::Desc
-    );
+    assert_eq!(wc.order_by.len(), 1);
+    assert_eq!(wc.order_by[0].direction, OrderDirection::Desc);
     assert_eq!(wc.skip, Some(1));
     assert_eq!(wc.limit, Some(3));
     assert!(q.optional_clause.is_none());
@@ -1578,7 +1575,7 @@ fn with_parse_id_pred_in_where() {
     let wc = q.with_clause.as_ref().unwrap();
     assert_eq!(wc.end_pred, NodeIdPred::StartsWith("person://d".into()));
     assert!(wc.payload_preds.is_empty());
-    assert!(wc.order_by.is_none());
+    assert!(wc.order_by.is_empty());
 }
 
 #[test]
@@ -5069,5 +5066,274 @@ fn multi_order_by_single_field_unchanged() {
     assert_eq!(rows[0].fields["v"], serde_json::json!(1));
     assert_eq!(rows[1].fields["v"], serde_json::json!(2));
     assert_eq!(rows[2].fields["v"], serde_json::json!(3));
+    store.close().unwrap();
+}
+
+// ── WITH multi-field ORDER BY ─────────────────────────────────────────────────
+
+#[test]
+fn with_multi_order_by_parse_roundtrip() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[]->(b) WHERE id(a) = 'x' WITH b ORDER BY b.dept ASC, b.rank DESC RETURN b",
+    )
+    .unwrap();
+    let wc = q.with_clause.as_ref().unwrap();
+    assert_eq!(wc.order_by.len(), 2);
+    assert_eq!(
+        wc.order_by[0].field,
+        OrderByField::PayloadField("dept".into())
+    );
+    assert_eq!(wc.order_by[0].direction, OrderDirection::Asc);
+    assert_eq!(
+        wc.order_by[1].field,
+        OrderByField::PayloadField("rank".into())
+    );
+    assert_eq!(wc.order_by[1].direction, OrderDirection::Desc);
+}
+
+#[test]
+fn with_multi_order_by_sorts_pre_expansion() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("wmob://hub"), b"{}".to_vec());
+    tx.put_object(obj("wmob://a"), br#"{"grp":"x","pos":2}"#.to_vec());
+    tx.put_object(obj("wmob://b"), br#"{"grp":"x","pos":1}"#.to_vec());
+    tx.put_object(obj("wmob://c"), br#"{"grp":"y","pos":9}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("wmob_e1"),
+        obj("wmob://hub"),
+        obj("wmob://a"),
+        "L",
+        None,
+    );
+    tx2.put_edge(
+        eid("wmob_e2"),
+        obj("wmob://hub"),
+        obj("wmob://b"),
+        "L",
+        None,
+    );
+    tx2.put_edge(
+        eid("wmob_e3"),
+        obj("wmob://hub"),
+        obj("wmob://c"),
+        "L",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:L*1]->(b) WHERE id(a) = 'wmob://hub' WITH b ORDER BY b.grp ASC, b.pos ASC RETURN b.grp, b.pos",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    // grp ASC: x first, then y; within x, pos ASC: 1 before 2
+    assert_eq!(rows[0].fields["grp"], serde_json::json!("x"));
+    assert_eq!(rows[0].fields["pos"], serde_json::json!(1));
+    assert_eq!(rows[1].fields["pos"], serde_json::json!(2));
+    assert_eq!(rows[2].fields["grp"], serde_json::json!("y"));
+    store.close().unwrap();
+}
+
+#[test]
+fn with_multi_order_by_with_limit() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("wmobl://hub"), b"{}".to_vec());
+    tx.put_object(obj("wmobl://a"), br#"{"tier":1,"rank":3}"#.to_vec());
+    tx.put_object(obj("wmobl://b"), br#"{"tier":1,"rank":1}"#.to_vec());
+    tx.put_object(obj("wmobl://c"), br#"{"tier":2,"rank":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("wmobl_e1"),
+        obj("wmobl://hub"),
+        obj("wmobl://a"),
+        "L",
+        None,
+    );
+    tx2.put_edge(
+        eid("wmobl_e2"),
+        obj("wmobl://hub"),
+        obj("wmobl://b"),
+        "L",
+        None,
+    );
+    tx2.put_edge(
+        eid("wmobl_e3"),
+        obj("wmobl://hub"),
+        obj("wmobl://c"),
+        "L",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:L*1]->(b) WHERE id(a) = 'wmobl://hub' WITH b ORDER BY b.tier ASC, b.rank ASC LIMIT 2 RETURN b.tier, b.rank",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].fields["tier"], serde_json::json!(1));
+    assert_eq!(rows[0].fields["rank"], serde_json::json!(1));
+    assert_eq!(rows[1].fields["tier"], serde_json::json!(1));
+    assert_eq!(rows[1].fields["rank"], serde_json::json!(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn with_single_order_by_still_works_as_vec() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[]->(b) WHERE id(a) = 'x' WITH b ORDER BY b.score DESC RETURN b",
+    )
+    .unwrap();
+    let wc = q.with_clause.as_ref().unwrap();
+    assert_eq!(wc.order_by.len(), 1);
+    assert_eq!(wc.order_by[0].direction, OrderDirection::Desc);
+}
+
+// ── Numeric RETURN transforms ─────────────────────────────────────────────────
+
+#[test]
+fn return_abs_of_negative_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rnabs://hub"), b"{}".to_vec());
+    tx.put_object(obj("rnabs://a"), br#"{"val":-4.5}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rnabs_e1"),
+        obj("rnabs://hub"),
+        obj("rnabs://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rnabs://hub' RETURN ABS(b.val)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].fields.get("val").and_then(|v| v.as_f64());
+    assert!((v.unwrap() - 4.5).abs() < f64::EPSILON);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_round_of_decimal() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rnrd://hub"), b"{}".to_vec());
+    tx.put_object(obj("rnrd://a"), br#"{"val":3.7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rnrd_e1"),
+        obj("rnrd://hub"),
+        obj("rnrd://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rnrd://hub' RETURN ROUND(b.val)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["val"], serde_json::json!(4.0));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_ceil_and_floor() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rncf://hub"), b"{}".to_vec());
+    tx.put_object(obj("rncf://a"), br#"{"hi":2.1,"lo":2.9}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rncf_e1"),
+        obj("rncf://hub"),
+        obj("rncf://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let ceil_rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rncf://hub' RETURN CEIL(b.hi)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(ceil_rows[0].fields["hi"], serde_json::json!(3.0));
+
+    let floor_rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rncf://hub' RETURN FLOOR(b.lo)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(floor_rows[0].fields["lo"], serde_json::json!(2.0));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_numeric_transform_on_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rntsp://hub"), b"{}".to_vec());
+    tx.put_object(obj("rntsp://a"), br#"{"name":"Alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rntsp_e1"),
+        obj("rntsp://hub"),
+        obj("rntsp://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    // ABS on a string should pass the value through unchanged
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rntsp://hub' RETURN ABS(b.name)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["name"], serde_json::json!("Alice"));
     store.close().unwrap();
 }
