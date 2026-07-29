@@ -7294,3 +7294,248 @@ fn return_atan_string_passes_through() {
     assert_eq!(rows[0].fields["s"], serde_json::json!("arc"));
     store.close().unwrap();
 }
+
+#[test]
+fn return_asin_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gasin://hub"), b"{}".to_vec());
+    tx.put_object(obj("gasin://a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gasin_e1"),
+        obj("gasin://hub"),
+        obj("gasin://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gasin://hub' RETURN ASIN(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_asin_out_of_domain_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gasinood://hub"), b"{}".to_vec());
+    tx.put_object(obj("gasinood://a"), br#"{"n":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gasinood_e1"),
+        obj("gasinood://hub"),
+        obj("gasinood://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gasinood://hub' RETURN ASIN(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["n"], serde_json::json!(2));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_acos_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gacos://hub"), b"{}".to_vec());
+    tx.put_object(obj("gacos://a"), br#"{"n":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gacos_e1"),
+        obj("gacos://hub"),
+        obj("gacos://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gacos://hub' RETURN ACOS(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_acos_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gacosstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gacosstr://a"), br#"{"s":"arc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gacosstr_e1"),
+        obj("gacosstr://hub"),
+        obj("gacosstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gacosstr://hub' RETURN ACOS(b.s)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["s"], serde_json::json!("arc"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_trunc_negative() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gtruncn://hub"), b"{}".to_vec());
+    tx.put_object(obj("gtruncn://a"), br#"{"n":-1.7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gtruncn_e1"),
+        obj("gtruncn://hub"),
+        obj("gtruncn://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gtruncn://hub' RETURN TRUNC(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - (-1.0)).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_trunc_positive() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gtruncp://hub"), b"{}".to_vec());
+    tx.put_object(obj("gtruncp://a"), br#"{"n":1.7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gtruncp_e1"),
+        obj("gtruncp://hub"),
+        obj("gtruncp://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gtruncp://hub' RETURN TRUNC(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_cbrt_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gcbrt://hub"), b"{}".to_vec());
+    tx.put_object(obj("gcbrt://a"), br#"{"n":8}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gcbrt_e1"),
+        obj("gcbrt://hub"),
+        obj("gcbrt://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gcbrt://hub' RETURN CBRT(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - 2.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_cbrt_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gcbrtstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gcbrtstr://a"), br#"{"s":"root"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gcbrtstr_e1"),
+        obj("gcbrtstr://hub"),
+        obj("gcbrtstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gcbrtstr://hub' RETURN CBRT(b.s)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["s"], serde_json::json!("root"));
+    store.close().unwrap();
+}

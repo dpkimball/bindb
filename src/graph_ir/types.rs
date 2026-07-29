@@ -157,6 +157,14 @@ pub enum ReturnTransform {
     Tan,
     /// `ATAN(b.field)` — arc tangent of a numeric field; result in [-π/2, π/2].
     Atan,
+    /// `ASIN(b.field)` — arc sine of a numeric field in [-1, 1]; out-of-domain passes through.
+    Asin,
+    /// `ACOS(b.field)` — arc cosine of a numeric field in [-1, 1]; out-of-domain passes through.
+    Acos,
+    /// `TRUNC(b.field)` — truncate a numeric field toward zero (differs from FLOOR for negatives).
+    Trunc,
+    /// `CBRT(b.field)` — cube root of a numeric field.
+    Cbrt,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
