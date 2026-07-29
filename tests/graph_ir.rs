@@ -5959,3 +5959,171 @@ fn return_nullif_parses_correctly() {
         Some(ReturnTransform::NullIf(s)) if s == "none"
     ));
 }
+
+// ── REVERSE / INITCAP / LPAD / RPAD transform tests ─────────────────────────
+
+#[test]
+fn return_reverse_reverses_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rrev://hub"), b"{}".to_vec());
+    tx.put_object(obj("rrev://a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rrev_e1"),
+        obj("rrev://hub"),
+        obj("rrev://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rrev://hub' RETURN REVERSE(b.word)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["word"], serde_json::json!("olleh"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_reverse_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN REVERSE(b.word)")
+        .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("word"),
+        Some(ReturnTransform::Reverse)
+    ));
+}
+
+#[test]
+fn return_initcap_capitalises_words() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ricp://hub"), b"{}".to_vec());
+    tx.put_object(obj("ricp://a"), br#"{"title":"hello world"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ricp_e1"),
+        obj("ricp://hub"),
+        obj("ricp://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'ricp://hub' RETURN INITCAP(b.title)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["title"], serde_json::json!("Hello World"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_initcap_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN INITCAP(b.title)")
+        .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("title"),
+        Some(ReturnTransform::InitCap)
+    ));
+}
+
+#[test]
+fn return_lpad_pads_short_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rlpad://hub"), b"{}".to_vec());
+    tx.put_object(obj("rlpad://a"), br#"{"code":"42"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rlpad_e1"),
+        obj("rlpad://hub"),
+        obj("rlpad://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rlpad://hub' RETURN LPAD(b.code, 5, '0')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["code"], serde_json::json!("00042"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_lpad_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN LPAD(b.code, 8, '0')")
+            .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("code"),
+        Some(ReturnTransform::Lpad(8, s)) if s == "0"
+    ));
+}
+
+#[test]
+fn return_rpad_pads_short_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rrpad://hub"), b"{}".to_vec());
+    tx.put_object(obj("rrpad://a"), br#"{"name":"hi"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rrpad_e1"),
+        obj("rrpad://hub"),
+        obj("rrpad://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rrpad://hub' RETURN RPAD(b.name, 5, '.')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["name"], serde_json::json!("hi..."));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_rpad_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN RPAD(b.label, 10, ' ')")
+            .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("label"),
+        Some(ReturnTransform::Rpad(10, s)) if s == " "
+    ));
+}

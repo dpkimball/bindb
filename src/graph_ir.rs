@@ -193,6 +193,14 @@ pub enum ReturnTransform {
     CastString,
     /// `NULLIF(b.field, 'val')` — returns null (field omitted) when field equals `val`.
     NullIf(String),
+    /// `REVERSE(b.field)` — reverses a string field character by character.
+    Reverse,
+    /// `INITCAP(b.field)` — capitalizes the first letter of each whitespace-separated word.
+    InitCap,
+    /// `LPAD(b.field, n, 'c')` — left-pad string to width `n` with char `c`.
+    Lpad(usize, String),
+    /// `RPAD(b.field, n, 'c')` — right-pad string to width `n` with char `c`.
+    Rpad(usize, String),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -1788,6 +1796,64 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             val
         }
+        ReturnTransform::Reverse => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(s.chars().rev().collect())
+            } else {
+                val
+            }
+        }
+        ReturnTransform::InitCap => {
+            if let serde_json::Value::String(s) = val {
+                let result = s
+                    .split_whitespace()
+                    .map(|word| {
+                        let mut chars = word.chars();
+                        match chars.next() {
+                            None => String::new(),
+                            Some(first) => {
+                                first.to_uppercase().collect::<String>()
+                                    + &chars.as_str().to_lowercase()
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                serde_json::Value::String(result)
+            } else {
+                val
+            }
+        }
+        ReturnTransform::Lpad(width, pad) => {
+            if let serde_json::Value::String(s) = val {
+                let pad_char = pad.chars().next().unwrap_or(' ');
+                let char_count = s.chars().count();
+                if char_count >= *width {
+                    serde_json::Value::String(s)
+                } else {
+                    let needed = width - char_count;
+                    let padding: String = std::iter::repeat_n(pad_char, needed).collect();
+                    serde_json::Value::String(format!("{padding}{s}"))
+                }
+            } else {
+                val
+            }
+        }
+        ReturnTransform::Rpad(width, pad) => {
+            if let serde_json::Value::String(s) = val {
+                let pad_char = pad.chars().next().unwrap_or(' ');
+                let char_count = s.chars().count();
+                if char_count >= *width {
+                    serde_json::Value::String(s)
+                } else {
+                    let needed = width - char_count;
+                    let padding: String = std::iter::repeat_n(pad_char, needed).collect();
+                    serde_json::Value::String(format!("{s}{padding}"))
+                }
+            } else {
+                val
+            }
+        }
     }
 }
 
@@ -2161,6 +2227,34 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         return Some((field, ReturnTransform::Substring(start, len)));
     }
 
+    // LPAD(b.field, n, 'c') / RPAD(b.field, n, 'c')
+    for (kw, is_lpad) in [("LPAD(", true), ("RPAD(", false)] {
+        if su.starts_with(kw) && s.ends_with(')') {
+            let inner = &s[kw.len()..s.len() - 1];
+            let comma1 = inner.find(',')?;
+            let field_part = inner[..comma1].trim();
+            let field = field_part
+                .strip_prefix("b.")
+                .or_else(|| field_part.strip_prefix("B."))?
+                .trim()
+                .to_string();
+            if field.is_empty() {
+                return None;
+            }
+            let rest = inner[comma1 + 1..].trim_start();
+            let comma2 = rest.find(',')?;
+            let width: usize = rest[..comma2].trim().parse().ok()?;
+            let rest2 = rest[comma2 + 1..].trim_start();
+            let (pad_str, _) = parse_single_quoted_graph(rest2)?;
+            let transform = if is_lpad {
+                ReturnTransform::Lpad(width, pad_str)
+            } else {
+                ReturnTransform::Rpad(width, pad_str)
+            };
+            return Some((field, transform));
+        }
+    }
+
     let prefixes: &[(&str, ReturnTransform)] = &[
         ("UPPER(", ReturnTransform::Upper),
         ("LOWER(", ReturnTransform::Lower),
@@ -2170,6 +2264,8 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         ("CEIL(", ReturnTransform::Ceil),
         ("FLOOR(", ReturnTransform::Floor),
         ("LENGTH(", ReturnTransform::Length),
+        ("REVERSE(", ReturnTransform::Reverse),
+        ("INITCAP(", ReturnTransform::InitCap),
     ];
     let found = prefixes
         .iter()
