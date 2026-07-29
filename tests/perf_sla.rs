@@ -145,22 +145,31 @@ fn sla_commit_buffered_throughput_gte_5k_per_sec() {
     let dir = tempfile::tempdir().unwrap();
     let store = BinderStore::open(dir.path()).unwrap();
     let n = 10_000usize;
+    let trials = 3usize;
 
-    let start = Instant::now();
-    for i in 0..n {
-        let mut tx = Transaction::new();
-        tx.put_object(obj(format!("a://o{i}")), vec![0u8; 64]);
-        store.commit_buffered(tx, "test", "").unwrap();
+    // Three independent 10 K trials; assert on the median throughput.
+    // A single-sample measurement is unreliable on shared CI runners where a
+    // transient CPU spike can drop one trial below the SLA.
+    let mut throughputs: Vec<f64> = Vec::with_capacity(trials);
+    for trial in 0..trials {
+        let start = Instant::now();
+        for i in 0..n {
+            let mut tx = Transaction::new();
+            tx.put_object(obj(format!("a://t{trial}o{i}")), vec![0u8; 64]);
+            store.commit_buffered(tx, "test", "").unwrap();
+        }
+        store.flush().unwrap();
+        throughputs.push(n as f64 / start.elapsed().as_secs_f64());
     }
-    store.flush().unwrap();
-    let elapsed = start.elapsed();
+    throughputs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = throughputs[trials / 2];
 
-    let throughput = n as f64 / elapsed.as_secs_f64();
     assert!(
-        throughput >= COMMIT_BUFFERED_THROUGHPUT_MIN as f64,
-        "commit_buffered() throughput {:.0} commits/sec < SLA minimum {} commits/sec",
-        throughput,
-        COMMIT_BUFFERED_THROUGHPUT_MIN
+        median >= COMMIT_BUFFERED_THROUGHPUT_MIN as f64,
+        "commit_buffered() median throughput {:.0} commits/sec < SLA minimum {} commits/sec (trials: {:?})",
+        median,
+        COMMIT_BUFFERED_THROUGHPUT_MIN,
+        throughputs,
     );
 }
 

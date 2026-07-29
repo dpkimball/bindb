@@ -566,6 +566,40 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
             SqlPayloadOp::Contains,
             skip_keyword(after_close, "CONTAINS"),
         )
+    } else if starts_with_keyword(after_close, "NOT LIKE") {
+        let after_op = skip_keyword(after_close, "NOT LIKE").trim_start();
+        let (s, rest2) = parse_quoted(after_op)
+            .map_err(|_| SqlAggError::Unsupported("NOT LIKE requires a quoted pattern".into()))?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::NotLike,
+                value: SqlPayloadValue::Str(s),
+            },
+            rest2.trim_start(),
+        ));
+    } else if starts_with_keyword(after_close, "NOT IN") {
+        let after_op = skip_keyword(after_close, "NOT IN").trim_start();
+        let (items, rest2) = parse_quoted_list(after_op)?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::NotIn,
+                value: SqlPayloadValue::StrList(items),
+            },
+            rest2.trim_start(),
+        ));
+    } else if starts_with_keyword(after_close, "IN") {
+        let after_op = skip_keyword(after_close, "IN").trim_start();
+        let (items, rest2) = parse_quoted_list(after_op)?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::In,
+                value: SqlPayloadValue::StrList(items),
+            },
+            rest2.trim_start(),
+        ));
     } else if starts_with_keyword(after_close, "LIKE") {
         (SqlPayloadOp::Like, skip_keyword(after_close, "LIKE"))
     } else if starts_with_keyword(after_close, "BETWEEN") {
@@ -789,6 +823,18 @@ fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bo
                         SqlPayloadOp::EndsWith => field_str.ends_with(s.as_str()),
                         SqlPayloadOp::Contains => field_str.contains(s.as_str()),
                         SqlPayloadOp::Like => sql_like_match(field_str, s.as_str()),
+                        SqlPayloadOp::NotLike => !sql_like_match(field_str, s.as_str()),
+                        _ => false,
+                    }
+                }
+                SqlPayloadValue::StrList(items) => {
+                    let field_str = match &field_val {
+                        serde_json::Value::String(fs) => fs.as_str(),
+                        _ => return false,
+                    };
+                    match filter.op {
+                        SqlPayloadOp::In => items.iter().any(|v| field_str == v.as_str()),
+                        SqlPayloadOp::NotIn => items.iter().all(|v| field_str != v.as_str()),
                         _ => false,
                     }
                 }
@@ -1020,8 +1066,14 @@ pub enum SqlPayloadOp {
     IsNotNull,
     /// `LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
     Like,
+    /// `NOT LIKE 'pat%tern'`
+    NotLike,
     /// `BETWEEN lo AND hi` — numeric inclusive range
     Between,
+    /// `IN ('a', 'b', 'c')` — matches any listed string value
+    In,
+    /// `NOT IN ('a', 'b', 'c')` — must not match any listed string value
+    NotIn,
 }
 
 /// A value to compare against in a `WHERE PAYLOAD_FIELD` filter.
@@ -1032,6 +1084,8 @@ pub enum SqlPayloadValue {
     Null,
     /// Inclusive numeric range for `BETWEEN lo AND hi`.
     NumRange(f64, f64),
+    /// String list for `IN` / `NOT IN`.
+    StrList(Vec<String>),
 }
 
 /// How multiple `payload_filters` are combined.

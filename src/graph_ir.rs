@@ -111,6 +111,8 @@ pub enum NodeIdPred {
     EndsWith(String),
     Contains(String),
     Equals(String),
+    /// `id(b) IN ['x://a', 'x://b']` — matches any of the listed full object IDs.
+    InList(Vec<String>),
 }
 
 /// Comparison operator for payload field predicates.
@@ -441,13 +443,14 @@ impl GraphIrQuery {
                     pred_combinator = this_conn;
                 }
                 let (mut pred, rest) = parse_payload_pred(after_not)?;
-                pred.negated = negated;
+                // XOR: outer NOT flips whatever the inner parse set (e.g. NOT LIKE sets true).
+                pred.negated ^= negated;
                 payload_preds.push(pred);
                 after_preds2 = rest.trim_start();
                 continue;
             } else if after_not.starts_with("r.") || after_not.starts_with("R.") {
                 let (mut pred, rest) = parse_payload_pred_for_var(after_not, "r")?;
-                pred.negated = negated;
+                pred.negated ^= negated;
                 edge_preds.push(pred);
                 after_preds2 = rest.trim_start();
                 continue;
@@ -901,7 +904,29 @@ fn parse_payload_pred_inner<'a>(
     }
 
     // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS, LIKE) before symbols
-    let (op, rest) = if starts_with_keyword(rest, "LIKE") {
+    // NOT LIKE must come before LIKE to avoid ambiguity.
+    let (op, rest) = if starts_with_keyword(rest, "NOT LIKE") {
+        return {
+            let r = skip_keyword(rest, "NOT LIKE").trim_start();
+            let (value, rest) = if r.starts_with('\'') || r.starts_with('"') {
+                let (s, r2) = parse_quoted(r)?;
+                (CmpValue::Text(s), r2)
+            } else {
+                return Err(GraphIrError::Unsupported(
+                    "NOT LIKE requires a quoted string pattern".into(),
+                ));
+            };
+            Ok((
+                PayloadPred {
+                    field,
+                    op: CmpOp::Like,
+                    value,
+                    negated: true,
+                },
+                rest.trim_start(),
+            ))
+        };
+    } else if starts_with_keyword(rest, "LIKE") {
         (CmpOp::Like, skip_keyword(rest, "LIKE").trim_start())
     } else if starts_with_keyword(rest, "STARTS WITH") {
         (
@@ -1010,9 +1035,13 @@ fn parse_end_pred_for_var<'a>(
     } else if let Some(after_eq) = after.strip_prefix('=') {
         let (val, rest) = parse_quoted(after_eq.trim_start())?;
         Ok((NodeIdPred::Equals(val), rest))
+    } else if starts_with_keyword(after, "IN") {
+        let after_kw = skip_keyword(after, "IN").trim_start();
+        let (items, rest) = parse_string_list(after_kw)?;
+        Ok((NodeIdPred::InList(items), rest))
     } else {
         Err(GraphIrError::Unsupported(format!(
-            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, or id({var}) ="
+            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, = or IN"
         )))
     }
 }
@@ -1643,6 +1672,10 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
             let id = id.clone();
             builder.filter_node(move |obj| obj.object_id.0 == id)
         }
+        NodeIdPred::InList(ids) => {
+            let ids = ids.clone();
+            builder.filter_node(move |obj| ids.contains(&obj.object_id.0))
+        }
     };
 
     if !q.payload_preds.is_empty() {
@@ -1968,6 +2001,9 @@ fn apply_with_clause(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause)
         NodeIdPred::Equals(id) => {
             matches.retain(|m| m.object.object_id.0 == id.as_str());
         }
+        NodeIdPred::InList(ids) => {
+            matches.retain(|m| ids.iter().any(|id| m.object.object_id.0 == id.as_str()));
+        }
     }
     if !wc.payload_preds.is_empty() {
         matches.retain(|m| {
@@ -2079,6 +2115,10 @@ fn execute_optional_clause(
             let id = id.clone();
             builder.filter_node(move |obj| obj.object_id.0 == id)
         }
+        NodeIdPred::InList(ids) => {
+            let ids = ids.clone();
+            builder.filter_node(move |obj| ids.contains(&obj.object_id.0))
+        }
     };
 
     if !clause.payload_preds.is_empty() {
@@ -2140,6 +2180,9 @@ fn apply_with_clause_filter(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWith
         }
         NodeIdPred::Equals(id) => {
             matches.retain(|m| m.object.object_id.0 == id.as_str());
+        }
+        NodeIdPred::InList(ids) => {
+            matches.retain(|m| ids.iter().any(|id| m.object.object_id.0 == id.as_str()));
         }
     }
     if !wc.payload_preds.is_empty() {

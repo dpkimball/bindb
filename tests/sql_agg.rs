@@ -1918,3 +1918,163 @@ fn id_in_filter_combined_with_payload() {
     assert_eq!(rows.len(), 2);
     store.close().unwrap();
 }
+
+// ── PAYLOAD_FIELD IN ('a','b','c') / NOT IN ───────────────────────────────────
+
+#[test]
+fn payload_field_in_list_filters_rows() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://pf:a"), br#"{"color":"red"}"#.to_vec());
+    tx.put_object(oid("obs://pf:b"), br#"{"color":"blue"}"#.to_vec());
+    tx.put_object(oid("obs://pf:c"), br#"{"color":"green"}"#.to_vec());
+    tx.put_object(oid("obs://pf:d"), br#"{"color":"yellow"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('color') FROM 'obs://pf' WHERE PAYLOAD_FIELD('color') IN ('red','green')")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let colors: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("color").and_then(|v| v.as_str()))
+        .collect();
+    assert!(colors.contains(&"red"));
+    assert!(colors.contains(&"green"));
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_field_not_in_list_excludes_values() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ni:a"), br#"{"tier":"free"}"#.to_vec());
+    tx.put_object(oid("obs://ni:b"), br#"{"tier":"pro"}"#.to_vec());
+    tx.put_object(oid("obs://ni:c"), br#"{"tier":"enterprise"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('tier') FROM 'obs://ni' WHERE PAYLOAD_FIELD('tier') NOT IN ('pro')")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let tiers: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("tier").and_then(|v| v.as_str()))
+        .collect();
+    assert!(!tiers.contains(&"pro"));
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_field_in_list_aggregate_count() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://pia:a"), b"1.0".to_vec());
+    tx.put_object(oid("obs://pia:b"), b"2.0".to_vec());
+    tx.put_object(oid("obs://pia:c"), b"3.0".to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    // Use PAYLOAD_FIELD IN with non-JSON objects — all will be treated as null payload fields,
+    // so none match, count = 0. Use a JSON-carrying namespace instead.
+    let dir2 = tmp();
+    let store2 = BinderStore::open(dir2.path()).unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_object(oid("obs://jpia:a"), br#"{"env":"prod"}"#.to_vec());
+    tx2.put_object(oid("obs://jpia:b"), br#"{"env":"staging"}"#.to_vec());
+    tx2.put_object(oid("obs://jpia:c"), br#"{"env":"dev"}"#.to_vec());
+    tx2.put_object(oid("obs://jpia:d"), br#"{"env":"prod"}"#.to_vec());
+    store2.commit(tx2, "test", "").unwrap();
+
+    let results = store2
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://jpia' WHERE PAYLOAD_FIELD('env') IN ('prod','staging')",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3);
+    store2.close().unwrap();
+}
+
+#[test]
+fn payload_field_in_empty_list_none_match() {
+    // An empty IN list should match nothing. parse_quoted_list allows 0 items.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://emp:a"), br#"{"x":"y"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('x') FROM 'obs://emp' WHERE PAYLOAD_FIELD('x') IN ()")
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_field_in_parse_produces_str_list() {
+    use bindb::{SqlPayloadOp, SqlPayloadValue, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('color') FROM 'obs://x' WHERE PAYLOAD_FIELD('color') IN ('red','blue')",
+    )
+    .unwrap();
+    assert_eq!(q.payload_filters.len(), 1);
+    assert_eq!(q.payload_filters[0].op, SqlPayloadOp::In);
+    assert_eq!(
+        q.payload_filters[0].value,
+        SqlPayloadValue::StrList(vec!["red".into(), "blue".into()])
+    );
+}
+
+// ── PAYLOAD_FIELD NOT LIKE 'pat%' ─────────────────────────────────────────────
+
+#[test]
+fn payload_field_not_like_excludes_matching() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://pnl:a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(oid("obs://pnl:b"), br#"{"name":"bob"}"#.to_vec());
+    tx.put_object(oid("obs://pnl:c"), br#"{"name":"anna"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    // NOT LIKE 'a%' excludes alice and anna; only bob passes
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('name') FROM 'obs://pnl' WHERE PAYLOAD_FIELD('name') NOT LIKE 'a%'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("bob"));
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_field_not_like_aggregate() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://pnla:a"), br#"{"tag":"tmp_a"}"#.to_vec());
+    tx.put_object(oid("obs://pnla:b"), br#"{"tag":"prod_b"}"#.to_vec());
+    tx.put_object(oid("obs://pnla:c"), br#"{"tag":"tmp_c"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://pnla' WHERE PAYLOAD_FIELD('tag') NOT LIKE 'tmp%'",
+        )
+        .unwrap();
+    assert_eq!(results[0].count, 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_field_not_like_parse_op() {
+    use bindb::{SqlPayloadOp, SqlProjectQuery};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' WHERE PAYLOAD_FIELD('name') NOT LIKE 'tmp%'",
+    )
+    .unwrap();
+    assert_eq!(q.payload_filters[0].op, SqlPayloadOp::NotLike);
+}

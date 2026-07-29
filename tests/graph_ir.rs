@@ -4041,3 +4041,184 @@ fn named_path_var_with_field_projection() {
     );
     store.close().unwrap();
 }
+
+// ── NodeIdPred::InList — id(b) IN ['x://a', 'x://b'] ─────────────────────────
+
+#[test]
+fn id_in_list_matches_subset() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("il://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("il://a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(obj("il://b"), br#"{"v":2}"#.to_vec());
+    tx.put_object(obj("il://c"), br#"{"v":3}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("il_e1"), obj("il://hub"), obj("il://a"), "IL", None);
+    tx2.put_edge(eid("il_e2"), obj("il://hub"), obj("il://b"), "IL", None);
+    tx2.put_edge(eid("il_e3"), obj("il://hub"), obj("il://c"), "IL", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:IL]->(b) WHERE id(a) = 'il://hub' AND id(b) IN ['il://a','il://c'] RETURN b.v",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("v").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(vals.contains(&1));
+    assert!(vals.contains(&3));
+    store.close().unwrap();
+}
+
+#[test]
+fn id_in_list_single_entry() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ils://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("ils://x"), br#"{"n":"x"}"#.to_vec());
+    tx.put_object(obj("ils://y"), br#"{"n":"y"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("ils_e1"), obj("ils://hub"), obj("ils://x"), "S", None);
+    tx2.put_edge(eid("ils_e2"), obj("ils://hub"), obj("ils://y"), "S", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:S]->(b) WHERE id(a) = 'ils://hub' AND id(b) IN ['ils://x'] RETURN b.n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("n"),
+        Some(&serde_json::Value::String("x".into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn id_in_list_none_match() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("iln://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("iln://a"), br#"{"v":1}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("iln_e1"), obj("iln://hub"), obj("iln://a"), "N", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:N]->(b) WHERE id(a) = 'iln://hub' AND id(b) IN ['iln://missing'] RETURN b.v",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn id_in_list_parse_produces_in_list_pred() {
+    use bindb::NodeIdPred;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:E]->(b) WHERE id(a) = 'x://a' AND id(b) IN ['x://b','x://c'] RETURN b.v",
+    )
+    .unwrap();
+    assert!(matches!(q.end_pred, NodeIdPred::InList(_)));
+    if let NodeIdPred::InList(ref ids) = q.end_pred {
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"x://b".to_string()));
+        assert!(ids.contains(&"x://c".to_string()));
+    }
+}
+
+// ── b.field NOT LIKE 'pattern' ────────────────────────────────────────────────
+
+#[test]
+fn not_like_excludes_matching_nodes() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nl://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nl://a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("nl://b"), br#"{"name":"bob"}"#.to_vec());
+    tx.put_object(obj("nl://c"), br#"{"name":"charlie"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("nl_e1"), obj("nl://hub"), obj("nl://a"), "P", None);
+    tx2.put_edge(eid("nl_e2"), obj("nl://hub"), obj("nl://b"), "P", None);
+    tx2.put_edge(eid("nl_e3"), obj("nl://hub"), obj("nl://c"), "P", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    // NOT LIKE 'a%' excludes alice; bob and charlie pass
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:P]->(b) WHERE id(a) = 'nl://hub' AND b.name NOT LIKE 'a%' RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(!names.contains(&"alice"));
+    assert!(names.contains(&"bob"));
+    assert!(names.contains(&"charlie"));
+    store.close().unwrap();
+}
+
+#[test]
+fn not_like_parse_sets_negated_flag() {
+    use bindb::CmpOp;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:E]->(b) WHERE id(a) = 'x://a' AND b.name NOT LIKE 'tmp%' RETURN b.name",
+    )
+    .unwrap();
+    assert_eq!(q.payload_preds.len(), 1);
+    assert_eq!(q.payload_preds[0].op, CmpOp::Like);
+    assert!(q.payload_preds[0].negated);
+}
+
+#[test]
+fn not_like_all_excluded_returns_empty() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nle://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nle://a"), br#"{"tag":"test_a"}"#.to_vec());
+    tx.put_object(obj("nle://b"), br#"{"tag":"test_b"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("nle_e1"), obj("nle://hub"), obj("nle://a"), "Q", None);
+    tx2.put_edge(eid("nle_e2"), obj("nle://hub"), obj("nle://b"), "Q", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:Q]->(b) WHERE id(a) = 'nle://hub' AND b.tag NOT LIKE 'test%' RETURN b.tag",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
