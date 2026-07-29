@@ -1455,6 +1455,8 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         ("LENGTH(", ReturnTransform::Length),
         ("REVERSE(", ReturnTransform::Reverse),
         ("INITCAP(", ReturnTransform::InitCap),
+        ("SIGN(", ReturnTransform::Sign),
+        ("SQRT(", ReturnTransform::Sqrt),
     ];
     let found = prefixes
         .iter()
