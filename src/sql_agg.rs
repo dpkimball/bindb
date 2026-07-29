@@ -2426,9 +2426,7 @@ impl SqlProjectQuery {
 
 /// Parse `(PARTITION BY PAYLOAD_FIELD('f'), … ORDER BY PAYLOAD_FIELD('g') ASC|DESC, …)`.
 /// `s` must start with `(`. Returns `(partition_by, order_by, rest_after_close_paren)`.
-fn parse_over_clause(
-    s: &str,
-) -> Result<(Vec<String>, Vec<SqlProjectOrderBy>, &str), SqlAggError> {
+fn parse_over_clause(s: &str) -> Result<(Vec<String>, Vec<SqlProjectOrderBy>, &str), SqlAggError> {
     let s = s
         .strip_prefix('(')
         .ok_or_else(|| SqlAggError::Unsupported("expected '(' after OVER".into()))?;
