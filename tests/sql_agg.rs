@@ -3956,3 +3956,103 @@ fn select_degrees_string_passes_through() {
     assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("north"));
     store.close().unwrap();
 }
+
+#[test]
+fn select_sin_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssin:a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SIN(PAYLOAD_FIELD('n')) FROM 'obs://ssin'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_sin_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssins:a"), br#"{"s":"wave"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SIN(PAYLOAD_FIELD('s')) FROM 'obs://ssins'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("wave"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_cos_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scos:a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT COS(PAYLOAD_FIELD('n')) FROM 'obs://scos'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_tan_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://stan:a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT TAN(PAYLOAD_FIELD('n')) FROM 'obs://stan'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_atan_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://satan:a"), br#"{"n":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ATAN(PAYLOAD_FIELD('n')) FROM 'obs://satan'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - std::f64::consts::FRAC_PI_4).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_atan_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://satans:a"), br#"{"s":"arc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT ATAN(PAYLOAD_FIELD('s')) FROM 'obs://satans'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("arc"));
+    store.close().unwrap();
+}

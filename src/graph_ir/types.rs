@@ -149,6 +149,14 @@ pub enum ReturnTransform {
     Radians,
     /// `DEGREES(b.field)` — convert a numeric field from radians to degrees.
     Degrees,
+    /// `SIN(b.field)` — sine of a numeric field (radians).
+    Sin,
+    /// `COS(b.field)` — cosine of a numeric field (radians).
+    Cos,
+    /// `TAN(b.field)` — tangent of a numeric field (radians).
+    Tan,
+    /// `ATAN(b.field)` — arc tangent of a numeric field; result in [-π/2, π/2].
+    Atan,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.

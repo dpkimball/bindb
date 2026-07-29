@@ -7116,3 +7116,181 @@ fn return_degrees_string_passes_through() {
     assert_eq!(rows[0].fields["s"], serde_json::json!("north"));
     store.close().unwrap();
 }
+
+#[test]
+fn return_sin_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsin://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsin://a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsin_e1"),
+        obj("gsin://hub"),
+        obj("gsin://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'gsin://hub' RETURN SIN(b.n)")
+                .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_sin_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsinstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsinstr://a"), br#"{"s":"wave"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsinstr_e1"),
+        obj("gsinstr://hub"),
+        obj("gsinstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsinstr://hub' RETURN SIN(b.s)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["s"], serde_json::json!("wave"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_cos_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gcos://hub"), b"{}".to_vec());
+    tx.put_object(obj("gcos://a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gcos_e1"),
+        obj("gcos://hub"),
+        obj("gcos://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'gcos://hub' RETURN COS(b.n)")
+                .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_tan_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gtan://hub"), b"{}".to_vec());
+    tx.put_object(obj("gtan://a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gtan_e1"),
+        obj("gtan://hub"),
+        obj("gtan://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'gtan://hub' RETURN TAN(b.n)")
+                .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_atan_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gatan://hub"), b"{}".to_vec());
+    tx.put_object(obj("gatan://a"), br#"{"n":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gatan_e1"),
+        obj("gatan://hub"),
+        obj("gatan://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gatan://hub' RETURN ATAN(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - std::f64::consts::FRAC_PI_4).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_atan_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gatanstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gatanstr://a"), br#"{"s":"arc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gatanstr_e1"),
+        obj("gatanstr://hub"),
+        obj("gatanstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gatanstr://hub' RETURN ATAN(b.s)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["s"], serde_json::json!("arc"));
+    store.close().unwrap();
+}

@@ -348,6 +348,46 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             val
         }
+        ReturnTransform::Sin => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.sin()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Cos => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.cos()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Tan => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.tan()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Atan => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.atan()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
     }
 }
 
