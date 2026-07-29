@@ -27,9 +27,9 @@ pub use engine::BinderStore;
 pub use error::StoreError;
 pub use graph_ir::{
     AggFunc, CmpOp, CmpValue, GraphIrError, GraphIrOptionalClause, GraphIrOptionalMatch,
-    GraphIrOrderBy, GraphIrQuery, GraphIrRow, GraphIrWithClause, GraphIrWrite, GraphIrWriteError,
-    NodeIdPred, OrderByField, OrderDirection, PayloadPred, PayloadPredCombinator, ReturnTransform,
-    WithAggregation, WriteOp,
+    GraphIrOrderBy, GraphIrQuery, GraphIrRow, GraphIrUnionQuery, GraphIrWithClause, GraphIrWrite,
+    GraphIrWriteError, NodeIdPred, OrderByField, OrderDirection, PayloadPred,
+    PayloadPredCombinator, ReturnTransform, WithAggregation, WriteOp,
 };
 pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;

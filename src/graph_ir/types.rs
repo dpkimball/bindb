@@ -386,3 +386,22 @@ pub struct GraphIrQuery {
     /// is equivalent to `RETURN path` and `GraphIrRow::path` is populated.
     pub path_var: Option<String>,
 }
+
+/// A `MATCH … RETURN … UNION [ALL] MATCH … RETURN …` query.
+///
+/// Each branch is an independent `GraphIrQuery`. Results are merged and,
+/// for plain `UNION`, deduplicated by `object_id` (first occurrence wins).
+/// `UNION ALL` preserves duplicates.
+///
+/// ```text
+/// MATCH (a)-[:FOLLOWS]->(b) WHERE id(a) = 'sn://alice' RETURN b.name
+/// UNION
+/// MATCH (a)-[:LIKED_BY]->(b) WHERE id(a) = 'sn://alice' RETURN b.name
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrUnionQuery {
+    pub branches: Vec<GraphIrQuery>,
+    /// When `false` (plain UNION), duplicate rows are deduplicated by `object_id`.
+    /// When `true` (UNION ALL), duplicates are preserved.
+    pub all: bool,
+}

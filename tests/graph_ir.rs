@@ -1,6 +1,7 @@
 use bindb::{
-    AggFunc, BinderStore, CmpOp, CmpValue, EdgeId, GraphIrQuery, GraphIrWrite, GraphIrWriteError,
-    NodeIdPred, ObjectId, OrderByField, OrderDirection, Transaction, WithAggregation,
+    AggFunc, BinderStore, CmpOp, CmpValue, EdgeId, GraphIrQuery, GraphIrUnionQuery, GraphIrWrite,
+    GraphIrWriteError, NodeIdPred, ObjectId, OrderByField, OrderDirection, Transaction,
+    WithAggregation,
 };
 use tempfile::TempDir;
 
@@ -7537,5 +7538,213 @@ fn return_cbrt_string_passes_through() {
         )
         .unwrap();
     assert_eq!(rows[0].fields["s"], serde_json::json!("root"));
+    store.close().unwrap();
+}
+
+// --- UNION ---
+
+#[test]
+fn union_merges_two_edge_types() {
+    // Alice -FOLLOWS-> Bob and Alice -LIKED_BY-> Carol; UNION should return both.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("sn://alice"), b"{}".to_vec());
+    tx.put_object(obj("sn://bob"), br#"{"name":"bob"}"#.to_vec());
+    tx.put_object(obj("sn://carol"), br#"{"name":"carol"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("uf_e1"),
+        obj("sn://alice"),
+        obj("sn://bob"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("uf_e2"),
+        obj("sn://alice"),
+        obj("sn://carol"),
+        "LIKED_BY",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_union(
+            "MATCH (a)-[:FOLLOWS]->(b) WHERE id(a) = 'sn://alice' RETURN b.name \
+             UNION \
+             MATCH (a)-[:LIKED_BY]->(b) WHERE id(a) = 'sn://alice' RETURN b.name",
+        )
+        .unwrap();
+    let names: std::collections::HashSet<String> = rows
+        .iter()
+        .filter_map(|r| {
+            r.fields
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert!(names.contains("bob"), "expected bob in union");
+    assert!(names.contains("carol"), "expected carol in union");
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn union_deduplicates_same_node() {
+    // Same node reachable via two edge types; UNION deduplicates by object_id.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("sn2://hub"), b"{}".to_vec());
+    tx.put_object(obj("sn2://shared"), br#"{"name":"shared"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ud_e1"),
+        obj("sn2://hub"),
+        obj("sn2://shared"),
+        "EDGE_A",
+        None,
+    );
+    tx2.put_edge(
+        eid("ud_e2"),
+        obj("sn2://hub"),
+        obj("sn2://shared"),
+        "EDGE_B",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_union(
+            "MATCH (a)-[:EDGE_A]->(b) WHERE id(a) = 'sn2://hub' RETURN b.name \
+             UNION \
+             MATCH (a)-[:EDGE_B]->(b) WHERE id(a) = 'sn2://hub' RETURN b.name",
+        )
+        .unwrap();
+    // UNION should deduplicate: shared node appears once.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name").and_then(|v| v.as_str()),
+        Some("shared")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn union_all_preserves_duplicates() {
+    // Same node reachable via two edge types; UNION ALL keeps both rows.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("sn3://hub"), b"{}".to_vec());
+    tx.put_object(obj("sn3://shared"), br#"{"name":"shared"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ua_e1"),
+        obj("sn3://hub"),
+        obj("sn3://shared"),
+        "EDGE_A",
+        None,
+    );
+    tx2.put_edge(
+        eid("ua_e2"),
+        obj("sn3://hub"),
+        obj("sn3://shared"),
+        "EDGE_B",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_union(
+            "MATCH (a)-[:EDGE_A]->(b) WHERE id(a) = 'sn3://hub' RETURN b.name \
+             UNION ALL \
+             MATCH (a)-[:EDGE_B]->(b) WHERE id(a) = 'sn3://hub' RETURN b.name",
+        )
+        .unwrap();
+    // UNION ALL: both rows preserved.
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn union_three_branches() {
+    // Three independent hubs; UNION of three MATCH clauses merges all results.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("sn4://h1"), b"{}".to_vec());
+    tx.put_object(obj("sn4://h2"), b"{}".to_vec());
+    tx.put_object(obj("sn4://h3"), b"{}".to_vec());
+    tx.put_object(obj("sn4://n1"), br#"{"v":1}"#.to_vec());
+    tx.put_object(obj("sn4://n2"), br#"{"v":2}"#.to_vec());
+    tx.put_object(obj("sn4://n3"), br#"{"v":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("u3_e1"), obj("sn4://h1"), obj("sn4://n1"), "X", None);
+    tx2.put_edge(eid("u3_e2"), obj("sn4://h2"), obj("sn4://n2"), "X", None);
+    tx2.put_edge(eid("u3_e3"), obj("sn4://h3"), obj("sn4://n3"), "X", None);
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_union(
+            "MATCH (a)-[:X]->(b) WHERE id(a) = 'sn4://h1' RETURN b.v \
+             UNION \
+             MATCH (a)-[:X]->(b) WHERE id(a) = 'sn4://h2' RETURN b.v \
+             UNION \
+             MATCH (a)-[:X]->(b) WHERE id(a) = 'sn4://h3' RETURN b.v",
+        )
+        .unwrap();
+    let vals: std::collections::HashSet<i64> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("v").and_then(|v| v.as_i64()))
+        .collect();
+    assert_eq!(vals, [1, 2, 3].into_iter().collect());
+    store.close().unwrap();
+}
+
+#[test]
+fn union_parse_error_on_single_match() {
+    // Parsing a single MATCH as a UNION query must fail.
+    let err = GraphIrUnionQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://hub' RETURN b.name");
+    assert!(err.is_err());
+}
+
+#[test]
+fn union_projected_api() {
+    // Test graph_ir_union_projected with pre-parsed query.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("sn5://hub"), b"{}".to_vec());
+    tx.put_object(obj("sn5://a"), br#"{"n":1}"#.to_vec());
+    tx.put_object(obj("sn5://b"), br#"{"n":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("up_e1"), obj("sn5://hub"), obj("sn5://a"), "A", None);
+    tx2.put_edge(eid("up_e2"), obj("sn5://hub"), obj("sn5://b"), "B", None);
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrUnionQuery::parse(
+        "MATCH (a)-[:A]->(b) WHERE id(a) = 'sn5://hub' RETURN b.n \
+         UNION \
+         MATCH (a)-[:B]->(b) WHERE id(a) = 'sn5://hub' RETURN b.n",
+    )
+    .unwrap();
+    assert_eq!(q.branches.len(), 2);
+    assert!(!q.all);
+
+    let rows = store.graph_ir_union_projected(&q).unwrap();
+    let ns: std::collections::HashSet<i64> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("n").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(ns.contains(&1));
+    assert!(ns.contains(&2));
     store.close().unwrap();
 }
