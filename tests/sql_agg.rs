@@ -1738,3 +1738,183 @@ fn and_parse_preserves_combinator() {
     assert_eq!(q.payload_combinator, SqlFilterCombinator::And);
     assert_eq!(q.payload_filters.len(), 2);
 }
+
+// ── SELECT DISTINCT (sql_project) ─────────────────────────────────────────────
+
+#[test]
+fn select_distinct_removes_duplicate_rows() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("ns://a"), br#"{"color":"red"}"#.to_vec());
+    tx.put_object(oid("ns://b"), br#"{"color":"red"}"#.to_vec());
+    tx.put_object(oid("ns://c"), br#"{"color":"blue"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT DISTINCT PAYLOAD_FIELD('color') FROM 'ns://'")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let colors: std::collections::HashSet<_> = rows
+        .iter()
+        .filter_map(|r| r.get("color").and_then(|v| v.as_str()))
+        .collect();
+    assert!(colors.contains("red"));
+    assert!(colors.contains("blue"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_distinct_without_dupes_returns_all() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("nd://x"), br#"{"v":1}"#.to_vec());
+    tx.put_object(oid("nd://y"), br#"{"v":2}"#.to_vec());
+    tx.put_object(oid("nd://z"), br#"{"v":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT DISTINCT PAYLOAD_FIELD('v') FROM 'nd://'")
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_distinct_multi_field_dedup() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("mf://1"), br#"{"a":"x","b":"y"}"#.to_vec());
+    tx.put_object(oid("mf://2"), br#"{"a":"x","b":"y"}"#.to_vec());
+    tx.put_object(oid("mf://3"), br#"{"a":"x","b":"z"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT DISTINCT PAYLOAD_FIELD('a'), PAYLOAD_FIELD('b') FROM 'mf://'")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_distinct_with_limit() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for i in 0..6u32 {
+        let payload = format!(r#"{{"g":{}}}"#, i % 3);
+        tx.put_object(oid(&format!("lim://item{}", i)), payload.into_bytes());
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT DISTINCT PAYLOAD_FIELD('g') FROM 'lim://' LIMIT 2")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_distinct_parse_flag() {
+    let q = SqlProjectQuery::parse("SELECT DISTINCT PAYLOAD_FIELD('x') FROM 'ns://'").unwrap();
+    assert!(q.distinct);
+    let q2 = SqlProjectQuery::parse("SELECT PAYLOAD_FIELD('x') FROM 'ns://'").unwrap();
+    assert!(!q2.distinct);
+}
+
+// ── WHERE id IN ('a','b','c') ──────────────────────────────────────────────────
+// Convention: namespace is `obs://ns`, object IDs are `obs://ns:suffix`.
+// The execution strips the `obs://ns:` prefix so `id` equals the suffix.
+
+#[test]
+fn id_in_filter_project() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://items:alpha"), br#"{"v":1}"#.to_vec());
+    tx.put_object(oid("obs://items:beta"), br#"{"v":2}"#.to_vec());
+    tx.put_object(oid("obs://items:gamma"), br#"{"v":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('v') FROM 'obs://items' WHERE id IN ('alpha','gamma')")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.get("v").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(vals.contains(&1));
+    assert!(vals.contains(&3));
+    store.close().unwrap();
+}
+
+#[test]
+fn id_in_filter_single_item() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sing:one"), br#"{"n":"one"}"#.to_vec());
+    tx.put_object(oid("obs://sing:two"), br#"{"n":"two"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('n') FROM 'obs://sing' WHERE id IN ('one')")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n").and_then(|v| v.as_str()), Some("one"));
+    store.close().unwrap();
+}
+
+#[test]
+fn id_in_filter_aggregate() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scores:p"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://scores:q"), br#"{"score":20}"#.to_vec());
+    tx.put_object(oid("obs://scores:r"), br#"{"score":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://scores' WHERE id IN ('p','r')")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn id_in_filter_none_match() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nm:a"), br#"{"x":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('x') FROM 'obs://nm' WHERE id IN ('missing')")
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn id_in_filter_combined_with_payload() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://combo:a"), br#"{"status":"on"}"#.to_vec());
+    tx.put_object(oid("obs://combo:b"), br#"{"status":"off"}"#.to_vec());
+    tx.put_object(oid("obs://combo:c"), br#"{"status":"on"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    // id IN ('a','b','c') narrows to all three; payload filter keeps only 'on' → 2 rows
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('status') FROM 'obs://combo' WHERE id IN ('a','b','c') AND PAYLOAD_FIELD('status') = 'on'")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}

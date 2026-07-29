@@ -3822,6 +3822,199 @@ fn no_named_path_var_when_absent() {
     assert!(q.return_path);
 }
 
+// ── OR predicate combinator ────────────────────────────────────────────────────
+
+#[test]
+fn or_predicate_returns_either_match() {
+    use bindb::PayloadPredCombinator;
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("or://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("or://x"), br#"{"color":"red"}"#.to_vec());
+    tx.put_object(obj("or://y"), br#"{"color":"blue"}"#.to_vec());
+    tx.put_object(obj("or://z"), br#"{"color":"green"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("or_e1"), obj("or://hub"), obj("or://x"), "T", None);
+    tx2.put_edge(eid("or_e2"), obj("or://hub"), obj("or://y"), "T", None);
+    tx2.put_edge(eid("or_e3"), obj("or://hub"), obj("or://z"), "T", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:T]->(b) WHERE id(a) = 'or://hub' AND b.color = 'red' OR b.color = 'blue' RETURN b.color",
+    )
+    .unwrap();
+    assert_eq!(q.pred_combinator, PayloadPredCombinator::Or);
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 2);
+    let colors: std::collections::HashSet<_> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("color").and_then(|v| v.as_str()))
+        .collect();
+    assert!(colors.contains("red"));
+    assert!(colors.contains("blue"));
+    store.close().unwrap();
+}
+
+#[test]
+fn or_predicate_parse_combinator() {
+    use bindb::PayloadPredCombinator;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:E]->(b) WHERE id(a) = 'x://a' AND b.f = 'v1' OR b.f = 'v2' RETURN b.f",
+    )
+    .unwrap();
+    assert_eq!(q.pred_combinator, PayloadPredCombinator::Or);
+    assert_eq!(q.payload_preds.len(), 2);
+}
+
+#[test]
+fn and_predicate_combinator_default() {
+    use bindb::PayloadPredCombinator;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:E]->(b) WHERE id(a) = 'x://a' AND b.f = 'v1' AND b.g = 'v2' RETURN b.f",
+    )
+    .unwrap();
+    assert_eq!(q.pred_combinator, PayloadPredCombinator::And);
+    assert_eq!(q.payload_preds.len(), 2);
+}
+
+#[test]
+fn or_predicate_excludes_non_matching() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("exc://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("exc://a"), br#"{"tag":"keep1"}"#.to_vec());
+    tx.put_object(obj("exc://b"), br#"{"tag":"keep2"}"#.to_vec());
+    tx.put_object(obj("exc://c"), br#"{"tag":"drop"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("exc_e1"), obj("exc://hub"), obj("exc://a"), "L", None);
+    tx2.put_edge(eid("exc_e2"), obj("exc://hub"), obj("exc://b"), "L", None);
+    tx2.put_edge(eid("exc_e3"), obj("exc://hub"), obj("exc://c"), "L", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:L]->(b) WHERE id(a) = 'exc://hub' AND b.tag = 'keep1' OR b.tag = 'keep2' RETURN b.tag",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+// ── Numeric IN [1, 2, 3] predicate ────────────────────────────────────────────
+
+#[test]
+fn numeric_in_list_matches_values() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ni://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("ni://a"), br#"{"score":10}"#.to_vec());
+    tx.put_object(obj("ni://b"), br#"{"score":20}"#.to_vec());
+    tx.put_object(obj("ni://c"), br#"{"score":30}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("ni_e1"), obj("ni://hub"), obj("ni://a"), "H", None);
+    tx2.put_edge(eid("ni_e2"), obj("ni://hub"), obj("ni://b"), "H", None);
+    tx2.put_edge(eid("ni_e3"), obj("ni://hub"), obj("ni://c"), "H", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:H]->(b) WHERE id(a) = 'ni://hub' AND b.score IN [10, 30] RETURN b.score",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let scores: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("score").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(scores.contains(&10));
+    assert!(scores.contains(&30));
+    store.close().unwrap();
+}
+
+#[test]
+fn numeric_not_in_list_excludes_values() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nni://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nni://a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(obj("nni://b"), br#"{"v":2}"#.to_vec());
+    tx.put_object(obj("nni://c"), br#"{"v":3}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("nni_e1"), obj("nni://hub"), obj("nni://a"), "K", None);
+    tx2.put_edge(eid("nni_e2"), obj("nni://hub"), obj("nni://b"), "K", None);
+    tx2.put_edge(eid("nni_e3"), obj("nni://hub"), obj("nni://c"), "K", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:K]->(b) WHERE id(a) = 'nni://hub' AND b.v NOT IN [2] RETURN b.v",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("v").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(vals.contains(&1));
+    assert!(vals.contains(&3));
+    store.close().unwrap();
+}
+
+#[test]
+fn numeric_in_parse_produces_number_list() {
+    use bindb::CmpValue;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:E]->(b) WHERE id(a) = 'x://a' AND b.score IN [1, 2, 3] RETURN b.score",
+    )
+    .unwrap();
+    assert_eq!(q.payload_preds.len(), 1);
+    assert!(matches!(q.payload_preds[0].value, CmpValue::NumberList(_)));
+    if let CmpValue::NumberList(ref nums) = q.payload_preds[0].value {
+        assert_eq!(nums.len(), 3);
+    }
+}
+
+#[test]
+fn numeric_in_no_match_empty_result() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nem://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nem://a"), br#"{"n":5}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("nem_e1"), obj("nem://hub"), obj("nem://a"), "M", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:M]->(b) WHERE id(a) = 'nem://hub' AND b.n IN [99, 100] RETURN b.n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
 #[test]
 fn named_path_var_with_field_projection() {
     // `MATCH p = (a)-[r]->(b) WHERE … RETURN p, b.name` — path AND field combined

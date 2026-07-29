@@ -151,8 +151,19 @@ pub enum CmpValue {
     Null,
     /// List of string values for IN / NOT IN.
     StringList(Vec<String>),
+    /// List of numeric values for IN / NOT IN with numbers.
+    NumberList(Vec<f64>),
     /// Inclusive numeric range for BETWEEN.
     NumberRange(f64, f64),
+}
+
+/// How `payload_preds` are combined during BFS node filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadPredCombinator {
+    /// All predicates must hold (AND — default).
+    And,
+    /// Any predicate must hold (OR).
+    Or,
 }
 
 /// Predicate on a JSON field of the matched end node's payload.
@@ -310,10 +321,11 @@ pub struct GraphIrQuery {
     pub max_depth: usize,
     pub direction: Direction,
     pub end_pred: NodeIdPred,
-    /// Payload field predicates applied to matched end nodes (AND-combined).
-    /// All predicates must hold for a node to be included in results.
-    /// Empty = no payload filtering.
+    /// Payload field predicates applied to matched end nodes.
+    /// Combined according to `pred_combinator`. Empty = no payload filtering.
     pub payload_preds: Vec<PayloadPred>,
+    /// How `payload_preds` are combined. Defaults to `And`.
+    pub pred_combinator: PayloadPredCombinator,
     /// Payload field predicates applied to each traversal edge (AND-combined).
     /// Edges whose payload does not match all predicates are skipped; the BFS
     /// does not follow them. Empty = no edge filtering.
@@ -398,32 +410,47 @@ impl GraphIrQuery {
         let (start, end_pred, after_preds) = parse_where(after_where)?;
         let after_preds = after_preds.trim_start();
 
-        // Optional payload predicates: AND [NOT] b.FIELD OP VALUE or AND [NOT] r.FIELD OP VALUE
+        // Optional payload predicates: AND/OR [NOT] b.FIELD OP VALUE or AND/OR [NOT] r.FIELD OP VALUE
         let mut payload_preds: Vec<PayloadPred> = Vec::new();
         let mut edge_preds: Vec<PayloadPred> = Vec::new();
+        let mut pred_combinator = PayloadPredCombinator::And;
         let mut after_preds2 = after_preds;
         loop {
-            if starts_with_keyword(after_preds2, "AND") {
-                let after_and = skip_keyword(after_preds2, "AND").trim_start();
-                // Detect optional NOT modifier
-                let (negated, after_not) = if starts_with_keyword(after_and, "NOT") {
-                    (true, skip_keyword(after_and, "NOT").trim_start())
-                } else {
-                    (false, after_and)
-                };
-                if after_not.starts_with("b.") || after_not.starts_with("B.") {
-                    let (mut pred, rest) = parse_payload_pred(after_not)?;
-                    pred.negated = negated;
-                    payload_preds.push(pred);
-                    after_preds2 = rest.trim_start();
-                    continue;
-                } else if after_not.starts_with("r.") || after_not.starts_with("R.") {
-                    let (mut pred, rest) = parse_payload_pred_for_var(after_not, "r")?;
-                    pred.negated = negated;
-                    edge_preds.push(pred);
-                    after_preds2 = rest.trim_start();
-                    continue;
+            let is_and = starts_with_keyword(after_preds2, "AND");
+            let is_or = starts_with_keyword(after_preds2, "OR");
+            if !is_and && !is_or {
+                break;
+            }
+            let this_conn = if is_and {
+                PayloadPredCombinator::And
+            } else {
+                PayloadPredCombinator::Or
+            };
+            let kw = if is_and { "AND" } else { "OR" };
+            let after_kw = skip_keyword(after_preds2, kw).trim_start();
+            // Detect optional NOT modifier (only meaningful with AND)
+            let (negated, after_not) = if starts_with_keyword(after_kw, "NOT") {
+                (true, skip_keyword(after_kw, "NOT").trim_start())
+            } else {
+                (false, after_kw)
+            };
+            if after_not.starts_with("b.") || after_not.starts_with("B.") {
+                // The combinator is determined by the connector between the predicates
+                // (second and subsequent), not the one that introduces the first predicate.
+                if !payload_preds.is_empty() {
+                    pred_combinator = this_conn;
                 }
+                let (mut pred, rest) = parse_payload_pred(after_not)?;
+                pred.negated = negated;
+                payload_preds.push(pred);
+                after_preds2 = rest.trim_start();
+                continue;
+            } else if after_not.starts_with("r.") || after_not.starts_with("R.") {
+                let (mut pred, rest) = parse_payload_pred_for_var(after_not, "r")?;
+                pred.negated = negated;
+                edge_preds.push(pred);
+                after_preds2 = rest.trim_start();
+                continue;
             }
             break;
         }
@@ -525,6 +552,7 @@ impl GraphIrQuery {
             direction,
             end_pred,
             payload_preds,
+            pred_combinator,
             edge_preds,
             return_fields,
             edge_return_fields,
@@ -847,12 +875,12 @@ fn parse_payload_pred_inner<'a>(
     // NOT IN [...] before IN [...] to avoid ambiguity
     if starts_with_keyword(rest, "NOT IN") {
         let after_kw = skip_keyword(rest, "NOT IN").trim_start();
-        let (items, rest) = parse_string_list(after_kw)?;
+        let (value, rest) = parse_value_list(after_kw)?;
         return Ok((
             PayloadPred {
                 field,
                 op: CmpOp::NotIn,
-                value: CmpValue::StringList(items),
+                value,
                 negated: false,
             },
             rest,
@@ -860,12 +888,12 @@ fn parse_payload_pred_inner<'a>(
     }
     if starts_with_keyword(rest, "IN") {
         let after_kw = skip_keyword(rest, "IN").trim_start();
-        let (items, rest) = parse_string_list(after_kw)?;
+        let (value, rest) = parse_value_list(after_kw)?;
         return Ok((
             PayloadPred {
                 field,
                 op: CmpOp::In,
-                value: CmpValue::StringList(items),
+                value,
                 negated: false,
             },
             rest,
@@ -1287,6 +1315,44 @@ fn parse_quoted(s: &str) -> Result<(String, &str), GraphIrError> {
     Ok((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
 }
 
+/// Parse `[item, ...]` where items are either all quoted strings or all bare numbers.
+/// Returns `CmpValue::StringList` or `CmpValue::NumberList` accordingly.
+fn parse_value_list(s: &str) -> Result<(CmpValue, &str), GraphIrError> {
+    let s = s.trim_start();
+    let inner = s
+        .strip_prefix('[')
+        .ok_or_else(|| GraphIrError::Unsupported("expected '[' for IN list".into()))?
+        .trim_start();
+    // Peek: if first non-ws char is a digit, '-', or '+' → numeric list
+    let first = inner.chars().next().unwrap_or(' ');
+    if first.is_ascii_digit() || first == '-' || first == '+' {
+        let mut nums = Vec::new();
+        let mut rest = inner;
+        loop {
+            rest = rest.trim_start();
+            if let Some(after) = rest.strip_prefix(']') {
+                return Ok((CmpValue::NumberList(nums), after.trim_start()));
+            }
+            let end = rest
+                .find(|c: char| {
+                    !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E'
+                })
+                .unwrap_or(rest.len());
+            let num: f64 = rest[..end].parse().map_err(|_| {
+                GraphIrError::Unsupported(format!("invalid number in IN list: {}", &rest[..end]))
+            })?;
+            nums.push(num);
+            rest = rest[end..].trim_start();
+            if let Some(after_comma) = rest.strip_prefix(',') {
+                rest = after_comma;
+            }
+        }
+    } else {
+        let (items, rest) = parse_string_list(s)?;
+        Ok((CmpValue::StringList(items), rest))
+    }
+}
+
 /// Parse a `['v1', 'v2', ...]` string list literal.
 fn parse_string_list(s: &str) -> Result<(Vec<String>, &str), GraphIrError> {
     let s = s.trim_start();
@@ -1506,6 +1572,17 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 _ => false, // StringList only valid for In/NotIn
             }
         }
+        CmpValue::NumberList(list) => {
+            let lhs = match field_val.as_f64() {
+                Some(n) => n,
+                None => return false,
+            };
+            match pred.op {
+                CmpOp::In => list.iter().any(|v| (lhs - v).abs() < f64::EPSILON),
+                CmpOp::NotIn => list.iter().all(|v| (lhs - v).abs() >= f64::EPSILON),
+                _ => false,
+            }
+        }
     }
 }
 
@@ -1570,9 +1647,17 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 
     if !q.payload_preds.is_empty() {
         let preds = q.payload_preds.clone();
+        let combinator = q.pred_combinator;
         builder = builder.filter_node(move |obj| {
             let payload = obj.payload.as_deref().unwrap_or(&[]);
-            preds.iter().all(|pred| apply_payload_pred(payload, pred))
+            match combinator {
+                PayloadPredCombinator::And => {
+                    preds.iter().all(|pred| apply_payload_pred(payload, pred))
+                }
+                PayloadPredCombinator::Or => {
+                    preds.iter().any(|pred| apply_payload_pred(payload, pred))
+                }
+            }
         });
     }
 
