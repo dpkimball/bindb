@@ -1317,7 +1317,7 @@ pub struct SqlPayloadFilter {
 }
 
 /// Transform applied to a projected field in SELECT.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlFieldTransform {
     Upper,
     Lower,
@@ -1332,6 +1332,10 @@ pub enum SqlFieldTransform {
     Floor,
     /// `LENGTH(PAYLOAD_FIELD('f'))` — character count of a string field (returned as a number).
     Length,
+    /// `COALESCE(PAYLOAD_FIELD('f'), 'fallback')` — substitute fallback when field is null.
+    Coalesce(String),
+    /// `REPLACE(PAYLOAD_FIELD('f'), 'from', 'to')` — string replacement.
+    Replace(String, String),
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1429,6 +1433,121 @@ impl SqlProjectQuery {
                 }
                 continue;
             }
+            // Detect COALESCE(PAYLOAD_FIELD('f'), 'fallback') and REPLACE(PAYLOAD_FIELD('f'), 'from', 'to')
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("COALESCE(PAYLOAD_FIELD(") {
+                let inner = &s["COALESCE(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let after_pf_close =
+                    after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected ')' after PAYLOAD_FIELD in COALESCE".into(),
+                        )
+                    })?;
+                let after_comma = after_pf_close
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected ',' in COALESCE after PAYLOAD_FIELD".into(),
+                        )
+                    })?
+                    .trim_start();
+                let after_quote_open = after_comma.strip_prefix('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported(
+                        "COALESCE fallback must be a single-quoted string".into(),
+                    )
+                })?;
+                let quote_end = after_quote_open.find('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("unclosed quote in COALESCE fallback".into())
+                })?;
+                let fallback = after_quote_open[..quote_end].to_string();
+                let after_fallback = &after_quote_open[quote_end + 1..];
+                let s_after = after_fallback
+                    .trim_start()
+                    .strip_prefix(')')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ')' to close COALESCE".into())
+                    })?;
+                s = s_after.trim_start();
+                field_transforms.insert(field.clone(), SqlFieldTransform::Coalesce(fallback));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            if su.starts_with("REPLACE(PAYLOAD_FIELD(") {
+                let inner = &s["REPLACE(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in REPLACE".into())
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected ',' after PAYLOAD_FIELD in REPLACE".into(),
+                        )
+                    })?
+                    .trim_start();
+                let after_from_open = rest.strip_prefix('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("REPLACE 'from' must be single-quoted".into())
+                })?;
+                let from_end = after_from_open.find('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("unclosed quote in REPLACE 'from'".into())
+                })?;
+                let from_str = after_from_open[..from_end].to_string();
+                let rest = after_from_open[from_end + 1..].trim_start();
+                let rest = rest
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ',' between REPLACE args".into())
+                    })?
+                    .trim_start();
+                let after_to_open = rest.strip_prefix('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("REPLACE 'to' must be single-quoted".into())
+                })?;
+                let to_end = after_to_open.find('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("unclosed quote in REPLACE 'to'".into())
+                })?;
+                let to_str = after_to_open[..to_end].to_string();
+                let s_after = after_to_open[to_end + 1..]
+                    .trim_start()
+                    .strip_prefix(')')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ')' to close REPLACE".into())
+                    })?;
+                s = s_after.trim_start();
+                field_transforms
+                    .insert(field.clone(), SqlFieldTransform::Replace(from_str, to_str));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
             // Detect UPPER/LOWER/TRIM/ABS/ROUND/CEIL/FLOOR/LENGTH(PAYLOAD_FIELD('f')) wrappers
             let su = s.to_ascii_uppercase();
             let transform_prefixes: &[(&str, SqlFieldTransform)] = &[
@@ -1447,7 +1566,7 @@ impl SqlProjectQuery {
                 .map(|(pfx, t)| {
                     // strip the outer function name including its opening '('
                     s = &s[pfx.len() - "PAYLOAD_FIELD(".len()..];
-                    *t
+                    t.clone()
                 });
             let su = s.to_ascii_uppercase();
             if !su.starts_with("PAYLOAD_FIELD(") {
@@ -1642,7 +1761,7 @@ impl SqlProjectQuery {
     }
 }
 
-fn apply_sql_field_transform(val: serde_json::Value, t: SqlFieldTransform) -> serde_json::Value {
+fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> serde_json::Value {
     match t {
         SqlFieldTransform::Upper | SqlFieldTransform::Lower | SqlFieldTransform::Trim => {
             if let serde_json::Value::String(s) = val {
@@ -1682,6 +1801,20 @@ fn apply_sql_field_transform(val: serde_json::Value, t: SqlFieldTransform) -> se
                 }
             }
             val
+        }
+        SqlFieldTransform::Coalesce(fallback) => {
+            if val.is_null() {
+                serde_json::Value::String(fallback.clone())
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Replace(from, to) => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(s.replace(from.as_str(), to.as_str()))
+            } else {
+                val
+            }
         }
     }
 }
@@ -1777,7 +1910,7 @@ impl BinderStore {
                     .map(|field| {
                         let raw = project_payload_field(v.payload.as_deref(), field);
                         let val = if let Some(t) = field_transforms.get(field) {
-                            apply_sql_field_transform(raw, *t)
+                            apply_sql_field_transform(raw, t)
                         } else {
                             raw
                         };

@@ -2889,3 +2889,132 @@ fn select_length_transform_parses_correctly() {
         Some(SqlFieldTransform::Length)
     ));
 }
+
+// ── COALESCE / REPLACE(PAYLOAD_FIELD) in SELECT tests ─────────────────────────
+
+#[test]
+fn select_coalesce_present_field_unchanged() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scpf:a"), br#"{"name":"Alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT COALESCE(PAYLOAD_FIELD('name'), 'unknown') FROM 'obs://scpf'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("Alice"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_coalesce_missing_field_uses_fallback() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scmf:a"), br#"{"other":"x"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT COALESCE(PAYLOAD_FIELD('name'), 'N/A') FROM 'obs://scmf'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("N/A"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_coalesce_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q =
+        SqlProjectQuery::parse("SELECT COALESCE(PAYLOAD_FIELD('label'), 'default') FROM 'obs://x'")
+            .unwrap();
+    assert_eq!(q.field_transforms.len(), 1);
+    assert!(matches!(
+        q.field_transforms.get("label"),
+        Some(SqlFieldTransform::Coalesce(s)) if s == "default"
+    ));
+}
+
+#[test]
+fn select_coalesce_with_alias() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scwa:a"), br#"{}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT COALESCE(PAYLOAD_FIELD('val'), 'none') AS v FROM 'obs://scwa'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("v").and_then(|v| v.as_str()), Some("none"));
+    assert!(!rows[0].contains_key("val"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_replace_substitutes_substring() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srss:a"), br#"{"tag":"hello-world"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT REPLACE(PAYLOAD_FIELD('tag'), '-', '_') FROM 'obs://srss'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("tag").and_then(|v| v.as_str()),
+        Some("hello_world")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn select_replace_all_occurrences() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srao:a"), br#"{"path":"a/b/c"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT REPLACE(PAYLOAD_FIELD('path'), '/', '.') FROM 'obs://srao'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("path").and_then(|v| v.as_str()), Some("a.b.c"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_replace_on_non_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srnsp:a"), br#"{"n":99}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT REPLACE(PAYLOAD_FIELD('n'), '9', '0') FROM 'obs://srnsp'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n").and_then(|v| v.as_u64()), Some(99));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_replace_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse(
+        "SELECT REPLACE(PAYLOAD_FIELD('text'), 'foo', 'bar') FROM 'obs://x'",
+    )
+    .unwrap();
+    assert_eq!(q.field_transforms.len(), 1);
+    assert!(matches!(
+        q.field_transforms.get("text"),
+        Some(SqlFieldTransform::Replace(f, t)) if f == "foo" && t == "bar"
+    ));
+}

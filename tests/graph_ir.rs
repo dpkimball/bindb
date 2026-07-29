@@ -5337,3 +5337,213 @@ fn return_numeric_transform_on_string_passes_through() {
     assert_eq!(rows[0].fields["name"], serde_json::json!("Alice"));
     store.close().unwrap();
 }
+
+// ── RETURN COALESCE / RETURN REPLACE tests ────────────────────────────────────
+
+#[test]
+fn return_coalesce_present_field_unchanged() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rcpf://hub"), b"{}".to_vec());
+    tx.put_object(obj("rcpf://a"), br#"{"label":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rcpf_e1"),
+        obj("rcpf://hub"),
+        obj("rcpf://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rcpf://hub' RETURN COALESCE(b.label, 'default')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["label"], serde_json::json!("hello"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_coalesce_missing_field_uses_fallback() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rcmf://hub"), b"{}".to_vec());
+    tx.put_object(obj("rcmf://a"), br#"{"other":"x"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rcmf_e1"),
+        obj("rcmf://hub"),
+        obj("rcmf://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rcmf://hub' RETURN COALESCE(b.label, 'N/A')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["label"], serde_json::json!("N/A"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_coalesce_parses_transform_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN COALESCE(b.name, 'unknown')",
+    )
+    .unwrap();
+    assert_eq!(q.return_field_transforms.len(), 1);
+    assert!(matches!(
+        q.return_field_transforms.get("name"),
+        Some(ReturnTransform::Coalesce(s)) if s == "unknown"
+    ));
+}
+
+#[test]
+fn return_replace_substitutes_substring() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rrss://hub"), b"{}".to_vec());
+    tx.put_object(obj("rrss://a"), br#"{"tag":"hello-world"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rrss_e1"),
+        obj("rrss://hub"),
+        obj("rrss://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rrss://hub' RETURN REPLACE(b.tag, '-', '_')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["tag"], serde_json::json!("hello_world"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_replace_no_match_returns_original() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rrnm://hub"), b"{}".to_vec());
+    tx.put_object(obj("rrnm://a"), br#"{"val":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rrnm_e1"),
+        obj("rrnm://hub"),
+        obj("rrnm://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rrnm://hub' RETURN REPLACE(b.val, 'x', 'y')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["val"], serde_json::json!("abc"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_replace_on_non_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rrnsp://hub"), b"{}".to_vec());
+    tx.put_object(obj("rrnsp://a"), br#"{"n":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rrnsp_e1"),
+        obj("rrnsp://hub"),
+        obj("rrnsp://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rrnsp://hub' RETURN REPLACE(b.n, '4', '5')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["n"], serde_json::json!(42));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_replace_parses_transform_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN REPLACE(b.text, 'foo', 'bar')",
+    )
+    .unwrap();
+    assert_eq!(q.return_field_transforms.len(), 1);
+    assert!(matches!(
+        q.return_field_transforms.get("text"),
+        Some(ReturnTransform::Replace(f, t)) if f == "foo" && t == "bar"
+    ));
+}
+
+#[test]
+fn return_replace_all_occurrences() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rrao://hub"), b"{}".to_vec());
+    tx.put_object(obj("rrao://a"), br#"{"msg":"a-b-c"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rrao_e1"),
+        obj("rrao://hub"),
+        obj("rrao://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rrao://hub' RETURN REPLACE(b.msg, '-', '/')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["msg"], serde_json::json!("a/b/c"));
+    store.close().unwrap();
+}

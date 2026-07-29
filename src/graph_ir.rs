@@ -164,7 +164,7 @@ pub enum CmpValue {
 }
 
 /// String transform applied to a projected node field in `RETURN UPPER(b.field)` etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnTransform {
     Upper,
     Lower,
@@ -177,6 +177,10 @@ pub enum ReturnTransform {
     Ceil,
     /// `FLOOR(b.field)` — floor of a numeric field.
     Floor,
+    /// `COALESCE(b.field, 'fallback')` — substitute fallback when field is null.
+    Coalesce(String),
+    /// `REPLACE(b.field, 'from', 'to')` — string replacement.
+    Replace(String, String),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -1652,7 +1656,7 @@ fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
 /// Evaluate a payload predicate against raw payload bytes.
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
 /// Apply a `ReturnTransform` to a JSON value. Only `String` values are affected.
-fn apply_return_transform(val: serde_json::Value, t: ReturnTransform) -> serde_json::Value {
+fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_json::Value {
     match t {
         ReturnTransform::Upper | ReturnTransform::Lower | ReturnTransform::Trim => {
             if let serde_json::Value::String(s) = val {
@@ -1685,6 +1689,20 @@ fn apply_return_transform(val: serde_json::Value, t: ReturnTransform) -> serde_j
                 }
             }
             val
+        }
+        ReturnTransform::Coalesce(fallback) => {
+            if val.is_null() {
+                serde_json::Value::String(fallback.clone())
+            } else {
+                val
+            }
+        }
+        ReturnTransform::Replace(from, to) => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(s.replace(from.as_str(), to.as_str()))
+            } else {
+                val
+            }
         }
     }
 }
@@ -1944,8 +1962,56 @@ type ReturnSpec = (
 
 /// Detect `UPPER/LOWER/TRIM/ABS/ROUND/CEIL/FLOOR(b.field)` in a RETURN selector.
 /// Returns `(field_name, transform)` if recognized, otherwise `None`.
+fn parse_single_quoted_graph(s: &str) -> Option<(String, &str)> {
+    let s = s.strip_prefix('\'')?;
+    let end = s.find('\'')?;
+    Some((s[..end].to_string(), &s[end + 1..]))
+}
+
 fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
     let su = s.to_ascii_uppercase();
+
+    // COALESCE(b.field, 'fallback')
+    if su.starts_with("COALESCE(") && s.ends_with(')') {
+        let inner = &s["COALESCE(".len()..s.len() - 1];
+        let comma = inner.find(',')?;
+        let field_part = inner[..comma].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let fallback_raw = inner[comma + 1..].trim();
+        let fallback = fallback_raw
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))?
+            .to_string();
+        return Some((field, ReturnTransform::Coalesce(fallback)));
+    }
+
+    // REPLACE(b.field, 'from', 'to')
+    if su.starts_with("REPLACE(") && s.ends_with(')') {
+        let inner = &s["REPLACE(".len()..s.len() - 1];
+        let comma1 = inner.find(',')?;
+        let field_part = inner[..comma1].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let rest = inner[comma1 + 1..].trim_start();
+        let (from_str, after_from) = parse_single_quoted_graph(rest)?;
+        let rest2 = after_from.trim_start().strip_prefix(',')?.trim_start();
+        let (to_str, _) = parse_single_quoted_graph(rest2)?;
+        return Some((field, ReturnTransform::Replace(from_str, to_str)));
+    }
+
     let prefixes: &[(&str, ReturnTransform)] = &[
         ("UPPER(", ReturnTransform::Upper),
         ("LOWER(", ReturnTransform::Lower),
@@ -1955,9 +2021,11 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         ("CEIL(", ReturnTransform::Ceil),
         ("FLOOR(", ReturnTransform::Floor),
     ];
-    let &(pfx, t) = prefixes
+    let found = prefixes
         .iter()
         .find(|(pfx, _)| su.starts_with(pfx) && s.ends_with(')'))?;
+    let pfx: &str = found.0;
+    let t: ReturnTransform = found.1.clone();
     let inner = &s[pfx.len()..s.len() - 1];
     let field = inner
         .strip_prefix("b.")
@@ -1968,6 +2036,26 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
     } else {
         Some((field, t))
     }
+}
+
+/// Split a RETURN selector list on commas that are not inside parentheses.
+fn split_return_parts(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
@@ -1993,7 +2081,7 @@ fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let mut return_path = false;
     let mut return_id = false;
     let mut return_all_fields = false;
-    for part in s.split(',') {
+    for part in split_return_parts(s) {
         let p = part.trim();
         // Detect optional `AS alias` suffix (e.g. `b.name AS n`).
         let tokens: Vec<&str> = p.split_whitespace().collect();
@@ -2213,17 +2301,23 @@ impl BinderStore {
                     if let Ok(text) = std::str::from_utf8(payload) {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
                             for key in &q.return_fields {
-                                if let Some(raw_val) = v.get(key) {
-                                    let out_key = q
-                                        .return_field_aliases
-                                        .get(key)
-                                        .cloned()
-                                        .unwrap_or_else(|| key.clone());
-                                    let val = if let Some(t) = q.return_field_transforms.get(key) {
-                                        apply_return_transform(raw_val.clone(), *t)
-                                    } else {
-                                        raw_val.clone()
-                                    };
+                                let raw_val =
+                                    v.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                                let has_transform = q.return_field_transforms.contains_key(key);
+                                if raw_val.is_null() && !has_transform {
+                                    continue;
+                                }
+                                let out_key = q
+                                    .return_field_aliases
+                                    .get(key)
+                                    .cloned()
+                                    .unwrap_or_else(|| key.clone());
+                                let val = if let Some(t) = q.return_field_transforms.get(key) {
+                                    apply_return_transform(raw_val, t)
+                                } else {
+                                    raw_val
+                                };
+                                if !val.is_null() {
                                     b_fields.insert(out_key, val);
                                 }
                             }
