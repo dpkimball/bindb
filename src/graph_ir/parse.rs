@@ -1540,6 +1540,10 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         ("EXP(", ReturnTransform::Exp),
         ("RADIANS(", ReturnTransform::Radians),
         ("DEGREES(", ReturnTransform::Degrees),
+        ("SIN(", ReturnTransform::Sin),
+        ("COS(", ReturnTransform::Cos),
+        ("TAN(", ReturnTransform::Tan),
+        ("ATAN(", ReturnTransform::Atan),
     ];
     let found = prefixes
         .iter()
