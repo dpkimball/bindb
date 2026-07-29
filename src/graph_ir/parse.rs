@@ -1791,14 +1791,14 @@ fn normalize_chained_step(seg: &str) -> String {
         // Has WHERE — insert dummy start before existing predicates.
         format!(
             "MATCH {} WHERE id(a) = '__chained__' AND {}",
-            &seg[..wpos].trim(),
-            &seg[wpos + sep_where.len()..].trim_start()
+            seg[..wpos].trim(),
+            seg[wpos + sep_where.len()..].trim_start()
         )
     } else if let Some(rpos) = upper.find(sep_return) {
         // No WHERE but has RETURN — insert WHERE before RETURN.
         format!(
             "MATCH {} WHERE id(a) = '__chained__'{}",
-            &seg[..rpos].trim(),
+            seg[..rpos].trim(),
             &seg[rpos..]
         )
     } else {
