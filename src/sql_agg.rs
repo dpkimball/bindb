@@ -1372,6 +1372,14 @@ pub enum SqlFieldTransform {
     Strpos(String),
     /// `SPLIT_PART(PAYLOAD_FIELD('f'), 'delim', n)` — nth (1-based) token split by delimiter.
     SplitPart(String, usize),
+    /// `LTRIM(PAYLOAD_FIELD('f'))` — remove leading whitespace from a string field.
+    Ltrim,
+    /// `RTRIM(PAYLOAD_FIELD('f'))` — remove trailing whitespace from a string field.
+    Rtrim,
+    /// `LOG(PAYLOAD_FIELD('f'))` — natural logarithm of a positive numeric field.
+    Log,
+    /// `EXP(PAYLOAD_FIELD('f'))` — e raised to the power of a numeric field.
+    Exp,
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -2094,6 +2102,10 @@ impl SqlProjectQuery {
                 ("INITCAP(PAYLOAD_FIELD(", SqlFieldTransform::InitCap),
                 ("SIGN(PAYLOAD_FIELD(", SqlFieldTransform::Sign),
                 ("SQRT(PAYLOAD_FIELD(", SqlFieldTransform::Sqrt),
+                ("LTRIM(PAYLOAD_FIELD(", SqlFieldTransform::Ltrim),
+                ("RTRIM(PAYLOAD_FIELD(", SqlFieldTransform::Rtrim),
+                ("LOG(PAYLOAD_FIELD(", SqlFieldTransform::Log),
+                ("EXP(PAYLOAD_FIELD(", SqlFieldTransform::Exp),
             ];
             let transform = transform_prefixes
                 .iter()
@@ -2563,6 +2575,38 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
                     .unwrap_or("")
                     .to_string();
                 return serde_json::Value::String(part);
+            }
+            val
+        }
+        SqlFieldTransform::Ltrim => {
+            if let serde_json::Value::String(s) = val {
+                return serde_json::Value::String(s.trim_start().to_string());
+            }
+            val
+        }
+        SqlFieldTransform::Rtrim => {
+            if let serde_json::Value::String(s) = val {
+                return serde_json::Value::String(s.trim_end().to_string());
+            }
+            val
+        }
+        SqlFieldTransform::Log => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.ln()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Exp => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.exp()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
             }
             val
         }

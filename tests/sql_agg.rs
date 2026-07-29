@@ -3739,3 +3739,101 @@ fn select_split_part_parse() {
         Some(SqlFieldTransform::SplitPart(d, 2)) if d == ","
     ));
 }
+
+#[test]
+fn select_ltrim_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sltrim:a"), br#"{"s":"  hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LTRIM(PAYLOAD_FIELD('s')) FROM 'obs://sltrim'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("hello"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_rtrim_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srtrim:a"), br#"{"s":"hello  "}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT RTRIM(PAYLOAD_FIELD('s')) FROM 'obs://srtrim'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("hello"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_log_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slog:a"), br#"{"n":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LOG(PAYLOAD_FIELD('n')) FROM 'obs://slog'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!(v.abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_log_non_positive_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slog0:a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LOG(PAYLOAD_FIELD('n')) FROM 'obs://slog0'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n").and_then(|v| v.as_u64()), Some(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_exp_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sexp:a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT EXP(PAYLOAD_FIELD('n')) FROM 'obs://sexp'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_exp_on_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sexps:a"), br#"{"tag":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT EXP(PAYLOAD_FIELD('tag')) FROM 'obs://sexps'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("abc"));
+    store.close().unwrap();
+}

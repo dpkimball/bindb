@@ -133,6 +133,14 @@ pub enum ReturnTransform {
     Strpos(String),
     /// `SPLIT_PART(b.field, 'delim', n)` — nth (1-based) token after splitting string by delimiter.
     SplitPart(String, usize),
+    /// `LTRIM(b.field)` — remove leading whitespace from a string field.
+    Ltrim,
+    /// `RTRIM(b.field)` — remove trailing whitespace from a string field.
+    Rtrim,
+    /// `LOG(b.field)` — natural logarithm of a positive numeric field; non-positive passes through.
+    Log,
+    /// `EXP(b.field)` — e raised to the power of a numeric field.
+    Exp,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
