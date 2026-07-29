@@ -4325,3 +4325,261 @@ fn return_field_no_alias_uses_raw_name() {
     );
     store.close().unwrap();
 }
+
+// ── ILIKE tests ───────────────────────────────────────────────────────────────
+
+#[test]
+fn ilike_matches_case_insensitively() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ilk://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("ilk://a"), br#"{"name":"Alice"}"#.to_vec());
+    tx.put_object(obj("ilk://b"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("ilk://c"), br#"{"name":"ALICE"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("ilk_e1"), obj("ilk://hub"), obj("ilk://a"), "K", None);
+    tx2.put_edge(eid("ilk_e2"), obj("ilk://hub"), obj("ilk://b"), "K", None);
+    tx2.put_edge(eid("ilk_e3"), obj("ilk://hub"), obj("ilk://c"), "K", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:K]->(b) WHERE id(a) = 'ilk://hub' AND b.name ILIKE 'alice' RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn ilike_wildcard_pattern() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ilk2://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("ilk2://a"), br#"{"city":"New York"}"#.to_vec());
+    tx.put_object(obj("ilk2://b"), br#"{"city":"new york"}"#.to_vec());
+    tx.put_object(obj("ilk2://c"), br#"{"city":"Newark"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ilk2_e1"),
+        obj("ilk2://hub"),
+        obj("ilk2://a"),
+        "K",
+        None,
+    );
+    tx2.put_edge(
+        eid("ilk2_e2"),
+        obj("ilk2://hub"),
+        obj("ilk2://b"),
+        "K",
+        None,
+    );
+    tx2.put_edge(
+        eid("ilk2_e3"),
+        obj("ilk2://hub"),
+        obj("ilk2://c"),
+        "K",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:K]->(b) WHERE id(a) = 'ilk2://hub' AND b.city ILIKE 'new%' RETURN b.city",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn not_ilike_excludes_matching() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nilk://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nilk://a"), br#"{"tag":"Admin"}"#.to_vec());
+    tx.put_object(obj("nilk://b"), br#"{"tag":"admin"}"#.to_vec());
+    tx.put_object(obj("nilk://c"), br#"{"tag":"user"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("nilk_e1"),
+        obj("nilk://hub"),
+        obj("nilk://a"),
+        "K",
+        None,
+    );
+    tx2.put_edge(
+        eid("nilk_e2"),
+        obj("nilk://hub"),
+        obj("nilk://b"),
+        "K",
+        None,
+    );
+    tx2.put_edge(
+        eid("nilk_e3"),
+        obj("nilk://hub"),
+        obj("nilk://c"),
+        "K",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:K]->(b) WHERE id(a) = 'nilk://hub' AND b.tag NOT ILIKE 'admin' RETURN b.tag",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("tag"),
+        Some(&serde_json::Value::String("user".into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn ilike_parse_stored_in_struct() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:K]->(b) WHERE id(a) = 'x://hub' AND b.name ILIKE 'al%' RETURN b.name",
+    )
+    .unwrap();
+    assert_eq!(q.payload_preds.len(), 1);
+    assert_eq!(q.payload_preds[0].op, CmpOp::ILike);
+    assert_eq!(q.payload_preds[0].value, CmpValue::Text("al%".into()));
+}
+
+// ── RETURN b.* wildcard tests ──────────────────────────────────────────────────
+
+#[test]
+fn return_all_fields_basic() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("raf://hub"), br#"{}"#.to_vec());
+    tx.put_object(
+        obj("raf://a"),
+        br#"{"name":"bob","age":25,"score":88}"#.to_vec(),
+    );
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("raf_e1"), obj("raf://hub"), obj("raf://a"), "X", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'raf://hub' RETURN b.*")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name"),
+        Some(&serde_json::Value::String("bob".into()))
+    );
+    assert_eq!(
+        rows[0].fields.get("age"),
+        Some(&serde_json::Value::Number(25.into()))
+    );
+    assert_eq!(
+        rows[0].fields.get("score"),
+        Some(&serde_json::Value::Number(88.into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_all_fields_no_payload() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("raf2://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("raf2://a"), br#"{}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("raf2_e1"),
+        obj("raf2://hub"),
+        obj("raf2://a"),
+        "X",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'raf2://hub' RETURN b.*")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].fields.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn return_all_fields_multiple_nodes() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("raf3://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("raf3://a"), br#"{"x":1}"#.to_vec());
+    tx.put_object(obj("raf3://b"), br#"{"y":2}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("raf3_e1"),
+        obj("raf3://hub"),
+        obj("raf3://a"),
+        "X",
+        None,
+    );
+    tx2.put_edge(
+        eid("raf3_e2"),
+        obj("raf3://hub"),
+        obj("raf3://b"),
+        "X",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'raf3://hub' RETURN b.*")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let x_row = rows.iter().find(|r| r.fields.contains_key("x")).unwrap();
+    let y_row = rows.iter().find(|r| r.fields.contains_key("y")).unwrap();
+    assert_eq!(
+        x_row.fields.get("x"),
+        Some(&serde_json::Value::Number(1.into()))
+    );
+    assert_eq!(
+        y_row.fields.get("y"),
+        Some(&serde_json::Value::Number(2.into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_all_fields_parse_flag() {
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://h' RETURN b.*").unwrap();
+    assert!(q.return_all_fields);
+    assert!(q.return_fields.is_empty());
+}

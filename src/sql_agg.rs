@@ -137,8 +137,10 @@ pub struct SqlAggregateQuery {
     pub payload_filters: Vec<SqlPayloadFilter>,
     /// How `payload_filters` are combined (AND or OR). Defaults to `And`.
     pub payload_combinator: SqlFilterCombinator,
-    /// Optional post-aggregation filter.
-    pub having: Option<HavingClause>,
+    /// Post-aggregation filters (AND/OR-combined by `having_combinator`).
+    pub having: Vec<HavingClause>,
+    /// How multiple `having` conditions are combined. Defaults to `And`.
+    pub having_combinator: SqlFilterCombinator,
     /// Optional post-aggregation sort (applied after HAVING).
     pub order_by: Option<AggOrderBy>,
     /// Optional cap on returned aggregate rows (applied last).
@@ -207,14 +209,48 @@ impl SqlAggregateQuery {
             SqlGroupBy::None
         };
 
-        let having = if starts_with_keyword(rest, "HAVING") {
+        let mut having: Vec<HavingClause> = Vec::new();
+        let mut having_combinator = SqlFilterCombinator::And;
+        if starts_with_keyword(rest, "HAVING") {
             let after_having = skip_keyword(rest, "HAVING").trim_start();
-            let (having_clause, remainder) = parse_having(after_having)?;
+            let (clause, remainder) = parse_having(after_having)?;
+            having.push(clause);
             rest = remainder;
-            Some(having_clause)
-        } else {
-            None
-        };
+            loop {
+                let is_and = starts_with_keyword(rest, "AND");
+                let is_or = starts_with_keyword(rest, "OR");
+                if !is_and && !is_or {
+                    break;
+                }
+                let after_conn = if is_and {
+                    skip_keyword(rest, "AND")
+                } else {
+                    skip_keyword(rest, "OR")
+                }
+                .trim_start();
+                let su2 = after_conn.to_ascii_uppercase();
+                let is_having_expr = su2.starts_with("COUNT(*)")
+                    || su2.starts_with("AVG(")
+                    || su2.starts_with("SUM(")
+                    || su2.starts_with("MIN(")
+                    || su2.starts_with("MAX(")
+                    || su2.starts_with("P50(")
+                    || su2.starts_with("P99(");
+                if !is_having_expr {
+                    break;
+                }
+                if !having.is_empty() {
+                    having_combinator = if is_and {
+                        SqlFilterCombinator::And
+                    } else {
+                        SqlFilterCombinator::Or
+                    };
+                }
+                let (clause2, rem2) = parse_having(after_conn)?;
+                having.push(clause2);
+                rest = rem2;
+            }
+        }
 
         let order_by = if starts_with_keyword(rest, "ORDER") {
             let after_order = skip_keyword(rest, "ORDER").trim_start();
@@ -272,6 +308,7 @@ impl SqlAggregateQuery {
             payload_filters,
             payload_combinator,
             having,
+            having_combinator,
             order_by,
             limit,
             offset,
@@ -593,6 +630,18 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
             SqlPayloadOp::Contains,
             skip_keyword(after_close, "CONTAINS"),
         )
+    } else if starts_with_keyword(after_close, "NOT ILIKE") {
+        let after_op = skip_keyword(after_close, "NOT ILIKE").trim_start();
+        let (s, rest2) = parse_quoted(after_op)
+            .map_err(|_| SqlAggError::Unsupported("NOT ILIKE requires a quoted pattern".into()))?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::NotILike,
+                value: SqlPayloadValue::Str(s),
+            },
+            rest2.trim_start(),
+        ));
     } else if starts_with_keyword(after_close, "NOT LIKE") {
         let after_op = skip_keyword(after_close, "NOT LIKE").trim_start();
         let (s, rest2) = parse_quoted(after_op)
@@ -627,6 +676,8 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
             },
             rest2.trim_start(),
         ));
+    } else if starts_with_keyword(after_close, "ILIKE") {
+        (SqlPayloadOp::ILike, skip_keyword(after_close, "ILIKE"))
     } else if starts_with_keyword(after_close, "LIKE") {
         (SqlPayloadOp::Like, skip_keyword(after_close, "LIKE"))
     } else if starts_with_keyword(after_close, "BETWEEN") {
@@ -851,6 +902,12 @@ fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bo
                         SqlPayloadOp::Contains => field_str.contains(s.as_str()),
                         SqlPayloadOp::Like => sql_like_match(field_str, s.as_str()),
                         SqlPayloadOp::NotLike => !sql_like_match(field_str, s.as_str()),
+                        SqlPayloadOp::ILike => {
+                            sql_like_match(&field_str.to_lowercase(), &s.to_lowercase())
+                        }
+                        SqlPayloadOp::NotILike => {
+                            !sql_like_match(&field_str.to_lowercase(), &s.to_lowercase())
+                        }
                         _ => false,
                     }
                 }
@@ -1037,22 +1094,28 @@ impl BinderStore {
         let results = builder.execute()?;
 
         // Apply HAVING filter post-aggregation
-        let mut results = if let Some(having) = &q.having {
+        let mut results = if !q.having.is_empty() {
             results
                 .into_iter()
                 .filter(|r| {
-                    let lhs = match having.agg {
-                        HavingAggregate::Count => r.count as f64,
-                        HavingAggregate::Value => r.value,
+                    let check = |having: &HavingClause| {
+                        let lhs = match having.agg {
+                            HavingAggregate::Count => r.count as f64,
+                            HavingAggregate::Value => r.value,
+                        };
+                        let rhs = having.threshold;
+                        match having.op {
+                            HavingOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
+                            HavingOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
+                            HavingOp::Gt => lhs > rhs,
+                            HavingOp::Lt => lhs < rhs,
+                            HavingOp::Gte => lhs >= rhs,
+                            HavingOp::Lte => lhs <= rhs,
+                        }
                     };
-                    let rhs = having.threshold;
-                    match having.op {
-                        HavingOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
-                        HavingOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
-                        HavingOp::Gt => lhs > rhs,
-                        HavingOp::Lt => lhs < rhs,
-                        HavingOp::Gte => lhs >= rhs,
-                        HavingOp::Lte => lhs <= rhs,
+                    match q.having_combinator {
+                        SqlFilterCombinator::And => q.having.iter().all(check),
+                        SqlFilterCombinator::Or => q.having.iter().any(check),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1118,6 +1181,10 @@ pub enum SqlPayloadOp {
     Like,
     /// `NOT LIKE 'pat%tern'`
     NotLike,
+    /// `ILIKE 'pat%tern'` — case-insensitive SQL wildcard
+    ILike,
+    /// `NOT ILIKE 'pat%tern'`
+    NotILike,
     /// `BETWEEN lo AND hi` — numeric inclusive range
     Between,
     /// `IN ('a', 'b', 'c')` — matches any listed string value
