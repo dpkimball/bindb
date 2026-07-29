@@ -4583,3 +4583,238 @@ fn return_all_fields_parse_flag() {
     assert!(q.return_all_fields);
     assert!(q.return_fields.is_empty());
 }
+
+// ── id(b) NOT IN [...] tests ──────────────────────────────────────────────────
+
+#[test]
+fn node_id_not_in_list_excludes() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nin://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nin://a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(obj("nin://b"), br#"{"v":2}"#.to_vec());
+    tx.put_object(obj("nin://c"), br#"{"v":3}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("nin_e1"), obj("nin://hub"), obj("nin://a"), "E", None);
+    tx2.put_edge(eid("nin_e2"), obj("nin://hub"), obj("nin://b"), "E", None);
+    tx2.put_edge(eid("nin_e3"), obj("nin://hub"), obj("nin://c"), "E", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:E]->(b) WHERE id(a) = 'nin://hub' AND id(b) NOT IN ['nin://a','nin://c'] RETURN b.v",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("v"),
+        Some(&serde_json::Value::Number(2.into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn node_id_not_in_list_empty_excludes_all() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nin2://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nin2://a"), br#"{"v":1}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("nin2_e1"),
+        obj("nin2://hub"),
+        obj("nin2://a"),
+        "E",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:E]->(b) WHERE id(a) = 'nin2://hub' AND id(b) NOT IN ['nin2://a'] RETURN b.v",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn node_id_not_in_list_parse_stored() {
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:E]->(b) WHERE id(a) = 'x://h' AND id(b) NOT IN ['x://a','x://b'] RETURN b.v",
+    )
+    .unwrap();
+    assert!(matches!(q.end_pred, NodeIdPred::NotInList(_)));
+    if let NodeIdPred::NotInList(ids) = &q.end_pred {
+        assert_eq!(ids.len(), 2);
+    }
+}
+
+#[test]
+fn node_id_not_in_list_all_pass_when_no_overlap() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("nin3://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("nin3://a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(obj("nin3://b"), br#"{"v":2}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("nin3_e1"),
+        obj("nin3://hub"),
+        obj("nin3://a"),
+        "E",
+        None,
+    );
+    tx2.put_edge(
+        eid("nin3_e2"),
+        obj("nin3://hub"),
+        obj("nin3://b"),
+        "E",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:E]->(b) WHERE id(a) = 'nin3://hub' AND id(b) NOT IN ['other://x'] RETURN b.v",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+// ── RETURN UPPER/LOWER/TRIM tests ─────────────────────────────────────────────
+
+#[test]
+fn return_upper_transform() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rut://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("rut://a"), br#"{"name":"alice"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("rut_e1"), obj("rut://hub"), obj("rut://a"), "X", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rut://hub' RETURN UPPER(b.name)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name"),
+        Some(&serde_json::Value::String("ALICE".into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_lower_transform() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rlt://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("rlt://a"), br#"{"tag":"HELLO"}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("rlt_e1"), obj("rlt://hub"), obj("rlt://a"), "X", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rlt://hub' RETURN LOWER(b.tag)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("tag"),
+        Some(&serde_json::Value::String("hello".into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_trim_transform() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rtt://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("rtt://a"), br#"{"val":"  hi  "}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("rtt_e1"), obj("rtt://hub"), obj("rtt://a"), "X", None);
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rtt://hub' RETURN TRIM(b.val)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("val"),
+        Some(&serde_json::Value::String("hi".into()))
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_transform_non_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rtns://hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("rtns://a"), br#"{"score":42}"#.to_vec());
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rtns_e1"),
+        obj("rtns://hub"),
+        obj("rtns://a"),
+        "X",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rtns://hub' RETURN UPPER(b.score)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // numeric values pass through unchanged
+    assert_eq!(
+        rows[0].fields.get("score"),
+        Some(&serde_json::Value::Number(42.into()))
+    );
+    store.close().unwrap();
+}

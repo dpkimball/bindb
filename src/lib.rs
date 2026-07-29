@@ -28,8 +28,8 @@ pub use error::StoreError;
 pub use graph_ir::{
     AggFunc, CmpOp, CmpValue, GraphIrError, GraphIrOptionalClause, GraphIrOptionalMatch,
     GraphIrOrderBy, GraphIrQuery, GraphIrRow, GraphIrWithClause, GraphIrWrite, GraphIrWriteError,
-    NodeIdPred, OrderByField, OrderDirection, PayloadPred, PayloadPredCombinator, WithAggregation,
-    WriteOp,
+    NodeIdPred, OrderByField, OrderDirection, PayloadPred, PayloadPredCombinator, ReturnTransform,
+    WithAggregation, WriteOp,
 };
 pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;
@@ -37,8 +37,9 @@ pub use object::{BinderObjectVersion, ObjectVersionId};
 pub use provenance::{Provenance, ProvenanceSource};
 pub use sql_agg::{
     AggOrderBy, AggOrderByField, AggOrderDirection, HavingAggregate, HavingClause, HavingOp,
-    SqlAggError, SqlAggregateQuery, SqlFilterCombinator, SqlGroupBy, SqlIdFilter, SqlPayloadFilter,
-    SqlPayloadOp, SqlPayloadValue, SqlProjectOrderBy, SqlProjectQuery,
+    SqlAggError, SqlAggregateQuery, SqlFieldTransform, SqlFilterCombinator, SqlGroupBy,
+    SqlIdFilter, SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue, SqlProjectOrderBy,
+    SqlProjectQuery,
 };
 pub use transaction::Transaction;
 pub use types::{CommitId, EdgeId, ObjectId};

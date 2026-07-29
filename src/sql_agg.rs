@@ -1222,6 +1222,14 @@ pub struct SqlPayloadFilter {
     pub value: SqlPayloadValue,
 }
 
+/// String transform applied to a projected field: `UPPER(PAYLOAD_FIELD('f'))` etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlFieldTransform {
+    Upper,
+    Lower,
+    Trim,
+}
+
 /// Sort direction for `ORDER BY` in a projection query.
 pub use AggOrderDirection as SqlProjectDirection;
 
@@ -1250,6 +1258,9 @@ pub struct SqlProjectQuery {
     /// Output-key aliases for projected fields (`SELECT PAYLOAD_FIELD('name') AS n`).
     /// Key = raw field name, value = alias used as output key in the result row.
     pub field_aliases: std::collections::HashMap<String, String>,
+    /// Optional string transforms on projected fields (`SELECT UPPER(PAYLOAD_FIELD('f'))`).
+    /// Key = raw field name, value = transform applied to string values before output.
+    pub field_transforms: std::collections::HashMap<String, SqlFieldTransform>,
     pub namespace: String,
     /// When `true`, each row includes an `"id"` key holding the full object_id string.
     pub return_id: bool,
@@ -1261,8 +1272,8 @@ pub struct SqlProjectQuery {
     pub payload_filters: Vec<SqlPayloadFilter>,
     /// How `payload_filters` are combined (AND or OR). Defaults to `And`.
     pub payload_combinator: SqlFilterCombinator,
-    /// Optional `ORDER BY PAYLOAD_FIELD('f') [ASC|DESC]` sort.
-    pub order_by: Option<SqlProjectOrderBy>,
+    /// `ORDER BY` sort keys (multi-key, evaluated left to right). Empty = no sort.
+    pub order_by: Vec<SqlProjectOrderBy>,
     /// Number of rows to skip before applying LIMIT (applied after ORDER BY).
     pub offset: Option<usize>,
     pub limit: Option<usize>,
@@ -1291,6 +1302,8 @@ impl SqlProjectQuery {
         let mut fields = Vec::new();
         let mut field_aliases: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut field_transforms: std::collections::HashMap<String, SqlFieldTransform> =
+            std::collections::HashMap::new();
         let mut return_id = false;
         loop {
             s = s.trim_start();
@@ -1298,7 +1311,6 @@ impl SqlProjectQuery {
                 break;
             }
             // `id` — return the full object_id as the `"id"` column
-            // Allow `id` followed by `,`, whitespace, or end (not just whitespace).
             let su = s.to_ascii_uppercase();
             let is_id = su.starts_with("ID,")
                 || su.starts_with("ID ")
@@ -1306,13 +1318,27 @@ impl SqlProjectQuery {
                 || su.starts_with("ID\t");
             if is_id {
                 return_id = true;
-                s = &s[2..]; // skip "id"
+                s = &s[2..];
                 s = s.trim_start();
                 if s.starts_with(',') {
                     s = &s[1..];
                 }
                 continue;
             }
+            // Detect UPPER/LOWER/TRIM(PAYLOAD_FIELD('f')) wrappers
+            let su = s.to_ascii_uppercase();
+            let transform = if su.starts_with("UPPER(PAYLOAD_FIELD(") {
+                s = &s["UPPER(".len()..];
+                Some(SqlFieldTransform::Upper)
+            } else if su.starts_with("LOWER(PAYLOAD_FIELD(") {
+                s = &s["LOWER(".len()..];
+                Some(SqlFieldTransform::Lower)
+            } else if su.starts_with("TRIM(PAYLOAD_FIELD(") {
+                s = &s["TRIM(".len()..];
+                Some(SqlFieldTransform::Trim)
+            } else {
+                None
+            };
             let su = s.to_ascii_uppercase();
             if !su.starts_with("PAYLOAD_FIELD(") {
                 return Err(SqlAggError::Unsupported(
@@ -1328,7 +1354,16 @@ impl SqlProjectQuery {
                 ));
             }
             s = rest[1..].trim_start();
-            // Optional `AS alias` after PAYLOAD_FIELD('f')
+            // Consume closing ')' of the outer UPPER/LOWER/TRIM wrapper if present
+            if transform.is_some() {
+                if let Some(after_outer) = s.strip_prefix(')') {
+                    s = after_outer.trim_start();
+                }
+            }
+            if let Some(t) = transform {
+                field_transforms.insert(field.clone(), t);
+            }
+            // Optional `AS alias` after PAYLOAD_FIELD('f') or its wrapper
             if starts_with_keyword(s, "AS") {
                 let after_as = skip_keyword(s, "AS").trim_start();
                 let alias_end = after_as
@@ -1385,55 +1420,66 @@ impl SqlProjectQuery {
             (None, vec![], SqlFilterCombinator::And)
         };
 
-        let order_by = if starts_with_keyword(s, "ORDER") {
+        let mut order_by: Vec<SqlProjectOrderBy> = Vec::new();
+        if starts_with_keyword(s, "ORDER") {
             let after_order = skip_keyword(s, "ORDER").trim_start();
             if !starts_with_keyword(after_order, "BY") {
                 return Err(SqlAggError::Unsupported("expected ORDER BY".into()));
             }
-            let after_by = skip_keyword(after_order, "BY").trim_start();
-            let su = after_by.to_ascii_uppercase();
-            if starts_with_keyword(after_by, "id") {
-                // ORDER BY id [ASC|DESC]
-                let rest2 = skip_keyword(after_by, "id").trim_start();
-                let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
-                    (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
-                } else if starts_with_keyword(rest2, "ASC") {
-                    (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+            let mut cur = skip_keyword(after_order, "BY").trim_start();
+            loop {
+                let su = cur.to_ascii_uppercase();
+                let (field, rest2) = if starts_with_keyword(cur, "id") {
+                    let rest2 = skip_keyword(cur, "id").trim_start();
+                    ("id".to_string(), rest2)
+                } else if su.starts_with("PAYLOAD_FIELD(") {
+                    let after_pf = &cur["PAYLOAD_FIELD(".len()..];
+                    let (f, r) = parse_quoted_sql(after_pf)?;
+                    let r = r.trim_start();
+                    if !r.starts_with(')') {
+                        return Err(SqlAggError::Unsupported(
+                            "expected ')' after PAYLOAD_FIELD in ORDER BY".into(),
+                        ));
+                    }
+                    (f, r[1..].trim_start())
                 } else {
-                    (AggOrderDirection::Asc, rest2)
-                };
-                s = rest2.trim_start();
-                Some(SqlProjectOrderBy {
-                    field: "id".to_string(),
-                    direction,
-                })
-            } else if su.starts_with("PAYLOAD_FIELD(") {
-                let after_pf = &after_by["PAYLOAD_FIELD(".len()..];
-                let (field, rest2) = parse_quoted_sql(after_pf)?;
-                let rest2 = rest2.trim_start();
-                if !rest2.starts_with(')') {
                     return Err(SqlAggError::Unsupported(
-                        "expected ')' after PAYLOAD_FIELD in ORDER BY".into(),
+                        "ORDER BY must be id or PAYLOAD_FIELD('field')".into(),
                     ));
-                }
-                let rest2 = rest2[1..].trim_start();
-                let (direction, rest2) = if starts_with_keyword(rest2, "DESC") {
-                    (AggOrderDirection::Desc, skip_keyword(rest2, "DESC"))
-                } else if starts_with_keyword(rest2, "ASC") {
-                    (AggOrderDirection::Asc, skip_keyword(rest2, "ASC"))
+                };
+                // Detect ASC/DESC even when followed by comma (not just whitespace).
+                let rest2_u = rest2.to_ascii_uppercase();
+                let (direction, rest2) = if rest2_u.starts_with("DESC")
+                    && (rest2.len() == 4
+                        || !rest2
+                            .as_bytes()
+                            .get(4)
+                            .is_some_and(|b| b.is_ascii_alphanumeric()))
+                    && rest2.len() >= 4
+                {
+                    (AggOrderDirection::Desc, rest2[4..].trim_start())
+                } else if rest2_u.starts_with("ASC")
+                    && (rest2.len() == 3
+                        || !rest2
+                            .as_bytes()
+                            .get(3)
+                            .is_some_and(|b| b.is_ascii_alphanumeric()))
+                    && rest2.len() >= 3
+                {
+                    (AggOrderDirection::Asc, rest2[3..].trim_start())
                 } else {
                     (AggOrderDirection::Asc, rest2)
                 };
-                s = rest2.trim_start();
-                Some(SqlProjectOrderBy { field, direction })
-            } else {
-                return Err(SqlAggError::Unsupported(
-                    "ORDER BY must be id or PAYLOAD_FIELD('field')".into(),
-                ));
+                order_by.push(SqlProjectOrderBy { field, direction });
+                cur = rest2.trim_start();
+                if cur.starts_with(',') {
+                    cur = cur[1..].trim_start();
+                } else {
+                    break;
+                }
             }
-        } else {
-            None
-        };
+            s = cur;
+        }
 
         let offset = if starts_with_keyword(s, "OFFSET") {
             let after_offset = skip_keyword(s, "OFFSET").trim_start();
@@ -1472,6 +1518,7 @@ impl SqlProjectQuery {
         Ok(SqlProjectQuery {
             fields,
             field_aliases,
+            field_transforms,
             namespace,
             return_id,
             distinct,
@@ -1482,6 +1529,17 @@ impl SqlProjectQuery {
             offset,
             limit,
         })
+    }
+}
+
+fn apply_sql_field_transform(val: serde_json::Value, t: SqlFieldTransform) -> serde_json::Value {
+    match val {
+        serde_json::Value::String(s) => serde_json::Value::String(match t {
+            SqlFieldTransform::Upper => s.to_uppercase(),
+            SqlFieldTransform::Lower => s.to_lowercase(),
+            SqlFieldTransform::Trim => s.trim().to_string(),
+        }),
+        other => other,
     }
 }
 
@@ -1556,22 +1614,29 @@ impl BinderStore {
         });
 
         // When ORDER BY references a field not in SELECT, we need to project it
-        // temporarily for sorting, then strip it from the output rows.
-        let sort_key_extra = q
+        // Collect sort-key fields that aren't in SELECT (need temporary projection).
+        let sort_keys_extra: Vec<String> = q
             .order_by
-            .as_ref()
+            .iter()
             .filter(|ob| ob.field != "id" && !q.fields.contains(&ob.field))
-            .map(|ob| ob.field.clone());
+            .map(|ob| ob.field.clone())
+            .collect();
 
         let return_id = q.return_id;
         let field_aliases = q.field_aliases.clone();
+        let field_transforms = q.field_transforms.clone();
         let mut rows: Vec<std::collections::HashMap<String, serde_json::Value>> = iter
             .map(|v| {
                 let mut row: std::collections::HashMap<String, serde_json::Value> = q
                     .fields
                     .iter()
                     .map(|field| {
-                        let val = project_payload_field(v.payload.as_deref(), field);
+                        let raw = project_payload_field(v.payload.as_deref(), field);
+                        let val = if let Some(t) = field_transforms.get(field) {
+                            apply_sql_field_transform(raw, *t)
+                        } else {
+                            raw
+                        };
                         let out_key = field_aliases
                             .get(field)
                             .cloned()
@@ -1585,30 +1650,34 @@ impl BinderStore {
                         serde_json::Value::String(v.object_id.0.clone()),
                     );
                 }
-                if let Some(ref sk) = sort_key_extra {
+                for sk in &sort_keys_extra {
                     row.insert(sk.clone(), project_payload_field(v.payload.as_deref(), sk));
                 }
                 row
             })
             .collect();
 
-        if let Some(ob) = &q.order_by {
-            let field = ob.field.clone();
-            let desc = ob.direction == AggOrderDirection::Desc;
+        if !q.order_by.is_empty() {
             rows.sort_by(|a, b| {
-                let av = a.get(&field).cloned().unwrap_or(serde_json::Value::Null);
-                let bv = b.get(&field).cloned().unwrap_or(serde_json::Value::Null);
-                let ord = compare_json_for_sort(&av, &bv);
-                if desc {
-                    ord.reverse()
-                } else {
-                    ord
+                for ob in &q.order_by {
+                    let av = a.get(&ob.field).cloned().unwrap_or(serde_json::Value::Null);
+                    let bv = b.get(&ob.field).cloned().unwrap_or(serde_json::Value::Null);
+                    let ord = compare_json_for_sort(&av, &bv);
+                    let ord = if ob.direction == AggOrderDirection::Desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
                 }
+                std::cmp::Ordering::Equal
             });
         }
 
-        // Remove the temporary sort key if it wasn't in the original SELECT list.
-        if let Some(ref sk) = sort_key_extra {
+        // Remove temporary sort keys not in original SELECT list.
+        for sk in &sort_keys_extra {
             for row in &mut rows {
                 row.remove(sk);
             }

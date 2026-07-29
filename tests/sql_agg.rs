@@ -1211,18 +1211,14 @@ fn project_order_by_null_sorts_last() {
 
 #[test]
 fn project_order_by_parse_roundtrip() {
-    use bindb::{AggOrderDirection, SqlProjectOrderBy, SqlProjectQuery};
+    use bindb::{AggOrderDirection, SqlProjectQuery};
     let q = SqlProjectQuery::parse(
         "SELECT PAYLOAD_FIELD('name') FROM 'obs://x' ORDER BY PAYLOAD_FIELD('score') DESC LIMIT 10",
     )
     .unwrap();
-    assert_eq!(
-        q.order_by,
-        Some(SqlProjectOrderBy {
-            field: "score".into(),
-            direction: AggOrderDirection::Desc,
-        })
-    );
+    assert_eq!(q.order_by.len(), 1);
+    assert_eq!(q.order_by[0].field, "score");
+    assert_eq!(q.order_by[0].direction, AggOrderDirection::Desc);
     assert_eq!(q.limit, Some(10));
     assert_eq!(q.id_filter, None);
 }
@@ -2464,4 +2460,153 @@ fn having_or_parse_stores_combinator() {
     .unwrap();
     assert_eq!(q.having.len(), 2);
     assert_eq!(q.having_combinator, bindb::SqlFilterCombinator::Or);
+}
+
+// ── UPPER/LOWER/TRIM(PAYLOAD_FIELD) in SELECT tests ──────────────────────────
+
+#[test]
+fn select_upper_transform() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sut:a"), br#"{"name":"alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT UPPER(PAYLOAD_FIELD('name')) FROM 'obs://sut'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("ALICE"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_lower_transform() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slt:a"), br#"{"tag":"HELLO"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LOWER(PAYLOAD_FIELD('tag')) FROM 'obs://slt'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("hello"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_trim_transform() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://str:a"), br#"{"val":"  hi  "}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT TRIM(PAYLOAD_FIELD('val')) FROM 'obs://str'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("val").and_then(|v| v.as_str()), Some("hi"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_transform_with_alias() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sta:a"), br#"{"city":"london"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT UPPER(PAYLOAD_FIELD('city')) AS c FROM 'obs://sta'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("c").and_then(|v| v.as_str()), Some("LONDON"));
+    assert!(!rows[0].contains_key("city"));
+    store.close().unwrap();
+}
+
+// ── Multi-field ORDER BY tests ────────────────────────────────────────────────
+
+#[test]
+fn multi_order_by_two_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://mob:a"), br#"{"dept":"eng","rank":2}"#.to_vec());
+    tx.put_object(oid("obs://mob:b"), br#"{"dept":"eng","rank":1}"#.to_vec());
+    tx.put_object(oid("obs://mob:c"), br#"{"dept":"art","rank":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('dept'), PAYLOAD_FIELD('rank') FROM 'obs://mob' ORDER BY PAYLOAD_FIELD('dept') ASC, PAYLOAD_FIELD('rank') ASC",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    // art/1, eng/1, eng/2
+    assert_eq!(rows[0].get("dept").and_then(|v| v.as_str()), Some("art"));
+    assert_eq!(rows[1].get("dept").and_then(|v| v.as_str()), Some("eng"));
+    assert_eq!(rows[1].get("rank").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(rows[2].get("dept").and_then(|v| v.as_str()), Some("eng"));
+    assert_eq!(rows[2].get("rank").and_then(|v| v.as_i64()), Some(2));
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_order_by_asc_desc() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://moad:a"), br#"{"dept":"eng","rank":2}"#.to_vec());
+    tx.put_object(oid("obs://moad:b"), br#"{"dept":"eng","rank":1}"#.to_vec());
+    tx.put_object(oid("obs://moad:c"), br#"{"dept":"art","rank":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('dept'), PAYLOAD_FIELD('rank') FROM 'obs://moad' ORDER BY PAYLOAD_FIELD('dept') ASC, PAYLOAD_FIELD('rank') DESC",
+        )
+        .unwrap();
+    // art/3, eng/2, eng/1
+    assert_eq!(rows[0].get("dept").and_then(|v| v.as_str()), Some("art"));
+    assert_eq!(rows[1].get("rank").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(rows[2].get("rank").and_then(|v| v.as_i64()), Some(1));
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_order_by_parse_stored() {
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('a'), PAYLOAD_FIELD('b') FROM 'obs://x' ORDER BY PAYLOAD_FIELD('a') ASC, PAYLOAD_FIELD('b') DESC",
+    )
+    .unwrap();
+    assert_eq!(q.order_by.len(), 2);
+    assert_eq!(q.order_by[0].field, "a");
+    assert_eq!(q.order_by[1].field, "b");
+    assert_eq!(q.order_by[1].direction, bindb::AggOrderDirection::Desc);
+}
+
+#[test]
+fn single_order_by_still_works() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sob:a"), br#"{"score":3}"#.to_vec());
+    tx.put_object(oid("obs://sob:b"), br#"{"score":1}"#.to_vec());
+    tx.put_object(oid("obs://sob:c"), br#"{"score":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://sob' ORDER BY PAYLOAD_FIELD('score') ASC",
+        )
+        .unwrap();
+    assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(rows[1].get("score").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(rows[2].get("score").and_then(|v| v.as_i64()), Some(3));
+    store.close().unwrap();
 }
