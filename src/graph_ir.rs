@@ -273,6 +273,9 @@ pub struct GraphIrWithClause {
     /// aggregation; each unique combination of values produces a separate row.
     /// Single-field case is `["field"]`; replaces the former `Option<String>`.
     pub group_by_fields: Vec<String>,
+    /// When true, duplicate `b` nodes (same `object_id`) are removed before
+    /// ordering and paging.  Parsed from `WITH DISTINCT b …`.
+    pub distinct: bool,
 }
 
 /// One row returned by `graph_ir_projected`.
@@ -365,8 +368,8 @@ pub struct GraphIrQuery {
     pub return_all_fields: bool,
     /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
     pub distinct: bool,
-    /// Optional ORDER BY clause applied after min-depth filtering.
-    pub order_by: Option<GraphIrOrderBy>,
+    /// ORDER BY sort keys (multi-key, evaluated left to right). Empty = no sort.
+    pub order_by: Vec<GraphIrOrderBy>,
     /// Maximum number of results to return (applied after ORDER BY and SKIP).
     pub limit: Option<usize>,
     /// Number of results to skip before applying LIMIT (applied after ORDER BY).
@@ -492,10 +495,17 @@ impl GraphIrQuery {
                     skip: None,
                     aggregations: aggs,
                     group_by_fields,
+                    distinct: false,
                 };
                 (Some(wc), after_aggs.trim_start())
             } else {
-                // Pass-through: WITH b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]
+                // Pass-through: WITH [DISTINCT] b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]
+                let (wc_distinct, after_with_kw) = if starts_with_keyword(after_with_kw, "DISTINCT")
+                {
+                    (true, skip_keyword(after_with_kw, "DISTINCT"))
+                } else {
+                    (false, after_with_kw)
+                };
                 if !starts_with_keyword(after_with_kw, "b") {
                     return Err(GraphIrError::Unsupported(
                         "WITH must project variable 'b' or start with an aggregation function"
@@ -514,6 +524,7 @@ impl GraphIrQuery {
                     skip: wc_skip,
                     aggregations: vec![],
                     group_by_fields: vec![],
+                    distinct: wc_distinct,
                 };
                 (Some(wc), after_wc_ordering.trim_start())
             }
@@ -568,7 +579,7 @@ impl GraphIrQuery {
             return_id,
             return_all_fields,
         ) = parse_return_spec(ret_spec, path_var.as_deref());
-        let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
+        let (order_by, limit, skip) = parse_multi_ordering_tail(ordering_tail)?;
 
         let optional_clause = optional_clause_raw.map(|mut oc| {
             oc.return_fields = c_return_fields;
@@ -1482,12 +1493,83 @@ fn split_at_ordering_clause(s: &str) -> (&str, &str) {
     (s, "")
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_ordering_tail(
-    s: &str,
-) -> Result<(Option<GraphIrOrderBy>, Option<usize>, Option<usize>), GraphIrError> {
-    let (ob, limit, skip, _rest) = parse_ordering_tail_rest(s)?;
-    Ok((ob, limit, skip))
+type MultiOrderingResult =
+    Result<(Vec<GraphIrOrderBy>, Option<usize>, Option<usize>), GraphIrError>;
+
+/// Parse multi-field ORDER BY for the RETURN clause.
+/// Supports `ORDER BY b.f1 ASC, b.f2 DESC` with comma-separated fields.
+fn parse_multi_ordering_tail(s: &str) -> MultiOrderingResult {
+    let mut s = s.trim_start();
+    let mut order_by: Vec<GraphIrOrderBy> = Vec::new();
+    let mut limit = None;
+    let mut skip = None;
+
+    if starts_with_keyword(s, "ORDER") {
+        let after_order = skip_keyword(s, "ORDER");
+        if !starts_with_keyword(after_order, "BY") {
+            return Err(GraphIrError::Unsupported("expected ORDER BY".into()));
+        }
+        let mut rest = skip_keyword(after_order, "BY");
+        loop {
+            let (field, after_field) = parse_order_field(rest)?;
+            let after_field = after_field.trim_start();
+            // Detect direction: allow non-alphanumeric boundary (e.g. comma) not just whitespace.
+            let au = after_field.to_ascii_uppercase();
+            let (direction, after_dir) = if au.starts_with("DESC")
+                && (after_field.len() == 4
+                    || !after_field
+                        .as_bytes()
+                        .get(4)
+                        .is_some_and(|b| b.is_ascii_alphanumeric()))
+            {
+                (OrderDirection::Desc, after_field[4..].trim_start())
+            } else if au.starts_with("ASC")
+                && (after_field.len() == 3
+                    || !after_field
+                        .as_bytes()
+                        .get(3)
+                        .is_some_and(|b| b.is_ascii_alphanumeric()))
+            {
+                (OrderDirection::Asc, after_field[3..].trim_start())
+            } else {
+                (OrderDirection::Asc, after_field)
+            };
+            order_by.push(GraphIrOrderBy { field, direction });
+            // Consume comma for next sort key
+            if let Some(after_comma) = after_dir.strip_prefix(',') {
+                rest = after_comma.trim_start();
+                if starts_with_keyword(rest, "SKIP")
+                    || starts_with_keyword(rest, "LIMIT")
+                    || rest.is_empty()
+                {
+                    break;
+                }
+            } else {
+                s = after_dir;
+                break;
+            }
+        }
+        if order_by.len() == 1 {
+            // single-field: s was already set inside the loop by the `break`
+        }
+    }
+
+    if starts_with_keyword(s, "SKIP") {
+        let after_skip = skip_keyword(s, "SKIP");
+        let (n, rest) = parse_usize_literal(after_skip)?;
+        skip = Some(n);
+        s = rest.trim_start();
+    }
+
+    if starts_with_keyword(s, "LIMIT") {
+        let after_limit = skip_keyword(s, "LIMIT");
+        let (n, rest) = parse_usize_literal(after_limit)?;
+        limit = Some(n);
+        s = rest.trim_start();
+    }
+    let _ = s;
+
+    Ok((order_by, limit, skip))
 }
 
 fn parse_order_field(s: &str) -> Result<(OrderByField, &str), GraphIrError> {
@@ -1960,22 +2042,28 @@ fn extract_sort_key(payload: Option<&[u8]>, field: &str) -> SortKey {
 }
 
 fn apply_order_limit_matches(matches: &mut Vec<GraphQueryMatch>, q: &GraphIrQuery) {
-    if let Some(ob) = &q.order_by {
+    if !q.order_by.is_empty() {
         matches.sort_by(|a, b| {
-            let ord = match &ob.field {
-                OrderByField::ObjectId => a.object.object_id.0.cmp(&b.object.object_id.0),
-                OrderByField::Depth => a.depth.cmp(&b.depth),
-                OrderByField::PayloadField(field) => {
-                    let ak = extract_sort_key(a.object.payload.as_deref(), field);
-                    let bk = extract_sort_key(b.object.payload.as_deref(), field);
-                    ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+            for ob in &q.order_by {
+                let ord = match &ob.field {
+                    OrderByField::ObjectId => a.object.object_id.0.cmp(&b.object.object_id.0),
+                    OrderByField::Depth => a.depth.cmp(&b.depth),
+                    OrderByField::PayloadField(field) => {
+                        let ak = extract_sort_key(a.object.payload.as_deref(), field);
+                        let bk = extract_sort_key(b.object.payload.as_deref(), field);
+                        ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                };
+                let ord = if ob.direction == OrderDirection::Desc {
+                    ord.reverse()
+                } else {
+                    ord
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
                 }
-            };
-            if ob.direction == OrderDirection::Desc {
-                ord.reverse()
-            } else {
-                ord
             }
+            std::cmp::Ordering::Equal
         });
     }
     if let Some(n) = q.skip.filter(|&n| n > 0) {
@@ -2167,6 +2255,10 @@ impl BinderStore {
 
 /// Apply WITH clause predicates, ordering, and paging to mandatory `b` results.
 fn apply_with_clause(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause) {
+    if wc.distinct {
+        let mut seen = std::collections::HashSet::new();
+        matches.retain(|m| seen.insert(m.object.object_id.clone()));
+    }
     match &wc.end_pred {
         NodeIdPred::Any => {}
         NodeIdPred::StartsWith(pfx) => {
@@ -2236,22 +2328,28 @@ fn sort_key_from_value(v: Option<&serde_json::Value>) -> SortKey {
 /// Apply ORDER BY / SKIP / LIMIT to final expanded `GraphIrRow` results.
 /// Used post-optional-expansion when a WITH clause controls pre-expansion ordering.
 fn apply_order_limit_rows(rows: &mut Vec<GraphIrRow>, q: &GraphIrQuery) {
-    if let Some(ob) = &q.order_by {
+    if !q.order_by.is_empty() {
         rows.sort_by(|a, b| {
-            let ord = match &ob.field {
-                OrderByField::ObjectId => a.object_id.0.cmp(&b.object_id.0),
-                OrderByField::Depth => a.depth.cmp(&b.depth),
-                OrderByField::PayloadField(field) => {
-                    let ak = sort_key_from_value(a.fields.get(field));
-                    let bk = sort_key_from_value(b.fields.get(field));
-                    ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+            for ob in &q.order_by {
+                let ord = match &ob.field {
+                    OrderByField::ObjectId => a.object_id.0.cmp(&b.object_id.0),
+                    OrderByField::Depth => a.depth.cmp(&b.depth),
+                    OrderByField::PayloadField(field) => {
+                        let ak = sort_key_from_value(a.fields.get(field));
+                        let bk = sort_key_from_value(b.fields.get(field));
+                        ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                };
+                let ord = if ob.direction == OrderDirection::Desc {
+                    ord.reverse()
+                } else {
+                    ord
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
                 }
-            };
-            if ob.direction == OrderDirection::Desc {
-                ord.reverse()
-            } else {
-                ord
             }
+            std::cmp::Ordering::Equal
         });
     }
     if let Some(n) = q.skip.filter(|&n| n > 0) {

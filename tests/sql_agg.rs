@@ -2610,3 +2610,151 @@ fn single_order_by_still_works() {
     assert_eq!(rows[2].get("score").and_then(|v| v.as_i64()), Some(3));
     store.close().unwrap();
 }
+
+// ── WHERE id NOT IN ──────────────────────────────────────────────────────────
+
+#[test]
+fn id_not_in_project_excludes_listed() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ni:a"), br#"{"x":1}"#.to_vec());
+    tx.put_object(oid("obs://ni:b"), br#"{"x":2}"#.to_vec());
+    tx.put_object(oid("obs://ni:c"), br#"{"x":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('x') FROM 'obs://ni' WHERE id NOT IN ('a', 'b')")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("x").and_then(|v| v.as_i64()), Some(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn id_not_in_aggregate_excludes_listed() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nia:a"), br#"{"v":10}"#.to_vec());
+    tx.put_object(oid("obs://nia:b"), br#"{"v":20}"#.to_vec());
+    tx.put_object(oid("obs://nia:c"), br#"{"v":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    // Exclude 'a' → only b and c remain → count = 2
+    let rows = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://nia' WHERE id NOT IN ('a')")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn id_not_in_empty_list_keeps_all() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://niel:a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(oid("obs://niel:b"), br#"{"v":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    // NOT IN with empty list matches everything
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('v') FROM 'obs://niel' WHERE id NOT IN ()")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn id_not_in_parses_correctly() {
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('f') FROM 'obs://x' WHERE id NOT IN ('p', 'q')",
+    )
+    .unwrap();
+    assert!(matches!(
+        q.id_filter,
+        Some(bindb::SqlIdFilter::NotIn(ref vs)) if vs == &vec!["p".to_string(), "q".to_string()]
+    ));
+}
+
+// ── PAYLOAD_FIELD numeric IN / NOT IN ────────────────────────────────────────
+
+#[test]
+fn payload_numeric_in_matches_values() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://numIN:a"), br#"{"score":1}"#.to_vec());
+    tx.put_object(oid("obs://numIN:b"), br#"{"score":2}"#.to_vec());
+    tx.put_object(oid("obs://numIN:c"), br#"{"score":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://numIN' WHERE PAYLOAD_FIELD('score') IN (1, 3)",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let scores: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.get("score").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(scores.contains(&1));
+    assert!(scores.contains(&3));
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_numeric_not_in_excludes_values() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://numNI:a"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://numNI:b"), br#"{"score":20}"#.to_vec());
+    tx.put_object(oid("obs://numNI:c"), br#"{"score":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://numNI' WHERE PAYLOAD_FIELD('score') NOT IN (10, 20)",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(30));
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_numeric_in_aggregate_filter() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://numINa:a"), br#"{"tier":1}"#.to_vec());
+    tx.put_object(oid("obs://numINa:b"), br#"{"tier":2}"#.to_vec());
+    tx.put_object(oid("obs://numINa:c"), br#"{"tier":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://numINa' WHERE PAYLOAD_FIELD('tier') IN (1, 3)")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn payload_numeric_in_parses_correctly() {
+    use bindb::{SqlPayloadOp, SqlPayloadValue};
+    let q = SqlProjectQuery::parse(
+        "SELECT PAYLOAD_FIELD('n') FROM 'obs://x' WHERE PAYLOAD_FIELD('n') IN (5, 10, 15)",
+    )
+    .unwrap();
+    assert_eq!(q.payload_filters.len(), 1);
+    assert_eq!(q.payload_filters[0].op, SqlPayloadOp::In);
+    assert!(matches!(
+        &q.payload_filters[0].value,
+        SqlPayloadValue::NumList(ns) if ns.len() == 3
+    ));
+}
