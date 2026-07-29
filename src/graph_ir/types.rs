@@ -1,0 +1,338 @@
+use crate::graph_query::Direction;
+use crate::types::{EdgeId, ObjectId};
+use std::collections::HashMap;
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum GraphIrError {
+    #[error("empty query")]
+    Empty,
+    #[error("unsupported graph IR: {0}")]
+    Unsupported(String),
+    #[error("missing start id(a) = '…' in WHERE")]
+    MissingStart,
+    #[error("invalid hop bound")]
+    BadHops,
+    #[error("no aggregating WITH clause; use graph_ir_projected instead")]
+    NoAggregation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeIdPred {
+    /// No predicate on matched end nodes.
+    Any,
+    StartsWith(String),
+    EndsWith(String),
+    Contains(String),
+    Equals(String),
+    /// `id(b) IN ['x://a', 'x://b']` — matches any of the listed full object IDs.
+    InList(Vec<String>),
+    /// `id(b) NOT IN ['x://a', 'x://b']` — excludes any of the listed full object IDs.
+    NotInList(Vec<String>),
+}
+
+/// Comparison operator for payload field predicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    /// `b.field STARTS WITH 'prefix'`
+    StartsWith,
+    /// `b.field ENDS WITH 'suffix'`
+    EndsWith,
+    /// `b.field CONTAINS 'substr'`
+    Contains,
+    /// `b.field IS NULL` — field absent from the JSON payload
+    IsNull,
+    /// `b.field IS NOT NULL` — field present in the JSON payload
+    IsNotNull,
+    /// `b.field IN ['v1', 'v2']` — field value is in the list
+    In,
+    /// `b.field NOT IN ['v1', 'v2']` — field value is not in the list
+    NotIn,
+    /// `b.field BETWEEN lo AND hi` — numeric range, inclusive on both ends
+    Between,
+    /// `b.field LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
+    Like,
+    /// `b.field ILIKE 'pat%tern'` — case-insensitive SQL wildcard
+    ILike,
+}
+
+/// Right-hand side of a payload predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CmpValue {
+    Number(f64),
+    Text(String),
+    /// Placeholder for IS NULL / IS NOT NULL (no RHS value).
+    Null,
+    /// List of string values for IN / NOT IN.
+    StringList(Vec<String>),
+    /// List of numeric values for IN / NOT IN with numbers.
+    NumberList(Vec<f64>),
+    /// Inclusive numeric range for BETWEEN.
+    NumberRange(f64, f64),
+}
+
+/// String transform applied to a projected node field in `RETURN UPPER(b.field)` etc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnTransform {
+    Upper,
+    Lower,
+    Trim,
+    /// `ABS(b.field)` — absolute value of a numeric field.
+    Abs,
+    /// `ROUND(b.field)` — round numeric field to nearest integer.
+    Round,
+    /// `CEIL(b.field)` — ceiling of a numeric field.
+    Ceil,
+    /// `FLOOR(b.field)` — floor of a numeric field.
+    Floor,
+    /// `COALESCE(b.field, 'fallback')` — substitute fallback when field is null.
+    Coalesce(String),
+    /// `REPLACE(b.field, 'from', 'to')` — string replacement.
+    Replace(String, String),
+    /// `LENGTH(b.field)` — character count of a string field (returned as a number).
+    Length,
+    /// `SUBSTRING(b.field, start, len)` — extract a substring (zero-based, char-indexed).
+    Substring(usize, usize),
+    /// `CAST(b.field AS INT)` — convert field to integer.
+    CastInt,
+    /// `CAST(b.field AS FLOAT)` — convert field to float.
+    CastFloat,
+    /// `CAST(b.field AS STRING)` — convert numeric field to string.
+    CastString,
+    /// `NULLIF(b.field, 'val')` — returns null (field omitted) when field equals `val`.
+    NullIf(String),
+    /// `REVERSE(b.field)` — reverses a string field character by character.
+    Reverse,
+    /// `INITCAP(b.field)` — capitalizes the first letter of each whitespace-separated word.
+    InitCap,
+    /// `LPAD(b.field, n, 'c')` — left-pad string to width `n` with char `c`.
+    Lpad(usize, String),
+    /// `RPAD(b.field, n, 'c')` — right-pad string to width `n` with char `c`.
+    Rpad(usize, String),
+}
+
+/// How `payload_preds` are combined during BFS node filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadPredCombinator {
+    /// All predicates must hold (AND — default).
+    And,
+    /// Any predicate must hold (OR).
+    Or,
+}
+
+/// Predicate on a JSON field of the matched end node's payload.
+/// Payload must be a UTF-8 JSON object; non-JSON payloads never match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PayloadPred {
+    pub field: String,
+    pub op: CmpOp,
+    pub value: CmpValue,
+    /// When `true`, the predicate result is inverted (`NOT`).
+    pub negated: bool,
+}
+
+/// The `OPTIONAL MATCH` clause in a two-clause query.
+///
+/// Traversal starts from each matched `b` node in the mandatory clause and
+/// tries to reach `c` nodes. When no `c` nodes are reachable, `GraphIrRow::optional`
+/// is set to `None` so the mandatory row is still emitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrOptionalClause {
+    pub edge_types: Vec<String>,
+    /// Minimum hop depth from `b` included in optional results.
+    pub min_depth: usize,
+    /// Maximum hop depth from `b`.
+    pub max_depth: usize,
+    pub direction: Direction,
+    pub end_pred: NodeIdPred,
+    /// Payload field predicates applied to matched `c` nodes (AND-combined).
+    pub payload_preds: Vec<PayloadPred>,
+    /// Fields to project from each `c` node's JSON payload (`RETURN c.f1, c.f2`).
+    pub return_fields: Vec<String>,
+}
+
+/// One result from an `OPTIONAL MATCH` clause.
+///
+/// Absent (`None` in [`GraphIrRow::optional`]) when no `c` node was reachable
+/// from the mandatory `b` node under the optional clause's constraints.
+#[derive(Debug, Clone)]
+pub struct GraphIrOptionalMatch {
+    pub object_id: ObjectId,
+    /// Hop depth from the mandatory `b` node to this `c` node.
+    pub depth: usize,
+    /// Projected fields from `RETURN c.f1, c.f2`. Empty when no fields were requested.
+    pub fields: HashMap<String, serde_json::Value>,
+}
+
+/// Aggregation function for a `WITH` aggregation clause.
+///
+/// Used in `WITH count(b) AS cnt` / `WITH sum(b.score) AS s` forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// One aggregation item in a `WITH count(b) AS alias` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithAggregation {
+    pub func: AggFunc,
+    /// Payload field name (`b.field`) for sum/avg/min/max; `None` for `count(b)`.
+    pub field: Option<String>,
+    pub alias: String,
+}
+
+/// The `WITH b` clause between a mandatory MATCH and a subsequent OPTIONAL MATCH
+/// or RETURN.
+///
+/// Two forms:
+/// - **Pass-through** (`WITH b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]`): filters,
+///   sorts, and pages mandatory `b` results before optional expansion. When present,
+///   `RETURN ORDER BY / LIMIT / SKIP` apply to the final expanded rows.
+/// - **Aggregating** (`WITH count(b) AS cnt [, sum(b.score) AS s …]`): collapses all
+///   matched `b` nodes into scalar values via `graph_ir_aggregated`. When
+///   `aggregations` is non-empty the other fields are unused.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrWithClause {
+    /// Additional id predicate on matched `b` nodes, applied after the MATCH.
+    pub end_pred: NodeIdPred,
+    /// Additional payload predicates on `b` nodes (AND-combined), applied after the MATCH.
+    pub payload_preds: Vec<PayloadPred>,
+    /// Sort mandatory `b` results before optional expansion (multi-key, left-to-right priority).
+    pub order_by: Vec<GraphIrOrderBy>,
+    /// Limit applied to mandatory results after ordering (before optional expansion).
+    pub limit: Option<usize>,
+    /// Skip applied to mandatory results after ordering (before optional expansion).
+    pub skip: Option<usize>,
+    /// Aggregation items. Non-empty → aggregating WITH; use `graph_ir_aggregated`.
+    pub aggregations: Vec<WithAggregation>,
+    /// Fields to group by (`b.f1, b.f2` → `["f1", "f2"]`). Non-empty → grouped
+    /// aggregation; each unique combination of values produces a separate row.
+    /// Single-field case is `["field"]`; replaces the former `Option<String>`.
+    pub group_by_fields: Vec<String>,
+    /// When true, duplicate `b` nodes (same `object_id`) are removed before
+    /// ordering and paging.  Parsed from `WITH DISTINCT b …`.
+    pub distinct: bool,
+}
+
+/// One row returned by `graph_ir_projected`.
+///
+/// `fields` contains only the keys requested in `RETURN b.field1, b.field2`.
+/// `edge_fields` contains keys requested in `RETURN r.field1, r.field2`, from
+/// the edge traversed to reach this node; missing fields are `null`.
+/// `path` is populated when `RETURN path` is requested; otherwise empty.
+/// `optional` is populated by an `OPTIONAL MATCH` clause if present.
+#[derive(Debug, Clone)]
+pub struct GraphIrRow {
+    pub object_id: ObjectId,
+    pub depth: usize,
+    pub fields: HashMap<String, serde_json::Value>,
+    /// Fields projected from the via-edge (`RETURN r.field`). Empty when no
+    /// `r.` fields were requested.
+    pub edge_fields: HashMap<String, serde_json::Value>,
+    /// Node IDs from start to this node when `RETURN path` was requested; otherwise empty.
+    /// Length N means N nodes (start inclusive). Parallel to `edge_path`.
+    pub path: Vec<ObjectId>,
+    /// Edge IDs traversed along `path` when `RETURN path` was requested; otherwise empty.
+    /// Length N-1 for a path of N nodes: `edge_path[i]` is the edge from `path[i]` to `path[i+1]`.
+    pub edge_path: Vec<EdgeId>,
+    /// Result of the `OPTIONAL MATCH` clause, if present in the query.
+    pub optional: Option<GraphIrOptionalMatch>,
+}
+
+/// Field to sort graph query results by.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderByField {
+    /// Sort by the matched node's object ID string (lexicographic).
+    ObjectId,
+    /// Sort by the traversal depth (number of hops from start).
+    Depth,
+    /// Sort by a named field extracted from the matched node's JSON payload.
+    PayloadField(String),
+}
+
+/// Sort direction for ORDER BY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderDirection {
+    Asc,
+    Desc,
+}
+
+/// An ORDER BY clause in a graph IR query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrOrderBy {
+    pub field: OrderByField,
+    pub direction: OrderDirection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrQuery {
+    pub start: ObjectId,
+    pub edge_types: Vec<String>,
+    /// Minimum hop depth included in results (1 = include immediate neighbours).
+    pub min_depth: usize,
+    /// Max hops from start (builder max_depth).
+    pub max_depth: usize,
+    pub direction: Direction,
+    pub end_pred: NodeIdPred,
+    /// Payload field predicates applied to matched end nodes.
+    /// Combined according to `pred_combinator`. Empty = no payload filtering.
+    pub payload_preds: Vec<PayloadPred>,
+    /// How `payload_preds` are combined. Defaults to `And`.
+    pub pred_combinator: PayloadPredCombinator,
+    /// Payload field predicates applied to each traversal edge (AND-combined).
+    /// Edges whose payload does not match all predicates are skipped; the BFS
+    /// does not follow them. Empty = no edge filtering.
+    pub edge_preds: Vec<PayloadPred>,
+    /// Fields to project from each matched node's JSON payload (`RETURN b.f1, b.f2`).
+    /// Empty = plain node return via `graph_ir` / `graph_ir_parsed`.
+    pub return_fields: Vec<String>,
+    /// Optional output-key aliases for projected node fields (`RETURN b.name AS n`).
+    /// Key = raw field name, value = alias used in `GraphIrRow::fields`.
+    pub return_field_aliases: HashMap<String, String>,
+    /// Optional string transforms on projected node fields (`RETURN UPPER(b.name)`).
+    /// Key = raw field name, value = transform applied to string values before output.
+    pub return_field_transforms: HashMap<String, ReturnTransform>,
+    /// Fields to project from the via-edge's JSON payload (`RETURN r.f1, r.f2`).
+    /// Empty = no edge projection. Populated into `GraphIrRow::edge_fields`.
+    pub edge_return_fields: Vec<String>,
+    /// When true, `graph_ir_projected` populates `GraphIrRow::path` with the
+    /// sequence of node IDs from the start node to each matched node.
+    pub return_path: bool,
+    /// When true, `graph_ir_projected` adds `"id(b)"` → object_id to each row's `fields`.
+    pub return_id: bool,
+    /// When true, all JSON fields from matched node payload are returned (`RETURN b.*`).
+    pub return_all_fields: bool,
+    /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
+    pub distinct: bool,
+    /// ORDER BY sort keys (multi-key, evaluated left to right). Empty = no sort.
+    pub order_by: Vec<GraphIrOrderBy>,
+    /// Maximum number of results to return (applied after ORDER BY and SKIP).
+    pub limit: Option<usize>,
+    /// Number of results to skip before applying LIMIT (applied after ORDER BY).
+    pub skip: Option<usize>,
+    /// Optional second traversal clause. When present, each mandatory result is
+    /// used as the start node for this clause. Results with no optional match
+    /// are emitted with `GraphIrRow::optional = None`.
+    ///
+    /// When `with_clause` is absent: ORDER BY / LIMIT / SKIP are applied to
+    /// mandatory results before optional expansion (backward compatible).
+    /// When `with_clause` is present: ORDER BY / LIMIT / SKIP are applied to
+    /// the final expanded rows after optional expansion.
+    pub optional_clause: Option<GraphIrOptionalClause>,
+    /// Optional WITH clause. Filters and pages mandatory `b` results before
+    /// they enter optional expansion or RETURN. See [`GraphIrWithClause`].
+    pub with_clause: Option<GraphIrWithClause>,
+    /// Named path variable from `MATCH p = (a)-[r]->(b)`. When set, `RETURN p`
+    /// is equivalent to `RETURN path` and `GraphIrRow::path` is populated.
+    pub path_var: Option<String>,
+}

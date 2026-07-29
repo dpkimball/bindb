@@ -3257,3 +3257,120 @@ fn select_rpad_parses_correctly() {
         Some(SqlFieldTransform::Rpad(10, s)) if s == " "
     ));
 }
+
+// ── REVERSE / INITCAP / REPEAT(PAYLOAD_FIELD) in SELECT tests ───────────────
+
+#[test]
+fn select_reverse_reverses_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srevrs:a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT REVERSE(PAYLOAD_FIELD('word')) FROM 'obs://srevrs'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("word").and_then(|v| v.as_str()), Some("olleh"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_reverse_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT REVERSE(PAYLOAD_FIELD('word')) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("word"),
+        Some(SqlFieldTransform::Reverse)
+    ));
+}
+
+#[test]
+fn select_initcap_capitalises_words() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sicpw:a"), br#"{"title":"hello world"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT INITCAP(PAYLOAD_FIELD('title')) FROM 'obs://sicpw'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("title").and_then(|v| v.as_str()),
+        Some("Hello World")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn select_initcap_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q =
+        SqlProjectQuery::parse("SELECT INITCAP(PAYLOAD_FIELD('title')) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("title"),
+        Some(SqlFieldTransform::InitCap)
+    ));
+}
+
+#[test]
+fn select_repeat_duplicates_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sreps:a"), br#"{"sep":"-"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT REPEAT(PAYLOAD_FIELD('sep'), 3) FROM 'obs://sreps'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("sep").and_then(|v| v.as_str()), Some("---"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_repeat_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q =
+        SqlProjectQuery::parse("SELECT REPEAT(PAYLOAD_FIELD('sep'), 4) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("sep"),
+        Some(SqlFieldTransform::Repeat(4))
+    ));
+}
+
+#[test]
+fn select_repeat_zero_gives_empty_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srep0:a"), br#"{"tag":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT REPEAT(PAYLOAD_FIELD('tag'), 0) FROM 'obs://srep0'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some(""));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_repeat_non_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srepnsp:a"), br#"{"score":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT REPEAT(PAYLOAD_FIELD('score'), 3) FROM 'obs://srepnsp'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(42));
+    store.close().unwrap();
+}

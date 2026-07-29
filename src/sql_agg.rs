@@ -1350,6 +1350,12 @@ pub enum SqlFieldTransform {
     Lpad(usize, String),
     /// `RPAD(PAYLOAD_FIELD('f'), n, 'c')` — right-pad string to width `n` with char `c`.
     Rpad(usize, String),
+    /// `REVERSE(PAYLOAD_FIELD('f'))` — reverse the characters of a string field.
+    Reverse,
+    /// `INITCAP(PAYLOAD_FIELD('f'))` — capitalise the first letter of each whitespace-delimited word.
+    InitCap,
+    /// `REPEAT(PAYLOAD_FIELD('f'), n)` — repeat the string value `n` times.
+    Repeat(usize),
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1655,6 +1661,47 @@ impl SqlProjectQuery {
                 }
                 continue;
             }
+            // Detect REPEAT(PAYLOAD_FIELD('f'), n)
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("REPEAT(PAYLOAD_FIELD(") {
+                let inner = &s["REPEAT(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in REPEAT".into())
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected count after PAYLOAD_FIELD in REPEAT".into(),
+                        )
+                    })?
+                    .trim_start();
+                let paren_end = rest.find(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' to close REPEAT".into())
+                })?;
+                let count: usize = rest[..paren_end].trim().parse().map_err(|_| {
+                    SqlAggError::Unsupported("REPEAT count must be a non-negative integer".into())
+                })?;
+                s = rest[paren_end + 1..].trim_start();
+                field_transforms.insert(field.clone(), SqlFieldTransform::Repeat(count));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
             // Detect COALESCE(PAYLOAD_FIELD('f'), 'fallback') and REPLACE(PAYLOAD_FIELD('f'), 'from', 'to')
             let su = s.to_ascii_uppercase();
             if su.starts_with("COALESCE(PAYLOAD_FIELD(") {
@@ -1781,6 +1828,8 @@ impl SqlProjectQuery {
                 ("CEIL(PAYLOAD_FIELD(", SqlFieldTransform::Ceil),
                 ("FLOOR(PAYLOAD_FIELD(", SqlFieldTransform::Floor),
                 ("LENGTH(PAYLOAD_FIELD(", SqlFieldTransform::Length),
+                ("REVERSE(PAYLOAD_FIELD(", SqlFieldTransform::Reverse),
+                ("INITCAP(PAYLOAD_FIELD(", SqlFieldTransform::InitCap),
             ];
             let transform = transform_prefixes
                 .iter()
@@ -2129,6 +2178,41 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
                     let padding: String = std::iter::repeat_n(pad_char, needed).collect();
                     serde_json::Value::String(format!("{s}{padding}"))
                 }
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Reverse => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(s.chars().rev().collect())
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::InitCap => {
+            if let serde_json::Value::String(s) = val {
+                let result = s
+                    .split_whitespace()
+                    .map(|word| {
+                        let mut chars = word.chars();
+                        match chars.next() {
+                            None => String::new(),
+                            Some(first) => {
+                                first.to_uppercase().collect::<String>()
+                                    + &chars.as_str().to_lowercase()
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                serde_json::Value::String(result)
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Repeat(n) => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::String(s.repeat(*n))
             } else {
                 val
             }
