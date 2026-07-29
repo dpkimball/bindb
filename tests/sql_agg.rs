@@ -4376,3 +4376,202 @@ fn window_with_limit() {
     assert_eq!(rns, vec![1, 2, 3]);
     store.close().unwrap();
 }
+
+// --- LAG / LEAD window functions ---
+
+#[test]
+fn window_lag_basic() {
+    // LAG(score, 1) returns the previous row's score within the global partition ordered by score ASC.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wlag:a"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wlag:b"), br#"{"score":20}"#.to_vec());
+    tx.put_object(oid("obs://wlag:c"), br#"{"score":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score'), \
+             LAG(PAYLOAD_FIELD('score'), 1) OVER (ORDER BY PAYLOAD_FIELD('score') ASC) AS prev \
+             FROM 'obs://wlag'",
+        )
+        .unwrap();
+    // Sort rows by score for deterministic assertions.
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("score").and_then(|v| v.as_i64()).unwrap_or(0));
+
+    assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(10));
+    assert_eq!(rows[0].get("prev"), Some(&serde_json::Value::Null)); // no previous row
+    assert_eq!(rows[1].get("score").and_then(|v| v.as_i64()), Some(20));
+    assert_eq!(rows[1].get("prev").and_then(|v| v.as_i64()), Some(10));
+    assert_eq!(rows[2].get("score").and_then(|v| v.as_i64()), Some(30));
+    assert_eq!(rows[2].get("prev").and_then(|v| v.as_i64()), Some(20));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_lead_basic() {
+    // LEAD(score, 1) returns the next row's score.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wlead:a"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wlead:b"), br#"{"score":20}"#.to_vec());
+    tx.put_object(oid("obs://wlead:c"), br#"{"score":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score'), \
+             LEAD(PAYLOAD_FIELD('score'), 1) OVER (ORDER BY PAYLOAD_FIELD('score') ASC) AS nxt \
+             FROM 'obs://wlead'",
+        )
+        .unwrap();
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("score").and_then(|v| v.as_i64()).unwrap_or(0));
+
+    assert_eq!(rows[0].get("score").and_then(|v| v.as_i64()), Some(10));
+    assert_eq!(rows[0].get("nxt").and_then(|v| v.as_i64()), Some(20));
+    assert_eq!(rows[1].get("score").and_then(|v| v.as_i64()), Some(20));
+    assert_eq!(rows[1].get("nxt").and_then(|v| v.as_i64()), Some(30));
+    assert_eq!(rows[2].get("score").and_then(|v| v.as_i64()), Some(30));
+    assert_eq!(rows[2].get("nxt"), Some(&serde_json::Value::Null)); // no next row
+    store.close().unwrap();
+}
+
+#[test]
+fn window_lag_offset_2() {
+    // LAG with offset=2 skips one row.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for i in 1u64..=4 {
+        tx.put_object(
+            oid(&format!("obs://wlag2:{i}")),
+            format!(r#"{{"n":{i}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('n'), \
+             LAG(PAYLOAD_FIELD('n'), 2) OVER (ORDER BY PAYLOAD_FIELD('n') ASC) AS prev2 \
+             FROM 'obs://wlag2'",
+        )
+        .unwrap();
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("n").and_then(|v| v.as_i64()).unwrap_or(0));
+
+    assert_eq!(rows[0].get("prev2"), Some(&serde_json::Value::Null));
+    assert_eq!(rows[1].get("prev2"), Some(&serde_json::Value::Null));
+    assert_eq!(rows[2].get("prev2").and_then(|v| v.as_i64()), Some(1)); // 3 - 2 = 1
+    assert_eq!(rows[3].get("prev2").and_then(|v| v.as_i64()), Some(2)); // 4 - 2 = 2
+    store.close().unwrap();
+}
+
+#[test]
+fn window_lag_partition_by() {
+    // LAG per partition: two groups (cat A and B); LAG resets at partition boundary.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wlagp:a1"), br#"{"cat":"A","v":1}"#.to_vec());
+    tx.put_object(oid("obs://wlagp:a2"), br#"{"cat":"A","v":2}"#.to_vec());
+    tx.put_object(oid("obs://wlagp:b1"), br#"{"cat":"B","v":10}"#.to_vec());
+    tx.put_object(oid("obs://wlagp:b2"), br#"{"cat":"B","v":20}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('cat'), PAYLOAD_FIELD('v'), \
+             LAG(PAYLOAD_FIELD('v'), 1) OVER (PARTITION BY PAYLOAD_FIELD('cat') ORDER BY PAYLOAD_FIELD('v') ASC) AS prev \
+             FROM 'obs://wlagp'",
+        )
+        .unwrap();
+
+    let get = |cat: &str, v: i64| {
+        rows.iter()
+            .find(|r| {
+                r.get("cat").and_then(|x| x.as_str()) == Some(cat)
+                    && r.get("v").and_then(|x| x.as_i64()) == Some(v)
+            })
+            .map(|r| r.get("prev").cloned().unwrap_or(serde_json::Value::Null))
+            .unwrap()
+    };
+    // First in each partition: no lag.
+    assert_eq!(get("A", 1), serde_json::Value::Null);
+    assert_eq!(get("B", 10), serde_json::Value::Null);
+    // Second in each partition: lag = first value.
+    assert_eq!(get("A", 2).as_i64(), Some(1));
+    assert_eq!(get("B", 20).as_i64(), Some(10));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_lag_lead_combined() {
+    // Both LAG and LEAD in the same SELECT.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wll:a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(oid("obs://wll:b"), br#"{"v":2}"#.to_vec());
+    tx.put_object(oid("obs://wll:c"), br#"{"v":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             LAG(PAYLOAD_FIELD('v'), 1) OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS prev, \
+             LEAD(PAYLOAD_FIELD('v'), 1) OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS nxt \
+             FROM 'obs://wll'",
+        )
+        .unwrap();
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("v").and_then(|v| v.as_i64()).unwrap_or(0));
+
+    // Middle row (v=2): prev=1, next=3.
+    assert_eq!(rows[1].get("prev").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(rows[1].get("nxt").and_then(|v| v.as_i64()), Some(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_lead_different_field() {
+    // LEAD can reference a different field than the one in SELECT.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://wldf:a"),
+        br#"{"rank":1,"name":"alice"}"#.to_vec(),
+    );
+    tx.put_object(oid("obs://wldf:b"), br#"{"rank":2,"name":"bob"}"#.to_vec());
+    tx.put_object(
+        oid("obs://wldf:c"),
+        br#"{"rank":3,"name":"carol"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('rank'), \
+             LEAD(PAYLOAD_FIELD('name'), 1) OVER (ORDER BY PAYLOAD_FIELD('rank') ASC) AS next_name \
+             FROM 'obs://wldf'",
+        )
+        .unwrap();
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("rank").and_then(|v| v.as_i64()).unwrap_or(0));
+
+    assert_eq!(
+        rows[0].get("next_name").and_then(|v| v.as_str()),
+        Some("bob")
+    );
+    assert_eq!(
+        rows[1].get("next_name").and_then(|v| v.as_str()),
+        Some("carol")
+    );
+    assert_eq!(rows[2].get("next_name"), Some(&serde_json::Value::Null));
+    store.close().unwrap();
+}

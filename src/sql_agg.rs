@@ -1425,6 +1425,10 @@ pub enum SqlWindowFunc {
     Rank,
     /// `DENSE_RANK()` — rank without gaps for ties (1, 2, 2, 3).
     DenseRank,
+    /// `LAG(PAYLOAD_FIELD('f'), n)` — payload field value from n rows before in the partition.
+    Lag { field: String, offset: usize },
+    /// `LEAD(PAYLOAD_FIELD('f'), n)` — payload field value from n rows after in the partition.
+    Lead { field: String, offset: usize },
 }
 
 /// A window column: `FUNC() OVER (PARTITION BY … ORDER BY …) AS alias`.
@@ -1528,9 +1532,13 @@ impl SqlProjectQuery {
                 }
                 continue;
             }
-            // Detect window functions: ROW_NUMBER(), RANK(), DENSE_RANK() OVER (...)
+            // Detect window functions: ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() OVER (...)
             let su = s.to_ascii_uppercase();
-            let wf_pair: Option<(SqlWindowFunc, &str)> = if su.starts_with("ROW_NUMBER()") {
+            let wf_pair: Option<(SqlWindowFunc, &str)> = if su.starts_with("LAG(PAYLOAD_FIELD(") {
+                parse_lag_lead_func(true, s)
+            } else if su.starts_with("LEAD(PAYLOAD_FIELD(") {
+                parse_lag_lead_func(false, s)
+            } else if su.starts_with("ROW_NUMBER()") {
                 Some((SqlWindowFunc::RowNumber, &s["ROW_NUMBER()".len()..]))
             } else if su.starts_with("DENSE_RANK()") {
                 Some((SqlWindowFunc::DenseRank, &s["DENSE_RANK()".len()..]))
@@ -1561,10 +1569,12 @@ impl SqlProjectQuery {
                     }
                     (after_as[..alias_end].to_string(), &after_as[alias_end..])
                 } else {
-                    let default = match func {
+                    let default = match &func {
                         SqlWindowFunc::RowNumber => "row_number",
                         SqlWindowFunc::Rank => "rank",
                         SqlWindowFunc::DenseRank => "dense_rank",
+                        SqlWindowFunc::Lag { .. } => "lag",
+                        SqlWindowFunc::Lead { .. } => "lead",
                     };
                     (default.to_string(), after_close)
                 };
@@ -2424,6 +2434,44 @@ impl SqlProjectQuery {
     }
 }
 
+/// Parse `LAG(PAYLOAD_FIELD('f'), n)` or `LEAD(PAYLOAD_FIELD('f'), n)` at the start of `s`.
+/// Returns `Some((func, rest_after_closing_paren))` or `None` on any parse failure.
+fn parse_lag_lead_func(is_lag: bool, s: &str) -> Option<(SqlWindowFunc, &str)> {
+    let after_open = if is_lag {
+        &s["LAG(".len()..]
+    } else {
+        &s["LEAD(".len()..]
+    };
+    let pf_upper = after_open.to_ascii_uppercase();
+    if !pf_upper.starts_with("PAYLOAD_FIELD('") {
+        return None;
+    }
+    let inner = &after_open["PAYLOAD_FIELD('".len()..];
+    let quote_end = inner.find('\'')?;
+    let field = inner[..quote_end].to_string();
+    let after_pf_close = inner[quote_end + 1..].trim_start_matches(')').trim_start();
+    let (offset, after_offset) = if after_pf_close.starts_with(',') {
+        let rest = after_pf_close
+            .strip_prefix(',')
+            .unwrap_or(after_pf_close)
+            .trim_start();
+        let n_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let n: usize = rest[..n_end].parse().unwrap_or(1);
+        (n, rest[n_end..].trim_start())
+    } else {
+        (1usize, after_pf_close)
+    };
+    let after_lag_close = after_offset.trim_start_matches(')');
+    let func = if is_lag {
+        SqlWindowFunc::Lag { field, offset }
+    } else {
+        SqlWindowFunc::Lead { field, offset }
+    };
+    Some((func, after_lag_close))
+}
+
 /// Parse `(PARTITION BY PAYLOAD_FIELD('f'), … ORDER BY PAYLOAD_FIELD('g') ASC|DESC, …)`.
 /// `s` must start with `(`. Returns `(partition_by, order_by, rest_after_close_paren)`.
 fn parse_over_clause(s: &str) -> Result<(Vec<String>, Vec<SqlProjectOrderBy>, &str), SqlAggError> {
@@ -3048,15 +3096,24 @@ impl BinderStore {
             .map(|ob| ob.field.clone())
             .collect();
 
-        // Extra fields needed by window PARTITION BY / ORDER BY but not in SELECT.
+        // Extra fields needed by window PARTITION BY / ORDER BY / LAG/LEAD source but not in SELECT.
         let window_extra_fields: Vec<String> = q
             .window_columns
             .iter()
             .flat_map(|wc| {
-                wc.partition_by
+                let mut extras: Vec<String> = wc
+                    .partition_by
                     .iter()
                     .chain(wc.order_by.iter().map(|ob| &ob.field))
                     .cloned()
+                    .collect();
+                match &wc.func {
+                    SqlWindowFunc::Lag { field, .. } | SqlWindowFunc::Lead { field, .. } => {
+                        extras.push(field.clone());
+                    }
+                    _ => {}
+                }
+                extras
             })
             .filter(|f| !q.fields.contains(f) && !sort_keys_extra.contains(f))
             .collect::<std::collections::HashSet<_>>()
@@ -3160,7 +3217,7 @@ impl BinderStore {
                             .join("\x00")
                     })
                     .collect();
-                match wc.func {
+                match &wc.func {
                     SqlWindowFunc::RowNumber => {
                         for (n, &idx) in sorted.iter().enumerate() {
                             rows[idx].insert(
@@ -3198,6 +3255,41 @@ impl BinderStore {
                                 wc.alias.clone(),
                                 serde_json::Value::Number(cur_rank.into()),
                             );
+                        }
+                    }
+                    SqlWindowFunc::Lag { field, offset } => {
+                        let values: Vec<serde_json::Value> = (0..sorted.len())
+                            .map(|pos| {
+                                if pos >= *offset {
+                                    rows[sorted[pos - *offset]]
+                                        .get(field)
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            })
+                            .collect();
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(wc.alias.clone(), values[pos].clone());
+                        }
+                    }
+                    SqlWindowFunc::Lead { field, offset } => {
+                        let n = sorted.len();
+                        let values: Vec<serde_json::Value> = (0..n)
+                            .map(|pos| {
+                                if pos + *offset < n {
+                                    rows[sorted[pos + *offset]]
+                                        .get(field)
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            })
+                            .collect();
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(wc.alias.clone(), values[pos].clone());
                         }
                     }
                 }
