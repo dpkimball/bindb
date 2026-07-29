@@ -6899,3 +6899,220 @@ fn return_exp_on_string_passes_through() {
     assert_eq!(rows[0].fields["tag"], serde_json::json!("abc"));
     store.close().unwrap();
 }
+
+#[test]
+fn return_log2_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("glog2://hub"), b"{}".to_vec());
+    tx.put_object(obj("glog2://a"), br#"{"n":8}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("glog2_e1"),
+        obj("glog2://hub"),
+        obj("glog2://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'glog2://hub' RETURN LOG2(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - 3.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_log2_non_positive_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("glog2z://hub"), b"{}".to_vec());
+    tx.put_object(obj("glog2z://a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("glog2z_e1"),
+        obj("glog2z://hub"),
+        obj("glog2z://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'glog2z://hub' RETURN LOG2(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["n"], serde_json::json!(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_log10_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("glog10://hub"), b"{}".to_vec());
+    tx.put_object(obj("glog10://a"), br#"{"n":100}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("glog10_e1"),
+        obj("glog10://hub"),
+        obj("glog10://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'glog10://hub' RETURN LOG10(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - 2.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_radians_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("grad://hub"), b"{}".to_vec());
+    tx.put_object(obj("grad://a"), br#"{"deg":180}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("grad_e1"),
+        obj("grad://hub"),
+        obj("grad://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'grad://hub' RETURN RADIANS(b.deg)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["deg"].as_f64().unwrap();
+    assert!((v - std::f64::consts::PI).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_degrees_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gdeg://hub"), b"{}".to_vec());
+    tx.put_object(
+        obj("gdeg://a"),
+        format!(r#"{{"rad":{}}}"#, std::f64::consts::PI).into_bytes(),
+    );
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gdeg_e1"),
+        obj("gdeg://hub"),
+        obj("gdeg://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gdeg://hub' RETURN DEGREES(b.rad)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["rad"].as_f64().unwrap();
+    assert!((v - 180.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_radians_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gradstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gradstr://a"), br#"{"s":"north"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gradstr_e1"),
+        obj("gradstr://hub"),
+        obj("gradstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gradstr://hub' RETURN RADIANS(b.s)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["s"], serde_json::json!("north"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_degrees_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gdegstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gdegstr://a"), br#"{"s":"north"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gdegstr_e1"),
+        obj("gdegstr://hub"),
+        obj("gdegstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gdegstr://hub' RETURN DEGREES(b.s)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["s"], serde_json::json!("north"));
+    store.close().unwrap();
+}

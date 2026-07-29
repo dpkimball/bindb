@@ -141,6 +141,14 @@ pub enum ReturnTransform {
     Log,
     /// `EXP(b.field)` — e raised to the power of a numeric field.
     Exp,
+    /// `LOG2(b.field)` — base-2 logarithm of a positive numeric field.
+    Log2,
+    /// `LOG10(b.field)` — base-10 logarithm of a positive numeric field.
+    Log10,
+    /// `RADIANS(b.field)` — convert a numeric field from degrees to radians.
+    Radians,
+    /// `DEGREES(b.field)` — convert a numeric field from radians to degrees.
+    Degrees,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
