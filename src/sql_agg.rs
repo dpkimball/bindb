@@ -1416,6 +1416,29 @@ pub struct SqlProjectOrderBy {
     pub direction: AggOrderDirection,
 }
 
+/// Window function kind for `OVER (...)` clauses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlWindowFunc {
+    /// `ROW_NUMBER()` — sequential 1-based row number within the partition.
+    RowNumber,
+    /// `RANK()` — rank with gaps for ties (1, 2, 2, 4).
+    Rank,
+    /// `DENSE_RANK()` — rank without gaps for ties (1, 2, 2, 3).
+    DenseRank,
+}
+
+/// A window column: `FUNC() OVER (PARTITION BY … ORDER BY …) AS alias`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlWindowColumn {
+    pub func: SqlWindowFunc,
+    /// Payload field names to partition by (empty = single global partition).
+    pub partition_by: Vec<String>,
+    /// Sort order within each partition for rank/numbering.
+    pub order_by: Vec<SqlProjectOrderBy>,
+    /// Output column name in each result row.
+    pub alias: String,
+}
+
 /// A parsed `SELECT PAYLOAD_FIELD(…) [, …] FROM … [WHERE …] [ORDER BY …] [LIMIT n]` query.
 ///
 /// Returns one row per matching observation; each row holds the projected field
@@ -1453,6 +1476,9 @@ pub struct SqlProjectQuery {
     /// Number of rows to skip before applying LIMIT (applied after ORDER BY).
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+    /// Window function columns (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` OVER clauses).
+    /// Computed against the full filtered result set before OFFSET/LIMIT.
+    pub window_columns: Vec<SqlWindowColumn>,
 }
 
 impl SqlProjectQuery {
@@ -1481,6 +1507,7 @@ impl SqlProjectQuery {
         let mut field_transforms: std::collections::HashMap<String, SqlFieldTransform> =
             std::collections::HashMap::new();
         let mut return_id = false;
+        let mut window_columns: Vec<SqlWindowColumn> = Vec::new();
         loop {
             s = s.trim_start();
             if starts_with_keyword(s, "FROM") {
@@ -1496,6 +1523,58 @@ impl SqlProjectQuery {
                 return_id = true;
                 s = &s[2..];
                 s = s.trim_start();
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect window functions: ROW_NUMBER(), RANK(), DENSE_RANK() OVER (...)
+            let su = s.to_ascii_uppercase();
+            let wf_pair: Option<(SqlWindowFunc, &str)> = if su.starts_with("ROW_NUMBER()") {
+                Some((SqlWindowFunc::RowNumber, &s["ROW_NUMBER()".len()..]))
+            } else if su.starts_with("DENSE_RANK()") {
+                Some((SqlWindowFunc::DenseRank, &s["DENSE_RANK()".len()..]))
+            } else if su.starts_with("RANK()") {
+                Some((SqlWindowFunc::Rank, &s["RANK()".len()..]))
+            } else {
+                None
+            };
+            if let Some((func, after_func)) = wf_pair {
+                let after_func = after_func.trim_start();
+                if !starts_with_keyword(after_func, "OVER") {
+                    return Err(SqlAggError::Unsupported(
+                        "expected OVER after window function".into(),
+                    ));
+                }
+                let after_over = skip_keyword(after_func, "OVER").trim_start();
+                let (partition_by, win_order_by, after_close) = parse_over_clause(after_over)?;
+                let after_close = after_close.trim_start();
+                let (alias, rest_after_alias) = if starts_with_keyword(after_close, "AS") {
+                    let after_as = skip_keyword(after_close, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end == 0 {
+                        return Err(SqlAggError::Unsupported(
+                            "expected alias name after AS in window function".into(),
+                        ));
+                    }
+                    (after_as[..alias_end].to_string(), &after_as[alias_end..])
+                } else {
+                    let default = match func {
+                        SqlWindowFunc::RowNumber => "row_number",
+                        SqlWindowFunc::Rank => "rank",
+                        SqlWindowFunc::DenseRank => "dense_rank",
+                    };
+                    (default.to_string(), after_close)
+                };
+                window_columns.push(SqlWindowColumn {
+                    func,
+                    partition_by,
+                    order_by: win_order_by,
+                    alias,
+                });
+                s = rest_after_alias.trim_start();
                 if s.starts_with(',') {
                     s = &s[1..];
                 }
@@ -2340,8 +2419,130 @@ impl SqlProjectQuery {
             order_by,
             offset,
             limit,
+            window_columns,
         })
     }
+}
+
+/// Parse `(PARTITION BY PAYLOAD_FIELD('f'), … ORDER BY PAYLOAD_FIELD('g') ASC|DESC, …)`.
+/// `s` must start with `(`. Returns `(partition_by, order_by, rest_after_close_paren)`.
+fn parse_over_clause(
+    s: &str,
+) -> Result<(Vec<String>, Vec<SqlProjectOrderBy>, &str), SqlAggError> {
+    let s = s
+        .strip_prefix('(')
+        .ok_or_else(|| SqlAggError::Unsupported("expected '(' after OVER".into()))?;
+    // Find matching ')' with depth counting.
+    let mut depth = 1usize;
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(SqlAggError::Unsupported(
+            "unclosed '(' in OVER clause".into(),
+        ));
+    }
+    let inner = s[..end].trim();
+    let after = &s[end + 1..];
+
+    let mut cur = inner;
+
+    // Optional PARTITION BY clause.
+    let mut partition_by = Vec::new();
+    let cu = cur.to_ascii_uppercase();
+    if cu.starts_with("PARTITION") {
+        cur = skip_keyword(cur, "PARTITION").trim_start();
+        if !starts_with_keyword(cur, "BY") {
+            return Err(SqlAggError::Unsupported(
+                "expected BY after PARTITION".into(),
+            ));
+        }
+        cur = skip_keyword(cur, "BY").trim_start();
+        loop {
+            let cu2 = cur.to_ascii_uppercase();
+            if !cu2.starts_with("PAYLOAD_FIELD(") {
+                break;
+            }
+            let after_pf = &cur["PAYLOAD_FIELD(".len()..];
+            let (f, r) = parse_quoted_sql(after_pf)?;
+            let r = r.trim_start().strip_prefix(')').ok_or_else(|| {
+                SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in PARTITION BY".into())
+            })?;
+            partition_by.push(f);
+            cur = r.trim_start();
+            if cur.starts_with(',') {
+                cur = cur[1..].trim_start();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Optional ORDER BY clause.
+    let mut order_by = Vec::new();
+    let cu = cur.to_ascii_uppercase();
+    if cu.starts_with("ORDER") {
+        cur = skip_keyword(cur, "ORDER").trim_start();
+        if !starts_with_keyword(cur, "BY") {
+            return Err(SqlAggError::Unsupported(
+                "expected BY after ORDER in OVER".into(),
+            ));
+        }
+        cur = skip_keyword(cur, "BY").trim_start();
+        loop {
+            let cu2 = cur.to_ascii_uppercase();
+            if !cu2.starts_with("PAYLOAD_FIELD(") {
+                break;
+            }
+            let after_pf = &cur["PAYLOAD_FIELD(".len()..];
+            let (f, r) = parse_quoted_sql(after_pf)?;
+            let r = r.trim_start().strip_prefix(')').ok_or_else(|| {
+                SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in OVER ORDER BY".into())
+            })?;
+            let r = r.trim_start();
+            let ru = r.to_ascii_uppercase();
+            let (direction, r) = if ru.starts_with("DESC")
+                && !r
+                    .as_bytes()
+                    .get(4)
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+            {
+                (AggOrderDirection::Desc, &r[4..])
+            } else if ru.starts_with("ASC")
+                && !r
+                    .as_bytes()
+                    .get(3)
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+            {
+                (AggOrderDirection::Asc, &r[3..])
+            } else {
+                (AggOrderDirection::Asc, r)
+            };
+            order_by.push(SqlProjectOrderBy {
+                field: f,
+                direction,
+            });
+            cur = r.trim_start();
+            if cur.starts_with(',') {
+                cur = cur[1..].trim_start();
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok((partition_by, order_by, after))
 }
 
 fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> serde_json::Value {
@@ -2849,6 +3050,21 @@ impl BinderStore {
             .map(|ob| ob.field.clone())
             .collect();
 
+        // Extra fields needed by window PARTITION BY / ORDER BY but not in SELECT.
+        let window_extra_fields: Vec<String> = q
+            .window_columns
+            .iter()
+            .flat_map(|wc| {
+                wc.partition_by
+                    .iter()
+                    .chain(wc.order_by.iter().map(|ob| &ob.field))
+                    .cloned()
+            })
+            .filter(|f| !q.fields.contains(f) && !sort_keys_extra.contains(f))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
         let return_id = q.return_id;
         let field_aliases = q.field_aliases.clone();
         let field_transforms = q.field_transforms.clone();
@@ -2880,9 +3096,122 @@ impl BinderStore {
                 for sk in &sort_keys_extra {
                     row.insert(sk.clone(), project_payload_field(v.payload.as_deref(), sk));
                 }
+                for wf in &window_extra_fields {
+                    row.insert(wf.clone(), project_payload_field(v.payload.as_deref(), wf));
+                }
                 row
             })
             .collect();
+
+        // Window function computation on the full filtered result set.
+        for wc in &q.window_columns {
+            // Group row indices by partition key.
+            let mut partitions: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, row) in rows.iter().enumerate() {
+                let pk = wc
+                    .partition_by
+                    .iter()
+                    .map(|f| {
+                        row.get(f)
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "null".to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\x00");
+                partitions.entry(pk).or_default().push(i);
+            }
+            for indices in partitions.values() {
+                // Sort partition indices by window ORDER BY.
+                let mut sorted: Vec<usize> = indices.clone();
+                sorted.sort_by(|&ai, &bi| {
+                    for ob in &wc.order_by {
+                        let av = rows[ai]
+                            .get(&ob.field)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let bv = rows[bi]
+                            .get(&ob.field)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let ord = compare_json_for_sort(&av, &bv);
+                        let ord = if ob.direction == AggOrderDirection::Desc {
+                            ord.reverse()
+                        } else {
+                            ord
+                        };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                // Pre-compute order keys for tie detection in RANK/DENSE_RANK.
+                let order_keys: Vec<String> = sorted
+                    .iter()
+                    .map(|&idx| {
+                        wc.order_by
+                            .iter()
+                            .map(|ob| {
+                                rows[idx]
+                                    .get(&ob.field)
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "null".to_string())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\x00")
+                    })
+                    .collect();
+                match wc.func {
+                    SqlWindowFunc::RowNumber => {
+                        for (n, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(
+                                wc.alias.clone(),
+                                serde_json::Value::Number((n + 1).into()),
+                            );
+                        }
+                    }
+                    SqlWindowFunc::Rank => {
+                        let mut cur_rank = 1usize;
+                        let mut gap = 0usize;
+                        for (pos, (&idx, key)) in sorted.iter().zip(order_keys.iter()).enumerate() {
+                            if pos == 0 {
+                                cur_rank = 1;
+                                gap = 0;
+                            } else if key == &order_keys[pos - 1] {
+                                gap += 1;
+                            } else {
+                                cur_rank += 1 + gap;
+                                gap = 0;
+                            }
+                            rows[idx].insert(
+                                wc.alias.clone(),
+                                serde_json::Value::Number(cur_rank.into()),
+                            );
+                        }
+                    }
+                    SqlWindowFunc::DenseRank => {
+                        let mut cur_rank = 1usize;
+                        for (pos, (&idx, key)) in sorted.iter().zip(order_keys.iter()).enumerate() {
+                            if pos > 0 && key != &order_keys[pos - 1] {
+                                cur_rank += 1;
+                            }
+                            rows[idx].insert(
+                                wc.alias.clone(),
+                                serde_json::Value::Number(cur_rank.into()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove temporary window extra fields.
+        for wf in &window_extra_fields {
+            for row in &mut rows {
+                row.remove(wf);
+            }
+        }
 
         if !q.order_by.is_empty() {
             rows.sort_by(|a, b| {
