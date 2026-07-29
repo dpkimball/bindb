@@ -113,6 +113,8 @@ pub enum NodeIdPred {
     Equals(String),
     /// `id(b) IN ['x://a', 'x://b']` — matches any of the listed full object IDs.
     InList(Vec<String>),
+    /// `id(b) NOT IN ['x://a', 'x://b']` — excludes any of the listed full object IDs.
+    NotInList(Vec<String>),
 }
 
 /// Comparison operator for payload field predicates.
@@ -159,6 +161,14 @@ pub enum CmpValue {
     NumberList(Vec<f64>),
     /// Inclusive numeric range for BETWEEN.
     NumberRange(f64, f64),
+}
+
+/// String transform applied to a projected node field in `RETURN UPPER(b.field)` etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnTransform {
+    Upper,
+    Lower,
+    Trim,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -340,6 +350,9 @@ pub struct GraphIrQuery {
     /// Optional output-key aliases for projected node fields (`RETURN b.name AS n`).
     /// Key = raw field name, value = alias used in `GraphIrRow::fields`.
     pub return_field_aliases: HashMap<String, String>,
+    /// Optional string transforms on projected node fields (`RETURN UPPER(b.name)`).
+    /// Key = raw field name, value = transform applied to string values before output.
+    pub return_field_transforms: HashMap<String, ReturnTransform>,
     /// Fields to project from the via-edge's JSON payload (`RETURN r.f1, r.f2`).
     /// Empty = no edge projection. Populated into `GraphIrRow::edge_fields`.
     pub edge_return_fields: Vec<String>,
@@ -548,6 +561,7 @@ impl GraphIrQuery {
         let (
             return_fields,
             return_field_aliases,
+            return_field_transforms,
             edge_return_fields,
             c_return_fields,
             return_path,
@@ -573,6 +587,7 @@ impl GraphIrQuery {
             edge_preds,
             return_fields,
             return_field_aliases,
+            return_field_transforms,
             return_all_fields,
             edge_return_fields,
             return_path,
@@ -1074,13 +1089,17 @@ fn parse_end_pred_for_var<'a>(
     } else if let Some(after_eq) = after.strip_prefix('=') {
         let (val, rest) = parse_quoted(after_eq.trim_start())?;
         Ok((NodeIdPred::Equals(val), rest))
+    } else if starts_with_keyword(after, "NOT IN") {
+        let after_kw = skip_keyword(after, "NOT IN").trim_start();
+        let (items, rest) = parse_string_list(after_kw)?;
+        Ok((NodeIdPred::NotInList(items), rest))
     } else if starts_with_keyword(after, "IN") {
         let after_kw = skip_keyword(after, "IN").trim_start();
         let (items, rest) = parse_string_list(after_kw)?;
         Ok((NodeIdPred::InList(items), rest))
     } else {
         Err(GraphIrError::Unsupported(format!(
-            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, = or IN"
+            "expected id({var}) STARTS WITH, ENDS WITH, CONTAINS, =, IN or NOT IN"
         )))
     }
 }
@@ -1516,6 +1535,18 @@ fn parse_usize_literal(s: &str) -> Result<(usize, &str), GraphIrError> {
 
 /// Evaluate a payload predicate against raw payload bytes.
 /// Returns false if the payload is not valid UTF-8 JSON or lacks the field.
+/// Apply a `ReturnTransform` to a JSON value. Only `String` values are affected.
+fn apply_return_transform(val: serde_json::Value, t: ReturnTransform) -> serde_json::Value {
+    match val {
+        serde_json::Value::String(s) => serde_json::Value::String(match t {
+            ReturnTransform::Upper => s.to_uppercase(),
+            ReturnTransform::Lower => s.to_lowercase(),
+            ReturnTransform::Trim => s.trim().to_string(),
+        }),
+        other => other,
+    }
+}
+
 /// Match `text` against a SQL LIKE pattern. `%` matches any sequence; `_` matches one char.
 fn like_match(text: &str, pattern: &str) -> bool {
     // dp[i][j] = text[..i] matches pattern[..j]
@@ -1716,6 +1747,10 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
             let ids = ids.clone();
             builder.filter_node(move |obj| ids.contains(&obj.object_id.0))
         }
+        NodeIdPred::NotInList(ids) => {
+            let ids = ids.clone();
+            builder.filter_node(move |obj| !ids.contains(&obj.object_id.0))
+        }
     };
 
     if !q.payload_preds.is_empty() {
@@ -1753,10 +1788,11 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 /// - `c_fields`: fields projected from the optional `c` node (`RETURN c.f1`)
 /// - `return_path`: true when `path` appears in the RETURN list, or the named path variable does
 ///
-/// `(b_fields, b_aliases, r_fields, c_fields, return_path, return_id, return_all_fields)`
+/// `(b_fields, b_aliases, b_transforms, r_fields, c_fields, return_path, return_id, return_all_fields)`
 type ReturnSpec = (
     Vec<String>,
     HashMap<String, String>,
+    HashMap<String, ReturnTransform>,
     Vec<String>,
     Vec<String>,
     bool,
@@ -1764,14 +1800,49 @@ type ReturnSpec = (
     bool,
 );
 
+/// Detect `UPPER(b.field)`, `LOWER(b.field)`, `TRIM(b.field)` in a RETURN selector.
+/// Returns `(field_name, transform)` if recognized, otherwise `None`.
+fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
+    let su = s.to_ascii_uppercase();
+    let (transform, inner) = if su.starts_with("UPPER(") && s.ends_with(')') {
+        (ReturnTransform::Upper, &s["UPPER(".len()..s.len() - 1])
+    } else if su.starts_with("LOWER(") && s.ends_with(')') {
+        (ReturnTransform::Lower, &s["LOWER(".len()..s.len() - 1])
+    } else if su.starts_with("TRIM(") && s.ends_with(')') {
+        (ReturnTransform::Trim, &s["TRIM(".len()..s.len() - 1])
+    } else {
+        return None;
+    };
+    // inner must be b.fieldname
+    let field = inner
+        .strip_prefix("b.")
+        .or_else(|| inner.strip_prefix("B."))?;
+    let field = field.trim().to_string();
+    if field.is_empty() {
+        None
+    } else {
+        Some((field, transform))
+    }
+}
+
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
 fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let s = s.trim();
     if s.is_empty() {
-        return (vec![], HashMap::new(), vec![], vec![], false, false, false);
+        return (
+            vec![],
+            HashMap::new(),
+            HashMap::new(),
+            vec![],
+            vec![],
+            false,
+            false,
+            false,
+        );
     }
     let mut b_fields = Vec::new();
     let mut b_aliases: HashMap<String, String> = HashMap::new();
+    let mut b_transforms: HashMap<String, ReturnTransform> = HashMap::new();
     let mut r_fields = Vec::new();
     let mut c_fields = Vec::new();
     let mut return_path = false;
@@ -1793,6 +1864,13 @@ fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
             return_id = true;
         } else if selector.eq_ignore_ascii_case("b.*") {
             return_all_fields = true;
+        } else if let Some((field, transform)) = parse_return_transform(selector) {
+            // UPPER(b.field) / LOWER(b.field) / TRIM(b.field)
+            b_transforms.insert(field.clone(), transform);
+            if let Some(a) = alias {
+                b_aliases.insert(field.clone(), a);
+            }
+            b_fields.push(field);
         } else if let Some(field) = selector
             .strip_prefix("b.")
             .or_else(|| selector.strip_prefix("B."))
@@ -1826,6 +1904,7 @@ fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     (
         b_fields,
         b_aliases,
+        b_transforms,
         r_fields,
         c_fields,
         return_path,
@@ -1983,13 +2062,18 @@ impl BinderStore {
                     if let Ok(text) = std::str::from_utf8(payload) {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
                             for key in &q.return_fields {
-                                if let Some(val) = v.get(key) {
+                                if let Some(raw_val) = v.get(key) {
                                     let out_key = q
                                         .return_field_aliases
                                         .get(key)
                                         .cloned()
                                         .unwrap_or_else(|| key.clone());
-                                    b_fields.insert(out_key, val.clone());
+                                    let val = if let Some(t) = q.return_field_transforms.get(key) {
+                                        apply_return_transform(raw_val.clone(), *t)
+                                    } else {
+                                        raw_val.clone()
+                                    };
+                                    b_fields.insert(out_key, val);
                                 }
                             }
                         }
@@ -2099,6 +2183,9 @@ fn apply_with_clause(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWithClause)
         }
         NodeIdPred::InList(ids) => {
             matches.retain(|m| ids.iter().any(|id| m.object.object_id.0 == id.as_str()));
+        }
+        NodeIdPred::NotInList(ids) => {
+            matches.retain(|m| ids.iter().all(|id| m.object.object_id.0 != id.as_str()));
         }
     }
     if !wc.payload_preds.is_empty() {
@@ -2215,6 +2302,10 @@ fn execute_optional_clause(
             let ids = ids.clone();
             builder.filter_node(move |obj| ids.contains(&obj.object_id.0))
         }
+        NodeIdPred::NotInList(ids) => {
+            let ids = ids.clone();
+            builder.filter_node(move |obj| !ids.contains(&obj.object_id.0))
+        }
     };
 
     if !clause.payload_preds.is_empty() {
@@ -2279,6 +2370,9 @@ fn apply_with_clause_filter(matches: &mut Vec<GraphQueryMatch>, wc: &GraphIrWith
         }
         NodeIdPred::InList(ids) => {
             matches.retain(|m| ids.iter().any(|id| m.object.object_id.0 == id.as_str()));
+        }
+        NodeIdPred::NotInList(ids) => {
+            matches.retain(|m| ids.iter().all(|id| m.object.object_id.0 != id.as_str()));
         }
     }
     if !wc.payload_preds.is_empty() {
