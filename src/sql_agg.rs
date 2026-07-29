@@ -69,6 +69,8 @@ pub enum SqlIdFilter {
     Equals(String),
     /// `WHERE id IN ('a', 'b', 'c')` — matches any of the listed suffixes
     In(Vec<String>),
+    /// `WHERE id NOT IN ('a', 'b', 'c')` — must not match any of the listed suffixes
+    NotIn(Vec<String>),
 }
 
 /// Comparison operator for a HAVING clause.
@@ -385,6 +387,10 @@ fn parse_where_id_filter(s: &str) -> Result<(SqlIdFilter, &str), SqlAggError> {
         let after_kw = skip_keyword(after_id, "CONTAINS");
         let (val, rest) = parse_quoted(after_kw)?;
         Ok((SqlIdFilter::Contains(val), rest.trim_start()))
+    } else if starts_with_keyword(after_id, "NOT IN") {
+        let after_kw = skip_keyword(after_id, "NOT IN").trim_start();
+        let (vals, rest) = parse_quoted_list(after_kw)?;
+        Ok((SqlIdFilter::NotIn(vals), rest.trim_start()))
     } else if starts_with_keyword(after_id, "IN") {
         let after_kw = skip_keyword(after_id, "IN").trim_start();
         let (vals, rest) = parse_quoted_list(after_kw)?;
@@ -414,6 +420,39 @@ fn parse_quoted_list(s: &str) -> Result<(Vec<String>, &str), SqlAggError> {
         let (val, after) = parse_quoted(rest)?;
         vals.push(val);
         rest = after.trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+        }
+    }
+}
+
+/// Parse a parenthesised numeric list: `(1.0, 2.5, 3)`.
+fn parse_paren_numeric_list(s: &str) -> Result<(Vec<f64>, &str), SqlAggError> {
+    let s = s.trim_start();
+    let inner = s
+        .strip_prefix('(')
+        .ok_or_else(|| SqlAggError::Unsupported("expected '(' before numeric IN list".into()))?;
+    let mut nums = Vec::new();
+    let mut rest = inner.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix(')') {
+            return Ok((nums, after));
+        }
+        let end = rest
+            .find(|c: char| {
+                !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E'
+            })
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return Err(SqlAggError::Unsupported(
+                "expected number in numeric IN list".into(),
+            ));
+        }
+        let n: f64 = rest[..end]
+            .parse()
+            .map_err(|_| SqlAggError::Unsupported("invalid number in numeric IN list".into()))?;
+        nums.push(n);
+        rest = rest[end..].trim_start();
         if rest.starts_with(',') {
             rest = rest[1..].trim_start();
         }
@@ -656,6 +695,23 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
         ));
     } else if starts_with_keyword(after_close, "NOT IN") {
         let after_op = skip_keyword(after_close, "NOT IN").trim_start();
+        // Auto-detect numeric vs string list by peeking at first non-paren char.
+        let peek = after_op
+            .trim_start()
+            .strip_prefix('(')
+            .map(|s| s.trim_start().chars().next().unwrap_or(' '))
+            .unwrap_or(' ');
+        if peek.is_ascii_digit() || peek == '-' || peek == '+' {
+            let (nums, rest2) = parse_paren_numeric_list(after_op)?;
+            return Ok((
+                SqlPayloadFilter {
+                    field,
+                    op: SqlPayloadOp::NotIn,
+                    value: SqlPayloadValue::NumList(nums),
+                },
+                rest2.trim_start(),
+            ));
+        }
         let (items, rest2) = parse_quoted_list(after_op)?;
         return Ok((
             SqlPayloadFilter {
@@ -667,6 +723,23 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
         ));
     } else if starts_with_keyword(after_close, "IN") {
         let after_op = skip_keyword(after_close, "IN").trim_start();
+        // Auto-detect numeric vs string list.
+        let peek = after_op
+            .trim_start()
+            .strip_prefix('(')
+            .map(|s| s.trim_start().chars().next().unwrap_or(' '))
+            .unwrap_or(' ');
+        if peek.is_ascii_digit() || peek == '-' || peek == '+' {
+            let (nums, rest2) = parse_paren_numeric_list(after_op)?;
+            return Ok((
+                SqlPayloadFilter {
+                    field,
+                    op: SqlPayloadOp::In,
+                    value: SqlPayloadValue::NumList(nums),
+                },
+                rest2.trim_start(),
+            ));
+        }
         let (items, rest2) = parse_quoted_list(after_op)?;
         return Ok((
             SqlPayloadFilter {
@@ -956,6 +1029,24 @@ fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bo
                         _ => false,
                     }
                 }
+                SqlPayloadValue::NumList(nums) => {
+                    let field_num = match &field_val {
+                        serde_json::Value::Number(num) => match num.as_f64() {
+                            Some(f) => f,
+                            None => return false,
+                        },
+                        _ => return false,
+                    };
+                    match filter.op {
+                        SqlPayloadOp::In => {
+                            nums.iter().any(|n| (field_num - n).abs() < f64::EPSILON)
+                        }
+                        SqlPayloadOp::NotIn => {
+                            nums.iter().all(|n| (field_num - n).abs() >= f64::EPSILON)
+                        }
+                        _ => false,
+                    }
+                }
                 SqlPayloadValue::Null => false,
             }
         }
@@ -1039,6 +1130,7 @@ impl BinderStore {
                         SqlIdFilter::Contains(s) => id.contains(s.as_str()),
                         SqlIdFilter::Equals(s) => id == s.as_str(),
                         SqlIdFilter::In(vs) => vs.iter().any(|s| id == s.as_str()),
+                        SqlIdFilter::NotIn(vs) => vs.iter().all(|s| id != s.as_str()),
                     };
                     if !id_ok {
                         return false;
@@ -1203,6 +1295,8 @@ pub enum SqlPayloadValue {
     NumRange(f64, f64),
     /// String list for `IN` / `NOT IN`.
     StrList(Vec<String>),
+    /// Numeric list for `IN` / `NOT IN` with numbers.
+    NumList(Vec<f64>),
 }
 
 /// How multiple `payload_filters` are combined.
@@ -1592,6 +1686,7 @@ impl BinderStore {
                     SqlIdFilter::Contains(s) => id.contains(s.as_str()),
                     SqlIdFilter::Equals(s) => id == s.as_str(),
                     SqlIdFilter::In(vs) => vs.iter().any(|s| id == s.as_str()),
+                    SqlIdFilter::NotIn(vs) => vs.iter().all(|s| id != s.as_str()),
                 };
                 if !ok {
                     return false;
