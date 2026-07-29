@@ -2270,3 +2270,198 @@ fn uuid() -> String {
         .subsec_nanos()
         .to_string()
 }
+
+// ── ILIKE tests ───────────────────────────────────────────────────────────────
+
+#[test]
+fn sql_ilike_matches_case_insensitively() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ilk:a"), br#"{"name":"Alice"}"#.to_vec());
+    tx.put_object(oid("obs://ilk:b"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(oid("obs://ilk:c"), br#"{"name":"ALICE"}"#.to_vec());
+    tx.put_object(oid("obs://ilk:d"), br#"{"name":"Bob"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://ilk' WHERE PAYLOAD_FIELD('name') ILIKE 'alice'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_ilike_wildcard() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ilk2:a"), br#"{"city":"New York"}"#.to_vec());
+    tx.put_object(oid("obs://ilk2:b"), br#"{"city":"new york"}"#.to_vec());
+    tx.put_object(oid("obs://ilk2:c"), br#"{"city":"Newark"}"#.to_vec());
+    tx.put_object(oid("obs://ilk2:d"), br#"{"city":"Boston"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('city') FROM 'obs://ilk2' WHERE PAYLOAD_FIELD('city') ILIKE 'new%'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_not_ilike_excludes_matching() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nilk:a"), br#"{"role":"Admin"}"#.to_vec());
+    tx.put_object(oid("obs://nilk:b"), br#"{"role":"admin"}"#.to_vec());
+    tx.put_object(oid("obs://nilk:c"), br#"{"role":"user"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('role') FROM 'obs://nilk' WHERE PAYLOAD_FIELD('role') NOT ILIKE 'admin'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("role").and_then(|v| v.as_str()), Some("user"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_ilike_in_aggregate_where() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://ilk3:a"),
+        br#"{"tag":"Alpha","val":1.0}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://ilk3:b"),
+        br#"{"tag":"alpha","val":2.0}"#.to_vec(),
+    );
+    tx.put_object(oid("obs://ilk3:c"), br#"{"tag":"beta","val":3.0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let result = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://ilk3' WHERE PAYLOAD_FIELD('tag') ILIKE 'alpha'")
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].count, 2);
+    store.close().unwrap();
+}
+
+// ── Multi-condition HAVING tests ──────────────────────────────────────────────
+
+#[test]
+fn having_and_two_conditions() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    // group A: 3 items
+    for i in 0..3 {
+        tx.put_object(
+            oid(&format!("obs://hav:a{i}")),
+            format!(r#"{{"g":"A","v":{}}}"#, i as f64 + 1.0).into_bytes(),
+        );
+    }
+    // group B: 1 item
+    tx.put_object(oid("obs://hav:b0"), br#"{"g":"B","v":10.0}"#.to_vec());
+    // group C: 5 items
+    for i in 0..5 {
+        tx.put_object(
+            oid(&format!("obs://hav:c{i}")),
+            format!(r#"{{"g":"C","v":{}}}"#, i as f64 + 1.0).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    // HAVING COUNT(*) >= 2 AND COUNT(*) <= 4 → only group A (3)
+    let result = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://hav' GROUP BY PAYLOAD_FIELD('g') HAVING COUNT(*) >= 2 AND COUNT(*) <= 4",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].group_key.as_deref(), Some("A"));
+    store.close().unwrap();
+}
+
+#[test]
+fn having_or_two_conditions() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for i in 0..2 {
+        tx.put_object(oid(&format!("obs://hav2:a{i}")), br#"{"g":"A"}"#.to_vec());
+    }
+    for i in 0..4 {
+        tx.put_object(oid(&format!("obs://hav2:b{i}")), br#"{"g":"B"}"#.to_vec());
+    }
+    for i in 0..3 {
+        tx.put_object(oid(&format!("obs://hav2:c{i}")), br#"{"g":"C"}"#.to_vec());
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    // HAVING COUNT(*) = 2 OR COUNT(*) = 4 → groups A and B
+    let result = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://hav2' GROUP BY PAYLOAD_FIELD('g') HAVING COUNT(*) = 2 OR COUNT(*) = 4",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 2);
+    let keys: Vec<_> = result
+        .iter()
+        .map(|r| r.group_key.as_deref().unwrap_or(""))
+        .collect();
+    assert!(keys.contains(&"A"));
+    assert!(keys.contains(&"B"));
+    store.close().unwrap();
+}
+
+#[test]
+fn having_single_condition_still_works() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for i in 0..3 {
+        tx.put_object(oid(&format!("obs://hav3:a{i}")), br#"{"g":"A"}"#.to_vec());
+    }
+    tx.put_object(oid("obs://hav3:b0"), br#"{"g":"B"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let result = store
+        .sql_aggregate(
+            "SELECT COUNT(*) FROM 'obs://hav3' GROUP BY PAYLOAD_FIELD('g') HAVING COUNT(*) > 1",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].group_key.as_deref(), Some("A"));
+    store.close().unwrap();
+}
+
+#[test]
+fn having_and_parse_stores_combinator() {
+    let q = bindb::SqlAggregateQuery::parse(
+        "SELECT COUNT(*) FROM 'obs://x' GROUP BY PAYLOAD_FIELD('g') HAVING COUNT(*) > 1 AND COUNT(*) < 10",
+    )
+    .unwrap();
+    assert_eq!(q.having.len(), 2);
+    assert_eq!(q.having_combinator, bindb::SqlFilterCombinator::And);
+}
+
+#[test]
+fn having_or_parse_stores_combinator() {
+    let q = bindb::SqlAggregateQuery::parse(
+        "SELECT COUNT(*) FROM 'obs://x' GROUP BY PAYLOAD_FIELD('g') HAVING COUNT(*) = 1 OR COUNT(*) = 5",
+    )
+    .unwrap();
+    assert_eq!(q.having.len(), 2);
+    assert_eq!(q.having_combinator, bindb::SqlFilterCombinator::Or);
+}

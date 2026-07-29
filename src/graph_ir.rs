@@ -142,6 +142,8 @@ pub enum CmpOp {
     Between,
     /// `b.field LIKE 'pat%tern'` — SQL wildcard: `%` = any chars, `_` = one char
     Like,
+    /// `b.field ILIKE 'pat%tern'` — case-insensitive SQL wildcard
+    ILike,
 }
 
 /// Right-hand side of a payload predicate.
@@ -346,6 +348,8 @@ pub struct GraphIrQuery {
     pub return_path: bool,
     /// When true, `graph_ir_projected` adds `"id(b)"` → object_id to each row's `fields`.
     pub return_id: bool,
+    /// When true, all JSON fields from matched node payload are returned (`RETURN b.*`).
+    pub return_all_fields: bool,
     /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
     pub distinct: bool,
     /// Optional ORDER BY clause applied after min-depth filtering.
@@ -548,6 +552,7 @@ impl GraphIrQuery {
             c_return_fields,
             return_path,
             return_id,
+            return_all_fields,
         ) = parse_return_spec(ret_spec, path_var.as_deref());
         let (order_by, limit, skip) = parse_ordering_tail(ordering_tail)?;
 
@@ -568,6 +573,7 @@ impl GraphIrQuery {
             edge_preds,
             return_fields,
             return_field_aliases,
+            return_all_fields,
             edge_return_fields,
             return_path,
             return_id,
@@ -913,9 +919,30 @@ fn parse_payload_pred_inner<'a>(
         ));
     }
 
-    // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS, LIKE) before symbols
-    // NOT LIKE must come before LIKE to avoid ambiguity.
-    let (op, rest) = if starts_with_keyword(rest, "NOT LIKE") {
+    // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS, LIKE, ILIKE) before symbols.
+    // NOT ILIKE / NOT LIKE must come before ILIKE / LIKE to avoid ambiguity.
+    let (op, rest) = if starts_with_keyword(rest, "NOT ILIKE") {
+        return {
+            let r = skip_keyword(rest, "NOT ILIKE").trim_start();
+            let (value, rest) = if r.starts_with('\'') || r.starts_with('"') {
+                let (s, r2) = parse_quoted(r)?;
+                (CmpValue::Text(s), r2)
+            } else {
+                return Err(GraphIrError::Unsupported(
+                    "NOT ILIKE requires a quoted string pattern".into(),
+                ));
+            };
+            Ok((
+                PayloadPred {
+                    field,
+                    op: CmpOp::ILike,
+                    value,
+                    negated: true,
+                },
+                rest.trim_start(),
+            ))
+        };
+    } else if starts_with_keyword(rest, "NOT LIKE") {
         return {
             let r = skip_keyword(rest, "NOT LIKE").trim_start();
             let (value, rest) = if r.starts_with('\'') || r.starts_with('"') {
@@ -936,6 +963,8 @@ fn parse_payload_pred_inner<'a>(
                 rest.trim_start(),
             ))
         };
+    } else if starts_with_keyword(rest, "ILIKE") {
+        (CmpOp::ILike, skip_keyword(rest, "ILIKE").trim_start())
     } else if starts_with_keyword(rest, "LIKE") {
         (CmpOp::Like, skip_keyword(rest, "LIKE").trim_start())
     } else if starts_with_keyword(rest, "STARTS WITH") {
@@ -1560,8 +1589,8 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
                 // Already handled above
                 CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
-                // IN/NOT IN handled via StringList arm; Between via NumberRange; Like on text only
-                CmpOp::In | CmpOp::NotIn | CmpOp::Between | CmpOp::Like => false,
+                // IN/NOT IN handled via StringList arm; Between via NumberRange; Like/ILike on text only
+                CmpOp::In | CmpOp::NotIn | CmpOp::Between | CmpOp::Like | CmpOp::ILike => false,
             }
         }
         CmpValue::NumberRange(lo, hi) => {
@@ -1597,6 +1626,7 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 // BETWEEN on a text field never matches
                 CmpOp::Between => false,
                 CmpOp::Like => like_match(lhs, rhs.as_str()),
+                CmpOp::ILike => like_match(&lhs.to_lowercase(), &rhs.to_lowercase()),
             }
         }
         CmpValue::Null => false,
@@ -1723,12 +1753,13 @@ fn build_graph_query<'a>(store: &'a BinderStore, q: &GraphIrQuery) -> GraphQuery
 /// - `c_fields`: fields projected from the optional `c` node (`RETURN c.f1`)
 /// - `return_path`: true when `path` appears in the RETURN list, or the named path variable does
 ///
-/// `(b_fields, b_aliases, r_fields, c_fields, return_path, return_id)`
+/// `(b_fields, b_aliases, r_fields, c_fields, return_path, return_id, return_all_fields)`
 type ReturnSpec = (
     Vec<String>,
     HashMap<String, String>,
     Vec<String>,
     Vec<String>,
+    bool,
     bool,
     bool,
 );
@@ -1737,7 +1768,7 @@ type ReturnSpec = (
 fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let s = s.trim();
     if s.is_empty() {
-        return (vec![], HashMap::new(), vec![], vec![], false, false);
+        return (vec![], HashMap::new(), vec![], vec![], false, false, false);
     }
     let mut b_fields = Vec::new();
     let mut b_aliases: HashMap<String, String> = HashMap::new();
@@ -1745,6 +1776,7 @@ fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let mut c_fields = Vec::new();
     let mut return_path = false;
     let mut return_id = false;
+    let mut return_all_fields = false;
     for part in s.split(',') {
         let p = part.trim();
         // Detect optional `AS alias` suffix (e.g. `b.name AS n`).
@@ -1759,6 +1791,8 @@ fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
             return_path = true;
         } else if selector.eq_ignore_ascii_case("id(b)") || selector.eq_ignore_ascii_case("id(a)") {
             return_id = true;
+        } else if selector.eq_ignore_ascii_case("b.*") {
+            return_all_fields = true;
         } else if let Some(field) = selector
             .strip_prefix("b.")
             .or_else(|| selector.strip_prefix("B."))
@@ -1796,6 +1830,7 @@ fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
         c_fields,
         return_path,
         return_id,
+        return_all_fields,
     )
 }
 
@@ -1931,7 +1966,19 @@ impl BinderStore {
 
         for m in matches {
             let mut b_fields = HashMap::new();
-            if !q.return_fields.is_empty() {
+            if q.return_all_fields {
+                if let Some(payload) = m.object.payload.as_deref() {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                            if let Some(obj) = v.as_object() {
+                                for (key, val) in obj {
+                                    b_fields.insert(key.clone(), val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if !q.return_fields.is_empty() {
                 if let Some(payload) = m.object.payload.as_deref() {
                     if let Ok(text) = std::str::from_utf8(payload) {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
