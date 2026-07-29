@@ -1534,8 +1534,12 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         ("SQRT(", ReturnTransform::Sqrt),
         ("LTRIM(", ReturnTransform::Ltrim),
         ("RTRIM(", ReturnTransform::Rtrim),
+        ("LOG2(", ReturnTransform::Log2),
+        ("LOG10(", ReturnTransform::Log10),
         ("LOG(", ReturnTransform::Log),
         ("EXP(", ReturnTransform::Exp),
+        ("RADIANS(", ReturnTransform::Radians),
+        ("DEGREES(", ReturnTransform::Degrees),
     ];
     let found = prefixes
         .iter()

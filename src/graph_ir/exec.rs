@@ -308,6 +308,46 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             val
         }
+        ReturnTransform::Log2 => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.log2()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Log10 => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.log10()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Radians => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.to_radians()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Degrees => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.to_degrees()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
     }
 }
 

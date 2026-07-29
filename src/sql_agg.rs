@@ -1380,6 +1380,14 @@ pub enum SqlFieldTransform {
     Log,
     /// `EXP(PAYLOAD_FIELD('f'))` — e raised to the power of a numeric field.
     Exp,
+    /// `LOG2(PAYLOAD_FIELD('f'))` — base-2 logarithm of a positive numeric field.
+    Log2,
+    /// `LOG10(PAYLOAD_FIELD('f'))` — base-10 logarithm of a positive numeric field.
+    Log10,
+    /// `RADIANS(PAYLOAD_FIELD('f'))` — convert a numeric field from degrees to radians.
+    Radians,
+    /// `DEGREES(PAYLOAD_FIELD('f'))` — convert a numeric field from radians to degrees.
+    Degrees,
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -2104,8 +2112,12 @@ impl SqlProjectQuery {
                 ("SQRT(PAYLOAD_FIELD(", SqlFieldTransform::Sqrt),
                 ("LTRIM(PAYLOAD_FIELD(", SqlFieldTransform::Ltrim),
                 ("RTRIM(PAYLOAD_FIELD(", SqlFieldTransform::Rtrim),
+                ("LOG2(PAYLOAD_FIELD(", SqlFieldTransform::Log2),
+                ("LOG10(PAYLOAD_FIELD(", SqlFieldTransform::Log10),
                 ("LOG(PAYLOAD_FIELD(", SqlFieldTransform::Log),
                 ("EXP(PAYLOAD_FIELD(", SqlFieldTransform::Exp),
+                ("RADIANS(PAYLOAD_FIELD(", SqlFieldTransform::Radians),
+                ("DEGREES(PAYLOAD_FIELD(", SqlFieldTransform::Degrees),
             ];
             let transform = transform_prefixes
                 .iter()
@@ -2604,6 +2616,46 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
             if let serde_json::Value::Number(n) = &val {
                 if let Some(f) = n.as_f64() {
                     if let Some(result) = serde_json::Number::from_f64(f.exp()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Log2 => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.log2()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Log10 => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.log10()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Radians => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.to_radians()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Degrees => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.to_degrees()) {
                         return serde_json::Value::Number(result);
                     }
                 }

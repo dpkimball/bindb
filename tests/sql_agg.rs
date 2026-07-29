@@ -3837,3 +3837,122 @@ fn select_exp_on_string_passes_through() {
     assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("abc"));
     store.close().unwrap();
 }
+
+#[test]
+fn select_log2_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slog2:a"), br#"{"n":8}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LOG2(PAYLOAD_FIELD('n')) FROM 'obs://slog2'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 3.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_log2_non_positive_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slog2z:a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LOG2(PAYLOAD_FIELD('n')) FROM 'obs://slog2z'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n").and_then(|v| v.as_u64()), Some(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_log10_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slog10:a"), br#"{"n":100}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LOG10(PAYLOAD_FIELD('n')) FROM 'obs://slog10'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 2.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_radians_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srad:a"), br#"{"deg":180}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT RADIANS(PAYLOAD_FIELD('deg')) FROM 'obs://srad'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("deg").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - std::f64::consts::PI).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_degrees_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://sdeg:a"),
+        format!(r#"{{"rad":{}}}"#, std::f64::consts::PI).into_bytes(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT DEGREES(PAYLOAD_FIELD('rad')) FROM 'obs://sdeg'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("rad").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 180.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_radians_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srads:a"), br#"{"s":"north"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT RADIANS(PAYLOAD_FIELD('s')) FROM 'obs://srads'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("north"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_degrees_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sdegs:a"), br#"{"s":"north"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT DEGREES(PAYLOAD_FIELD('s')) FROM 'obs://sdegs'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("north"));
+    store.close().unwrap();
+}
