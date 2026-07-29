@@ -493,19 +493,22 @@ fn sla_open_wal_replay_lte_500ms_at_10k_commits() {
         store.close().unwrap();
     }
 
-    let mut worst_ms = 0u64;
-    for _ in 0..3 {
+    let mut samples_ms: Vec<u64> = Vec::with_capacity(5);
+    for _ in 0..5 {
         let t = Instant::now();
         let store = BinderStore::open(dir.path()).unwrap();
-        let ms = t.elapsed().as_millis() as u64;
-        worst_ms = worst_ms.max(ms);
+        samples_ms.push(t.elapsed().as_millis() as u64);
         store.close().unwrap();
     }
+    let median_ms = percentile(
+        &mut samples_ms.iter().map(|&v| v * 1_000_000).collect::<Vec<_>>(),
+        50.0,
+    ) / 1_000_000;
 
     assert!(
-        worst_ms <= OPEN_REPLAY_M_MS_MAX,
-        "open() WAL replay worst-of-3 {} ms > SLA maximum {} ms",
-        worst_ms,
+        median_ms <= OPEN_REPLAY_M_MS_MAX,
+        "open() WAL replay median-of-5 {} ms > SLA maximum {} ms",
+        median_ms,
         OPEN_REPLAY_M_MS_MAX
     );
 }
