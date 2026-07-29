@@ -5752,3 +5752,210 @@ fn return_substring_zero_len_gives_empty() {
     assert_eq!(rows[0].fields["name"], serde_json::json!(""));
     store.close().unwrap();
 }
+
+// ── RETURN CAST / RETURN NULLIF tests ─────────────────────────────────────────
+
+#[test]
+fn return_cast_as_int_from_float() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rcaif://hub"), b"{}".to_vec());
+    tx.put_object(obj("rcaif://a"), br#"{"score":9.7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rcaif_e1"),
+        obj("rcaif://hub"),
+        obj("rcaif://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rcaif://hub' RETURN CAST(b.score AS INT)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["score"], serde_json::json!(9i64));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_cast_as_float_from_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rcafs://hub"), b"{}".to_vec());
+    tx.put_object(obj("rcafs://a"), br#"{"val":"2.5"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rcafs_e1"),
+        obj("rcafs://hub"),
+        obj("rcafs://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rcafs://hub' RETURN CAST(b.val AS FLOAT)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["val"].as_f64().unwrap();
+    assert!((v - 2.5).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_cast_as_string_from_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rcasfn://hub"), b"{}".to_vec());
+    tx.put_object(obj("rcasfn://a"), br#"{"id":100}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rcasfn_e1"),
+        obj("rcasfn://hub"),
+        obj("rcasfn://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rcasfn://hub' RETURN CAST(b.id AS STRING)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["id"], serde_json::json!("100"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_cast_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN CAST(b.n AS INT)")
+        .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("n"),
+        Some(ReturnTransform::CastInt)
+    ));
+}
+
+#[test]
+fn return_nullif_matching_value_omits_field() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rnimvof://hub"), b"{}".to_vec());
+    tx.put_object(obj("rnimvof://a"), br#"{"status":"N/A"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rnimvof_e1"),
+        obj("rnimvof://hub"),
+        obj("rnimvof://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rnimvof://hub' RETURN NULLIF(b.status, 'N/A')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(!rows[0].fields.contains_key("status"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_nullif_non_matching_value_kept() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rnnmvk://hub"), b"{}".to_vec());
+    tx.put_object(obj("rnnmvk://a"), br#"{"status":"active"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rnnmvk_e1"),
+        obj("rnnmvk://hub"),
+        obj("rnnmvk://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rnnmvk://hub' RETURN NULLIF(b.status, 'N/A')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["status"], serde_json::json!("active"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_nullif_on_non_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rnonsp2://hub"), b"{}".to_vec());
+    tx.put_object(obj("rnonsp2://a"), br#"{"n":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rnonsp2_e1"),
+        obj("rnonsp2://hub"),
+        obj("rnonsp2://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rnonsp2://hub' RETURN NULLIF(b.n, '0')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["n"], serde_json::json!(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_nullif_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN NULLIF(b.status, 'none')",
+    )
+    .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("status"),
+        Some(ReturnTransform::NullIf(s)) if s == "none"
+    ));
+}

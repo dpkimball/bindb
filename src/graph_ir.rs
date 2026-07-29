@@ -185,6 +185,14 @@ pub enum ReturnTransform {
     Length,
     /// `SUBSTRING(b.field, start, len)` — extract a substring (zero-based, char-indexed).
     Substring(usize, usize),
+    /// `CAST(b.field AS INT)` — convert field to integer.
+    CastInt,
+    /// `CAST(b.field AS FLOAT)` — convert field to float.
+    CastFloat,
+    /// `CAST(b.field AS STRING)` — convert numeric field to string.
+    CastString,
+    /// `NULLIF(b.field, 'val')` — returns null (field omitted) when field equals `val`.
+    NullIf(String),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -1725,6 +1733,61 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
                 val
             }
         }
+        ReturnTransform::CastInt => match &val {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    serde_json::Value::Number(i.into())
+                } else if let Some(f) = n.as_f64() {
+                    serde_json::Value::Number((f as i64).into())
+                } else {
+                    val
+                }
+            }
+            serde_json::Value::String(s) => {
+                if let Ok(i) = s.parse::<i64>() {
+                    serde_json::Value::Number(i.into())
+                } else if let Ok(f) = s.parse::<f64>() {
+                    serde_json::Value::Number((f as i64).into())
+                } else {
+                    val
+                }
+            }
+            _ => val,
+        },
+        ReturnTransform::CastFloat => match &val {
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(val)
+                } else {
+                    val
+                }
+            }
+            serde_json::Value::String(s) => {
+                if let Ok(f) = s.parse::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(val)
+                } else {
+                    val
+                }
+            }
+            _ => val,
+        },
+        ReturnTransform::CastString => match &val {
+            serde_json::Value::Number(n) => serde_json::Value::String(n.to_string()),
+            serde_json::Value::Bool(b) => serde_json::Value::String(b.to_string()),
+            _ => val,
+        },
+        ReturnTransform::NullIf(cmp_val) => {
+            if let serde_json::Value::String(s) = &val {
+                if s == cmp_val {
+                    return serde_json::Value::Null;
+                }
+            }
+            val
+        }
     }
 }
 
@@ -2033,6 +2096,51 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         return Some((field, ReturnTransform::Replace(from_str, to_str)));
     }
 
+    // CAST(b.field AS INT|FLOAT|STRING)
+    if su.starts_with("CAST(") && s.ends_with(')') {
+        let inner = &s["CAST(".len()..s.len() - 1];
+        let su_inner = inner.to_ascii_uppercase();
+        let as_pos = su_inner.find(" AS ")?;
+        let field_part = inner[..as_pos].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let type_str = su_inner[as_pos + 4..].trim();
+        let transform = match type_str {
+            "INT" => ReturnTransform::CastInt,
+            "FLOAT" => ReturnTransform::CastFloat,
+            "STRING" => ReturnTransform::CastString,
+            _ => return None,
+        };
+        return Some((field, transform));
+    }
+
+    // NULLIF(b.field, 'val')
+    if su.starts_with("NULLIF(") && s.ends_with(')') {
+        let inner = &s["NULLIF(".len()..s.len() - 1];
+        let comma = inner.find(',')?;
+        let field_part = inner[..comma].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let val_raw = inner[comma + 1..].trim();
+        let cmp = val_raw
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))?
+            .to_string();
+        return Some((field, ReturnTransform::NullIf(cmp)));
+    }
+
     // SUBSTRING(b.field, start, len)
     if su.starts_with("SUBSTRING(") && s.ends_with(')') {
         let inner = &s["SUBSTRING(".len()..s.len() - 1];
@@ -2080,6 +2188,53 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
     }
 }
 
+/// Split `EXPR [AS alias]` where `AS` is only an alias marker when it appears after
+/// all parentheses in `EXPR` are closed.  Handles `CAST(b.f AS INT)` correctly.
+fn split_selector_alias(p: &str) -> (&str, Option<String>) {
+    // Find the position after all parens close (depth returns to 0).
+    let mut depth: usize = 0;
+    let mut close_end: Option<usize> = None;
+    for (i, c) in p.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close_end = Some(i + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    let search_from = close_end.unwrap_or(0);
+    let remainder = p[search_from..].trim_start();
+    let ru = remainder.to_ascii_uppercase();
+    if ru.starts_with("AS ") || ru == "AS" {
+        let sel = p[..search_from + (p[search_from..].len() - remainder.len())].trim();
+        let after_as = remainder[2..].trim_start();
+        let end = after_as
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after_as.len());
+        let alias = &after_as[..end];
+        return (
+            sel,
+            if alias.is_empty() {
+                None
+            } else {
+                Some(alias.to_string())
+            },
+        );
+    }
+    if close_end.is_none() {
+        // No parens at all — simple `b.field [AS alias]` case.
+        let toks: Vec<&str> = p.split_whitespace().collect();
+        if toks.len() >= 3 && toks[1].eq_ignore_ascii_case("AS") {
+            return (toks[0], Some(toks[2].to_string()));
+        }
+    }
+    (p, None)
+}
+
 /// Split a RETURN selector list on commas that are not inside parentheses.
 fn split_return_parts(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
@@ -2125,13 +2280,8 @@ fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let mut return_all_fields = false;
     for part in split_return_parts(s) {
         let p = part.trim();
-        // Detect optional `AS alias` suffix (e.g. `b.name AS n`).
-        let tokens: Vec<&str> = p.split_whitespace().collect();
-        let (selector, alias) = if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("AS") {
-            (tokens[0], Some(tokens[2].to_string()))
-        } else {
-            (p, None)
-        };
+        // Detect optional `AS alias` suffix, respecting parenthesis depth.
+        let (selector, alias) = split_selector_alias(p);
         let is_path_var = path_var.is_some_and(|v| selector.eq_ignore_ascii_case(v));
         if selector.eq_ignore_ascii_case("path") || is_path_var {
             return_path = true;

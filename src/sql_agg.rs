@@ -1344,6 +1344,12 @@ pub enum SqlFieldTransform {
     CastFloat,
     /// `CAST(PAYLOAD_FIELD('f') AS STRING)` — convert numeric field to its string representation.
     CastString,
+    /// `NULLIF(PAYLOAD_FIELD('f'), 'val')` — returns null when field equals `val`.
+    NullIf(String),
+    /// `LPAD(PAYLOAD_FIELD('f'), n, 'c')` — left-pad string to width `n` with char `c`.
+    Lpad(usize, String),
+    /// `RPAD(PAYLOAD_FIELD('f'), n, 'c')` — right-pad string to width `n` with char `c`.
+    Rpad(usize, String),
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1531,6 +1537,116 @@ impl SqlProjectQuery {
                     if alias_end > 0 {
                         field_aliases.insert(field.clone(), after_as2[..alias_end].to_string());
                         s = after_as2[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect NULLIF(PAYLOAD_FIELD('f'), 'val'), LPAD(...), RPAD(...)
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("NULLIF(PAYLOAD_FIELD(") {
+                let inner = &s["NULLIF(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in NULLIF".into())
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| SqlAggError::Unsupported("expected ',' in NULLIF".into()))?
+                    .trim_start();
+                let after_open = rest.strip_prefix('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("NULLIF comparison value must be single-quoted".into())
+                })?;
+                let close = after_open.find('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("unclosed quote in NULLIF value".into())
+                })?;
+                let cmp_val = after_open[..close].to_string();
+                let s_after = after_open[close + 1..]
+                    .trim_start()
+                    .strip_prefix(')')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ')' to close NULLIF".into())
+                    })?;
+                s = s_after.trim_start();
+                field_transforms.insert(field.clone(), SqlFieldTransform::NullIf(cmp_val));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            if su.starts_with("LPAD(PAYLOAD_FIELD(") || su.starts_with("RPAD(PAYLOAD_FIELD(") {
+                let is_lpad = su.starts_with("LPAD(");
+                let prefix = if is_lpad {
+                    "LPAD(PAYLOAD_FIELD("
+                } else {
+                    "RPAD(PAYLOAD_FIELD("
+                };
+                let inner = &s[prefix.len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in LPAD/RPAD".into())
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected width after PAYLOAD_FIELD in LPAD/RPAD".into(),
+                        )
+                    })?
+                    .trim_start();
+                let comma2 = rest.find(',').ok_or_else(|| {
+                    SqlAggError::Unsupported("LPAD/RPAD requires width and pad arguments".into())
+                })?;
+                let width: usize = rest[..comma2].trim().parse().map_err(|_| {
+                    SqlAggError::Unsupported(
+                        "LPAD/RPAD width must be a non-negative integer".into(),
+                    )
+                })?;
+                let rest2 = rest[comma2 + 1..].trim_start();
+                let after_pad_open = rest2.strip_prefix('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("LPAD/RPAD pad char must be single-quoted".into())
+                })?;
+                let pad_end = after_pad_open.find('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("unclosed quote in LPAD/RPAD pad char".into())
+                })?;
+                let pad_str = after_pad_open[..pad_end].to_string();
+                let s_after = after_pad_open[pad_end + 1..]
+                    .trim_start()
+                    .strip_prefix(')')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ')' to close LPAD/RPAD".into())
+                    })?;
+                s = s_after.trim_start();
+                let transform = if is_lpad {
+                    SqlFieldTransform::Lpad(width, pad_str)
+                } else {
+                    SqlFieldTransform::Rpad(width, pad_str)
+                };
+                field_transforms.insert(field.clone(), transform);
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
                     }
                 }
                 fields.push(field);
@@ -1979,6 +2095,44 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
             serde_json::Value::Bool(b) => serde_json::Value::String(b.to_string()),
             _ => val,
         },
+        SqlFieldTransform::NullIf(cmp_val) => {
+            if let serde_json::Value::String(s) = &val {
+                if s == cmp_val {
+                    return serde_json::Value::Null;
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Lpad(width, pad) => {
+            if let serde_json::Value::String(s) = val {
+                let pad_char = pad.chars().next().unwrap_or(' ');
+                let char_count = s.chars().count();
+                if char_count >= *width {
+                    serde_json::Value::String(s)
+                } else {
+                    let needed = width - char_count;
+                    let padding: String = std::iter::repeat_n(pad_char, needed).collect();
+                    serde_json::Value::String(format!("{padding}{s}"))
+                }
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::Rpad(width, pad) => {
+            if let serde_json::Value::String(s) = val {
+                let pad_char = pad.chars().next().unwrap_or(' ');
+                let char_count = s.chars().count();
+                if char_count >= *width {
+                    serde_json::Value::String(s)
+                } else {
+                    let needed = width - char_count;
+                    let padding: String = std::iter::repeat_n(pad_char, needed).collect();
+                    serde_json::Value::String(format!("{s}{padding}"))
+                }
+            } else {
+                val
+            }
+        }
     }
 }
 
