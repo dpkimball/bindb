@@ -6312,3 +6312,207 @@ fn return_right_zero_gives_empty_string() {
     assert_eq!(rows[0].fields["tag"], serde_json::json!(""));
     store.close().unwrap();
 }
+
+// ── SIGN / SQRT transform tests ───────────────────────────────────────────────
+
+#[test]
+fn return_sign_positive_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsignp://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsignp://a"), br#"{"score":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsignp_e1"),
+        obj("gsignp://hub"),
+        obj("gsignp://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsignp://hub' RETURN SIGN(b.score)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["score"], serde_json::json!(1));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_sign_negative_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsignn://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsignn://a"), br#"{"val":-7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsignn_e1"),
+        obj("gsignn://hub"),
+        obj("gsignn://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsignn://hub' RETURN SIGN(b.val)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["val"], serde_json::json!(-1));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_sign_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN SIGN(b.score)").unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("score"),
+        Some(ReturnTransform::Sign)
+    ));
+}
+
+#[test]
+fn return_sqrt_of_perfect_square() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsqrt://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsqrt://a"), br#"{"n":9}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsqrt_e1"),
+        obj("gsqrt://hub"),
+        obj("gsqrt://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsqrt://hub' RETURN SQRT(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["n"].as_f64().unwrap();
+    assert!((v - 3.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_sqrt_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN SQRT(b.n)").unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("n"),
+        Some(ReturnTransform::Sqrt)
+    ));
+}
+
+#[test]
+fn return_sqrt_on_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsqrts://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsqrts://a"), br#"{"tag":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsqrts_e1"),
+        obj("gsqrts://hub"),
+        obj("gsqrts://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsqrts://hub' RETURN SQRT(b.tag)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["tag"], serde_json::json!("abc"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_sign_zero() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsignz://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsignz://a"), br#"{"val":0}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsignz_e1"),
+        obj("gsignz://hub"),
+        obj("gsignz://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsignz://hub' RETURN SIGN(b.val)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["val"], serde_json::json!(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_sign_on_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsignstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsignstr://a"), br#"{"tag":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsignstr_e1"),
+        obj("gsignstr://hub"),
+        obj("gsignstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsignstr://hub' RETURN SIGN(b.tag)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["tag"], serde_json::json!("abc"));
+    store.close().unwrap();
+}

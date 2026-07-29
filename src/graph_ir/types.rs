@@ -121,6 +121,10 @@ pub enum ReturnTransform {
     Left(usize),
     /// `RIGHT(b.field, n)` — last `n` characters of a string field.
     Right(usize),
+    /// `SIGN(b.field)` — sign of a numeric field: -1, 0, or 1.
+    Sign,
+    /// `SQRT(b.field)` — square root of a non-negative numeric field.
+    Sqrt,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.

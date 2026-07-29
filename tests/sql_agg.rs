@@ -3487,3 +3487,125 @@ fn select_sign_parses_correctly() {
         Some(SqlFieldTransform::Sign)
     ));
 }
+
+// ── SQRT / POWER(PAYLOAD_FIELD) in SELECT tests ──────────────────────────────
+
+#[test]
+fn select_sqrt_of_perfect_square() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssqrt:a"), br#"{"n":9}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SQRT(PAYLOAD_FIELD('n')) FROM 'obs://ssqrt'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 3.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_sqrt_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT SQRT(PAYLOAD_FIELD('n')) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("n"),
+        Some(SqlFieldTransform::Sqrt)
+    ));
+}
+
+#[test]
+fn select_sqrt_on_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssqrts:a"), br#"{"tag":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SQRT(PAYLOAD_FIELD('tag')) FROM 'obs://ssqrts'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("abc"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_power_squares_a_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://spow:a"), br#"{"n":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT POWER(PAYLOAD_FIELD('n'), 2) FROM 'obs://spow'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 9.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_power_fractional_exponent_gives_sqrt() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://spowf:a"), br#"{"n":4}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT POWER(PAYLOAD_FIELD('n'), 0.5) FROM 'obs://spowf'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 2.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_power_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT POWER(PAYLOAD_FIELD('n'), 3) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("n"),
+        Some(SqlFieldTransform::Power(e)) if (e - 3.0).abs() < 1e-9
+    ));
+}
+
+#[test]
+fn select_power_zero_exponent_gives_one() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://spow0:a"), br#"{"n":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT POWER(PAYLOAD_FIELD('n'), 0) FROM 'obs://spow0'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_power_on_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://spows:a"), br#"{"tag":"abc"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT POWER(PAYLOAD_FIELD('tag'), 2) FROM 'obs://spows'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("abc"));
+    store.close().unwrap();
+}

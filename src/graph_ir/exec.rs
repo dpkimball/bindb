@@ -209,6 +209,31 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
                 val
             }
         }
+        ReturnTransform::Sign => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    let sign: i64 = if f > 0.0 {
+                        1
+                    } else if f < 0.0 {
+                        -1
+                    } else {
+                        0
+                    };
+                    return serde_json::Value::Number(sign.into());
+                }
+            }
+            val
+        }
+        ReturnTransform::Sqrt => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.sqrt()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
     }
 }
 
