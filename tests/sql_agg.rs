@@ -3609,3 +3609,133 @@ fn select_power_on_string_passes_through() {
     assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("abc"));
     store.close().unwrap();
 }
+
+#[test]
+fn select_mod_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://smod:a"), br#"{"n":10}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT MOD(PAYLOAD_FIELD('n'), 3) FROM 'obs://smod'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("n").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_mod_parse() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT MOD(PAYLOAD_FIELD('n'), 3) FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("n"),
+        Some(SqlFieldTransform::Mod(d)) if (d - 3.0).abs() < 1e-9
+    ));
+}
+
+#[test]
+fn select_mod_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://smods:a"), br#"{"tag":"hi"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT MOD(PAYLOAD_FIELD('tag'), 3) FROM 'obs://smods'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("hi"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_strpos_found() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sstrpos:a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT STRPOS(PAYLOAD_FIELD('word'), 'l') FROM 'obs://sstrpos'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("word").and_then(|v| v.as_u64()), Some(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_strpos_not_found() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sstrpno:a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT STRPOS(PAYLOAD_FIELD('word'), 'z') FROM 'obs://sstrpno'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("word").and_then(|v| v.as_u64()), Some(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_strpos_parse() {
+    use bindb::SqlFieldTransform;
+    let q =
+        SqlProjectQuery::parse("SELECT STRPOS(PAYLOAD_FIELD('word'), 'l') FROM 'obs://x'").unwrap();
+    assert!(matches!(
+        q.field_transforms.get("word"),
+        Some(SqlFieldTransform::Strpos(n)) if n == "l"
+    ));
+}
+
+#[test]
+fn select_split_part_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssplitpt:a"), br#"{"csv":"a,b,c"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SPLIT_PART(PAYLOAD_FIELD('csv'), ',', 2) FROM 'obs://ssplitpt'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("csv").and_then(|v| v.as_str()), Some("b"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_split_part_out_of_bounds() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssplitob:a"), br#"{"csv":"a,b"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SPLIT_PART(PAYLOAD_FIELD('csv'), ',', 9) FROM 'obs://ssplitob'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("csv").and_then(|v| v.as_str()), Some(""));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_split_part_parse() {
+    use bindb::SqlFieldTransform;
+    let q =
+        SqlProjectQuery::parse("SELECT SPLIT_PART(PAYLOAD_FIELD('csv'), ',', 2) FROM 'obs://x'")
+            .unwrap();
+    assert!(matches!(
+        q.field_transforms.get("csv"),
+        Some(SqlFieldTransform::SplitPart(d, 2)) if d == ","
+    ));
+}

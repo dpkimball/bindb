@@ -78,7 +78,7 @@ pub enum CmpValue {
 }
 
 /// String transform applied to a projected node field in `RETURN UPPER(b.field)` etc.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReturnTransform {
     Upper,
     Lower,
@@ -125,6 +125,14 @@ pub enum ReturnTransform {
     Sign,
     /// `SQRT(b.field)` — square root of a non-negative numeric field.
     Sqrt,
+    /// `POWER(b.field, exp)` — raise numeric field to power `exp`.
+    Power(f64),
+    /// `MOD(b.field, n)` — numeric field modulo `n`.
+    Mod(f64),
+    /// `STRPOS(b.field, 'needle')` — 1-based char position of needle in string field; 0 if not found.
+    Strpos(String),
+    /// `SPLIT_PART(b.field, 'delim', n)` — nth (1-based) token after splitting string by delimiter.
+    SplitPart(String, usize),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.

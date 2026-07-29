@@ -1366,6 +1366,12 @@ pub enum SqlFieldTransform {
     Sqrt,
     /// `POWER(PAYLOAD_FIELD('f'), exp)` — raise numeric field to power `exp`.
     Power(f64),
+    /// `MOD(PAYLOAD_FIELD('f'), n)` — numeric field modulo `n`.
+    Mod(f64),
+    /// `STRPOS(PAYLOAD_FIELD('f'), 'needle')` — 1-based char position of needle; 0 if not found.
+    Strpos(String),
+    /// `SPLIT_PART(PAYLOAD_FIELD('f'), 'delim', n)` — nth (1-based) token split by delimiter.
+    SplitPart(String, usize),
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1737,6 +1743,155 @@ impl SqlProjectQuery {
                 })?;
                 s = rest[paren_end + 1..].trim_start();
                 field_transforms.insert(field.clone(), SqlFieldTransform::Power(exp));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect MOD(PAYLOAD_FIELD('f'), n)
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("MOD(PAYLOAD_FIELD(") {
+                let inner = &s["MOD(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in MOD".into())
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected divisor after PAYLOAD_FIELD in MOD".into(),
+                        )
+                    })?
+                    .trim_start();
+                let paren_end = rest
+                    .find(')')
+                    .ok_or_else(|| SqlAggError::Unsupported("expected ')' to close MOD".into()))?;
+                let n: f64 = rest[..paren_end]
+                    .trim()
+                    .parse()
+                    .map_err(|_| SqlAggError::Unsupported("MOD divisor must be a number".into()))?;
+                s = rest[paren_end + 1..].trim_start();
+                field_transforms.insert(field.clone(), SqlFieldTransform::Mod(n));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect STRPOS(PAYLOAD_FIELD('f'), 'needle')
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("STRPOS(PAYLOAD_FIELD(") {
+                let inner = &s["STRPOS(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in STRPOS".into())
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected needle after PAYLOAD_FIELD in STRPOS".into(),
+                        )
+                    })?
+                    .trim_start();
+                let after_quote_open = rest.strip_prefix('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("STRPOS needle must be single-quoted".into())
+                })?;
+                let quote_end = after_quote_open.find('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("unclosed quote in STRPOS needle".into())
+                })?;
+                let needle = after_quote_open[..quote_end].to_string();
+                let s_after = after_quote_open[quote_end + 1..]
+                    .trim_start()
+                    .strip_prefix(')')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ')' to close STRPOS".into())
+                    })?;
+                s = s_after.trim_start();
+                field_transforms.insert(field.clone(), SqlFieldTransform::Strpos(needle));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect SPLIT_PART(PAYLOAD_FIELD('f'), 'delim', n)
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("SPLIT_PART(PAYLOAD_FIELD(") {
+                let inner = &s["SPLIT_PART(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported(
+                        "expected ')' after PAYLOAD_FIELD in SPLIT_PART".into(),
+                    )
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected delimiter after PAYLOAD_FIELD in SPLIT_PART".into(),
+                        )
+                    })?
+                    .trim_start();
+                let after_delim_open = rest.strip_prefix('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("SPLIT_PART delimiter must be single-quoted".into())
+                })?;
+                let delim_end = after_delim_open.find('\'').ok_or_else(|| {
+                    SqlAggError::Unsupported("unclosed quote in SPLIT_PART delimiter".into())
+                })?;
+                let delim = after_delim_open[..delim_end].to_string();
+                let rest2 = after_delim_open[delim_end + 1..]
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ',' after SPLIT_PART delimiter".into())
+                    })?
+                    .trim_start();
+                let paren_end = rest2.find(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' to close SPLIT_PART".into())
+                })?;
+                let n: usize = rest2[..paren_end].trim().parse().map_err(|_| {
+                    SqlAggError::Unsupported(
+                        "SPLIT_PART index must be a non-negative integer".into(),
+                    )
+                })?;
+                s = rest2[paren_end + 1..].trim_start();
+                field_transforms.insert(field.clone(), SqlFieldTransform::SplitPart(delim, n));
                 if starts_with_keyword(s, "AS") {
                     let after_as = skip_keyword(s, "AS").trim_start();
                     let alias_end = after_as
@@ -2376,6 +2531,38 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
                         return serde_json::Value::Number(result);
                     }
                 }
+            }
+            val
+        }
+        SqlFieldTransform::Mod(divisor) => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f % divisor) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        SqlFieldTransform::Strpos(needle) => {
+            if let serde_json::Value::String(s) = &val {
+                let pos = if let Some(byte_pos) = s.find(needle.as_str()) {
+                    s[..byte_pos].chars().count() + 1
+                } else {
+                    0usize
+                };
+                return serde_json::Value::Number(pos.into());
+            }
+            val
+        }
+        SqlFieldTransform::SplitPart(delim, n) => {
+            if let serde_json::Value::String(s) = &val {
+                let part = s
+                    .split(delim.as_str())
+                    .nth(n.saturating_sub(1))
+                    .unwrap_or("")
+                    .to_string();
+                return serde_json::Value::String(part);
             }
             val
         }

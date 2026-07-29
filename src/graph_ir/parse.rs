@@ -1416,6 +1416,81 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         }
     }
 
+    // POWER(b.field, exp)
+    if su.starts_with("POWER(") && s.ends_with(')') {
+        let inner = &s["POWER(".len()..s.len() - 1];
+        let comma = inner.find(',')?;
+        let field_part = inner[..comma].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let exp: f64 = inner[comma + 1..].trim().parse().ok()?;
+        return Some((field, ReturnTransform::Power(exp)));
+    }
+
+    // MOD(b.field, n)
+    if su.starts_with("MOD(") && s.ends_with(')') {
+        let inner = &s["MOD(".len()..s.len() - 1];
+        let comma = inner.find(',')?;
+        let field_part = inner[..comma].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let n: f64 = inner[comma + 1..].trim().parse().ok()?;
+        return Some((field, ReturnTransform::Mod(n)));
+    }
+
+    // STRPOS(b.field, 'needle')
+    if su.starts_with("STRPOS(") && s.ends_with(')') {
+        let inner = &s["STRPOS(".len()..s.len() - 1];
+        let comma = inner.find(',')?;
+        let field_part = inner[..comma].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let needle_raw = inner[comma + 1..].trim();
+        let needle = needle_raw
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))?
+            .to_string();
+        return Some((field, ReturnTransform::Strpos(needle)));
+    }
+
+    // SPLIT_PART(b.field, 'delim', n)
+    if su.starts_with("SPLIT_PART(") && s.ends_with(')') {
+        let inner = &s["SPLIT_PART(".len()..s.len() - 1];
+        let comma1 = inner.find(',')?;
+        let field_part = inner[..comma1].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let rest = inner[comma1 + 1..].trim_start();
+        let (delim, after_delim) = parse_single_quoted_graph(rest)?;
+        let rest2 = after_delim.trim_start().strip_prefix(',')?.trim_start();
+        let n: usize = rest2.parse().ok()?;
+        return Some((field, ReturnTransform::SplitPart(delim, n)));
+    }
+
     // LPAD(b.field, n, 'c') / RPAD(b.field, n, 'c')
     for (kw, is_lpad) in [("LPAD(", true), ("RPAD(", false)] {
         if su.starts_with(kw) && s.ends_with(')') {

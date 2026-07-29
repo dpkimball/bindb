@@ -6516,3 +6516,210 @@ fn return_sign_on_string_passes_through() {
     assert_eq!(rows[0].fields["tag"], serde_json::json!("abc"));
     store.close().unwrap();
 }
+
+#[test]
+fn return_power_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gpow://hub"), b"{}".to_vec());
+    tx.put_object(obj("gpow://a"), br#"{"val":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gpow_e1"),
+        obj("gpow://hub"),
+        obj("gpow://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gpow://hub' RETURN POWER(b.val, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["val"].as_f64().unwrap();
+    assert!((v - 8.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_power_parse() {
+    use bindb::ReturnTransform;
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://hub' RETURN POWER(b.val, 3)")
+            .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("val"),
+        Some(ReturnTransform::Power(e)) if (e - 3.0).abs() < 1e-9
+    ));
+}
+
+#[test]
+fn return_mod_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gmod://hub"), b"{}".to_vec());
+    tx.put_object(obj("gmod://a"), br#"{"val":10}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gmod_e1"),
+        obj("gmod://hub"),
+        obj("gmod://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gmod://hub' RETURN MOD(b.val, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let v = rows[0].fields["val"].as_f64().unwrap();
+    assert!((v - 1.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn return_mod_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gmodstr://hub"), b"{}".to_vec());
+    tx.put_object(obj("gmodstr://a"), br#"{"tag":"hi"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gmodstr_e1"),
+        obj("gmodstr://hub"),
+        obj("gmodstr://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gmodstr://hub' RETURN MOD(b.tag, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["tag"], serde_json::json!("hi"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_strpos_found() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gstrpos://hub"), b"{}".to_vec());
+    tx.put_object(obj("gstrpos://a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gstrpos_e1"),
+        obj("gstrpos://hub"),
+        obj("gstrpos://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gstrpos://hub' RETURN STRPOS(b.word, 'l')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["word"], serde_json::json!(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_strpos_not_found() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gstrpno://hub"), b"{}".to_vec());
+    tx.put_object(obj("gstrpno://a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gstrpno_e1"),
+        obj("gstrpno://hub"),
+        obj("gstrpno://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gstrpno://hub' RETURN STRPOS(b.word, 'z')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["word"], serde_json::json!(0));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_split_part_exec() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("gsplitpt://hub"), b"{}".to_vec());
+    tx.put_object(obj("gsplitpt://a"), br#"{"csv":"a,b,c"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("gsplitpt_e1"),
+        obj("gsplitpt://hub"),
+        obj("gsplitpt://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'gsplitpt://hub' RETURN SPLIT_PART(b.csv, ',', 2)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["csv"], serde_json::json!("b"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_split_part_parse() {
+    use bindb::ReturnTransform;
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:X]->(b) WHERE id(a) = 'x://hub' RETURN SPLIT_PART(b.csv, ',', 2)",
+    )
+    .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("csv"),
+        Some(ReturnTransform::SplitPart(d, 2)) if d == ","
+    ));
+}

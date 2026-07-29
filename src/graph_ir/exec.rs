@@ -234,6 +234,48 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             val
         }
+        ReturnTransform::Power(exp) => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.powf(*exp)) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Mod(divisor) => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f % divisor) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Strpos(needle) => {
+            if let serde_json::Value::String(s) = &val {
+                let pos = if let Some(byte_pos) = s.find(needle.as_str()) {
+                    s[..byte_pos].chars().count() + 1
+                } else {
+                    0usize
+                };
+                return serde_json::Value::Number(pos.into());
+            }
+            val
+        }
+        ReturnTransform::SplitPart(delim, n) => {
+            if let serde_json::Value::String(s) = &val {
+                let part = s
+                    .split(delim.as_str())
+                    .nth(n.saturating_sub(1))
+                    .unwrap_or("")
+                    .to_string();
+                return serde_json::Value::String(part);
+            }
+            val
+        }
     }
 }
 
