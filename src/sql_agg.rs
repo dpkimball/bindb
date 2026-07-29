@@ -50,6 +50,10 @@ pub enum SqlGroupBy {
     /// Group by the named field in a UTF-8 JSON object payload.
     /// Observations whose payload is non-JSON or lacks the field go into the `None` group.
     PayloadField(String),
+    /// Group by multiple payload fields (`GROUP BY PAYLOAD_FIELD('f1'), PAYLOAD_FIELD('f2')`).
+    /// Composite key = JSON array of the field values (e.g. `["red",1]`).
+    /// Observations missing any field contribute a `null` for that position.
+    MultiPayloadField(Vec<String>),
 }
 
 /// Filter applied to observation `object_id` in a `WHERE` clause.
@@ -411,7 +415,30 @@ fn parse_group_by(s: &str) -> Result<(SqlGroupBy, &str), SqlAggError> {
                 "expected ')' after PAYLOAD_FIELD argument".into(),
             ));
         }
-        Ok((SqlGroupBy::PayloadField(field), rest[1..].trim_start()))
+        let mut fields = vec![field];
+        let mut rest = rest[1..].trim_start();
+        // Check for additional comma-separated PAYLOAD_FIELD('f2') entries
+        while rest.starts_with(',') {
+            let after_comma = rest[1..].trim_start();
+            let au2 = after_comma.to_ascii_uppercase();
+            if au2.starts_with("PAYLOAD_FIELD(") {
+                let orig2 = &after_comma["PAYLOAD_FIELD(".len()..];
+                let (f2, r2) = parse_quoted_sql(orig2)?;
+                let r2 = r2.trim_start();
+                if !r2.starts_with(')') {
+                    break;
+                }
+                fields.push(f2);
+                rest = r2[1..].trim_start();
+            } else {
+                break;
+            }
+        }
+        if fields.len() == 1 {
+            Ok((SqlGroupBy::PayloadField(fields.remove(0)), rest))
+        } else {
+            Ok((SqlGroupBy::MultiPayloadField(fields), rest))
+        }
     } else {
         Err(SqlAggError::Unsupported(
             "GROUP BY must be PATH_SEGMENT(i) or PAYLOAD_FIELD('name')".into(),
@@ -982,6 +1009,29 @@ impl BinderStore {
                 let field = field.clone();
                 builder.group_by(move |v| payload_field_group_key(v.payload.as_deref(), &field))
             }
+            SqlGroupBy::MultiPayloadField(fields) => {
+                let fields = fields.clone();
+                builder.group_by(move |v| {
+                    let json = v
+                        .payload
+                        .as_deref()
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+                    match json {
+                        None => None,
+                        Some(j) => {
+                            let parts: Vec<String> = fields
+                                .iter()
+                                .map(|f| match j.get(f) {
+                                    Some(v) => v.to_string(),
+                                    None => "null".to_string(),
+                                })
+                                .collect();
+                            Some(format!("[{}]", parts.join(",")))
+                        }
+                    }
+                })
+            }
         };
 
         let results = builder.execute()?;
@@ -1130,6 +1180,9 @@ pub struct SqlProjectOrderBy {
 pub struct SqlProjectQuery {
     /// Field names to extract from each observation's JSON payload.
     pub fields: Vec<String>,
+    /// Output-key aliases for projected fields (`SELECT PAYLOAD_FIELD('name') AS n`).
+    /// Key = raw field name, value = alias used as output key in the result row.
+    pub field_aliases: std::collections::HashMap<String, String>,
     pub namespace: String,
     /// When `true`, each row includes an `"id"` key holding the full object_id string.
     pub return_id: bool,
@@ -1169,6 +1222,8 @@ impl SqlProjectQuery {
         };
 
         let mut fields = Vec::new();
+        let mut field_aliases: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut return_id = false;
         loop {
             s = s.trim_start();
@@ -1206,6 +1261,17 @@ impl SqlProjectQuery {
                 ));
             }
             s = rest[1..].trim_start();
+            // Optional `AS alias` after PAYLOAD_FIELD('f')
+            if starts_with_keyword(s, "AS") {
+                let after_as = skip_keyword(s, "AS").trim_start();
+                let alias_end = after_as
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(after_as.len());
+                if alias_end > 0 {
+                    field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                    s = after_as[alias_end..].trim_start();
+                }
+            }
             fields.push(field);
             if s.starts_with(',') {
                 s = &s[1..];
@@ -1338,6 +1404,7 @@ impl SqlProjectQuery {
 
         Ok(SqlProjectQuery {
             fields,
+            field_aliases,
             namespace,
             return_id,
             distinct,
@@ -1430,6 +1497,7 @@ impl BinderStore {
             .map(|ob| ob.field.clone());
 
         let return_id = q.return_id;
+        let field_aliases = q.field_aliases.clone();
         let mut rows: Vec<std::collections::HashMap<String, serde_json::Value>> = iter
             .map(|v| {
                 let mut row: std::collections::HashMap<String, serde_json::Value> = q
@@ -1437,7 +1505,11 @@ impl BinderStore {
                     .iter()
                     .map(|field| {
                         let val = project_payload_field(v.payload.as_deref(), field);
-                        (field.clone(), val)
+                        let out_key = field_aliases
+                            .get(field)
+                            .cloned()
+                            .unwrap_or_else(|| field.clone());
+                        (out_key, val)
                     })
                     .collect();
                 if return_id {
