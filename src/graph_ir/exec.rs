@@ -276,6 +276,38 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             val
         }
+        ReturnTransform::Ltrim => {
+            if let serde_json::Value::String(s) = val {
+                return serde_json::Value::String(s.trim_start().to_string());
+            }
+            val
+        }
+        ReturnTransform::Rtrim => {
+            if let serde_json::Value::String(s) = val {
+                return serde_json::Value::String(s.trim_end().to_string());
+            }
+            val
+        }
+        ReturnTransform::Log => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.ln()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
+        ReturnTransform::Exp => {
+            if let serde_json::Value::Number(n) = &val {
+                if let Some(f) = n.as_f64() {
+                    if let Some(result) = serde_json::Number::from_f64(f.exp()) {
+                        return serde_json::Value::Number(result);
+                    }
+                }
+            }
+            val
+        }
     }
 }
 
