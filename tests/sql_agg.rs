@@ -3139,3 +3139,121 @@ fn select_cast_parses_correctly() {
         Some(SqlFieldTransform::CastInt)
     ));
 }
+
+// ── NULLIF / LPAD / RPAD(PAYLOAD_FIELD) in SELECT tests ───────────────────────
+
+#[test]
+fn select_nullif_matching_produces_null() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://snmpn:a"), br#"{"status":"N/A"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT NULLIF(PAYLOAD_FIELD('status'), 'N/A') FROM 'obs://snmpn'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("status"), Some(&serde_json::Value::Null));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_nullif_non_matching_kept() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://snnmk:a"), br#"{"status":"active"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT NULLIF(PAYLOAD_FIELD('status'), 'N/A') FROM 'obs://snnmk'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("status").and_then(|v| v.as_str()),
+        Some("active")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn select_nullif_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT NULLIF(PAYLOAD_FIELD('tag'), 'none') FROM 'obs://x'")
+        .unwrap();
+    assert!(matches!(
+        q.field_transforms.get("tag"),
+        Some(SqlFieldTransform::NullIf(s)) if s == "none"
+    ));
+}
+
+#[test]
+fn select_lpad_pads_short_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slpss:a"), br#"{"code":"42"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LPAD(PAYLOAD_FIELD('code'), 5, '0') FROM 'obs://slpss'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("code").and_then(|v| v.as_str()), Some("00042"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_lpad_already_wide_string_unchanged() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://slpawsu:a"), br#"{"tag":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT LPAD(PAYLOAD_FIELD('tag'), 3, ' ') FROM 'obs://slpawsu'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some("hello"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_rpad_pads_short_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://srpss:a"), br#"{"name":"hi"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT RPAD(PAYLOAD_FIELD('name'), 5, '.') FROM 'obs://srpss'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("hi..."));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_lpad_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT LPAD(PAYLOAD_FIELD('code'), 8, '0') FROM 'obs://x'")
+        .unwrap();
+    assert!(matches!(
+        q.field_transforms.get("code"),
+        Some(SqlFieldTransform::Lpad(8, s)) if s == "0"
+    ));
+}
+
+#[test]
+fn select_rpad_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT RPAD(PAYLOAD_FIELD('label'), 10, ' ') FROM 'obs://x'")
+        .unwrap();
+    assert!(matches!(
+        q.field_transforms.get("label"),
+        Some(SqlFieldTransform::Rpad(10, s)) if s == " "
+    ));
+}
