@@ -1336,6 +1336,14 @@ pub enum SqlFieldTransform {
     Coalesce(String),
     /// `REPLACE(PAYLOAD_FIELD('f'), 'from', 'to')` — string replacement.
     Replace(String, String),
+    /// `SUBSTRING(PAYLOAD_FIELD('f'), start, len)` — extract substring (zero-based, char-indexed).
+    Substring(usize, usize),
+    /// `CAST(PAYLOAD_FIELD('f') AS INT)` — convert field to integer (truncates floats, parses strings).
+    CastInt,
+    /// `CAST(PAYLOAD_FIELD('f') AS FLOAT)` — convert field to float (parses strings).
+    CastFloat,
+    /// `CAST(PAYLOAD_FIELD('f') AS STRING)` — convert numeric field to its string representation.
+    CastString,
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1428,6 +1436,104 @@ impl SqlProjectQuery {
                 return_id = true;
                 s = &s[2..];
                 s = s.trim_start();
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect SUBSTRING(PAYLOAD_FIELD('f'), start, len)
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("SUBSTRING(PAYLOAD_FIELD(") {
+                let inner = &s["SUBSTRING(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in SUBSTRING".into())
+                })?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported(
+                            "expected ',' after PAYLOAD_FIELD in SUBSTRING".into(),
+                        )
+                    })?
+                    .trim_start();
+                let comma2 = rest.find(',').ok_or_else(|| {
+                    SqlAggError::Unsupported("SUBSTRING requires start and len arguments".into())
+                })?;
+                let start: usize = rest[..comma2].trim().parse().map_err(|_| {
+                    SqlAggError::Unsupported(
+                        "SUBSTRING start must be a non-negative integer".into(),
+                    )
+                })?;
+                let rest2 = rest[comma2 + 1..].trim_start();
+                let close = rest2.find(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' to close SUBSTRING".into())
+                })?;
+                let len: usize = rest2[..close].trim().parse().map_err(|_| {
+                    SqlAggError::Unsupported("SUBSTRING len must be a non-negative integer".into())
+                })?;
+                s = rest2[close + 1..].trim_start();
+                field_transforms.insert(field.clone(), SqlFieldTransform::Substring(start, len));
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect CAST(PAYLOAD_FIELD('f') AS INT|FLOAT|STRING)
+            if su.starts_with("CAST(PAYLOAD_FIELD(") {
+                let inner = &s["CAST(PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let rest = after_field.trim_start().strip_prefix(')').ok_or_else(|| {
+                    SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in CAST".into())
+                })?;
+                let rest = rest.trim_start();
+                if !starts_with_keyword(rest, "AS") {
+                    return Err(SqlAggError::Unsupported(
+                        "CAST requires AS INT|FLOAT|STRING".into(),
+                    ));
+                }
+                let after_as = skip_keyword(rest, "AS").trim_start();
+                let su_type = after_as.to_ascii_uppercase();
+                let (cast_transform, after_type) = if su_type.starts_with("INT") {
+                    (SqlFieldTransform::CastInt, &after_as[3..])
+                } else if su_type.starts_with("FLOAT") {
+                    (SqlFieldTransform::CastFloat, &after_as[5..])
+                } else if su_type.starts_with("STRING") {
+                    (SqlFieldTransform::CastString, &after_as[6..])
+                } else {
+                    return Err(SqlAggError::Unsupported(
+                        "CAST target type must be INT, FLOAT, or STRING".into(),
+                    ));
+                };
+                let s_after = after_type
+                    .trim_start()
+                    .strip_prefix(')')
+                    .ok_or_else(|| SqlAggError::Unsupported("expected ')' to close CAST".into()))?;
+                s = s_after.trim_start();
+                field_transforms.insert(field.clone(), cast_transform);
+                if starts_with_keyword(s, "AS") {
+                    let after_as2 = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as2
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as2.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as2[..alias_end].to_string());
+                        s = after_as2[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
                 if s.starts_with(',') {
                     s = &s[1..];
                 }
@@ -1816,6 +1922,63 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
                 val
             }
         }
+        SqlFieldTransform::Substring(start, len) => {
+            if let serde_json::Value::String(s) = val {
+                let chars: Vec<char> = s.chars().collect();
+                let begin = (*start).min(chars.len());
+                let end = (begin + len).min(chars.len());
+                serde_json::Value::String(chars[begin..end].iter().collect())
+            } else {
+                val
+            }
+        }
+        SqlFieldTransform::CastInt => match &val {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    serde_json::Value::Number(i.into())
+                } else if let Some(f) = n.as_f64() {
+                    serde_json::Value::Number((f as i64).into())
+                } else {
+                    val
+                }
+            }
+            serde_json::Value::String(s) => {
+                if let Ok(i) = s.parse::<i64>() {
+                    serde_json::Value::Number(i.into())
+                } else if let Ok(f) = s.parse::<f64>() {
+                    serde_json::Value::Number((f as i64).into())
+                } else {
+                    val
+                }
+            }
+            _ => val,
+        },
+        SqlFieldTransform::CastFloat => match &val {
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(val)
+                } else {
+                    val
+                }
+            }
+            serde_json::Value::String(s) => {
+                if let Ok(f) = s.parse::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(val)
+                } else {
+                    val
+                }
+            }
+            _ => val,
+        },
+        SqlFieldTransform::CastString => match &val {
+            serde_json::Value::Number(n) => serde_json::Value::String(n.to_string()),
+            serde_json::Value::Bool(b) => serde_json::Value::String(b.to_string()),
+            _ => val,
+        },
     }
 }
 

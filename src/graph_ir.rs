@@ -181,6 +181,10 @@ pub enum ReturnTransform {
     Coalesce(String),
     /// `REPLACE(b.field, 'from', 'to')` — string replacement.
     Replace(String, String),
+    /// `LENGTH(b.field)` — character count of a string field (returned as a number).
+    Length,
+    /// `SUBSTRING(b.field, start, len)` — extract a substring (zero-based, char-indexed).
+    Substring(usize, usize),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -1704,6 +1708,23 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
                 val
             }
         }
+        ReturnTransform::Length => {
+            if let serde_json::Value::String(s) = val {
+                serde_json::Value::Number((s.chars().count() as u64).into())
+            } else {
+                val
+            }
+        }
+        ReturnTransform::Substring(start, len) => {
+            if let serde_json::Value::String(s) = val {
+                let chars: Vec<char> = s.chars().collect();
+                let begin = (*start).min(chars.len());
+                let end = (begin + len).min(chars.len());
+                serde_json::Value::String(chars[begin..end].iter().collect())
+            } else {
+                val
+            }
+        }
     }
 }
 
@@ -2012,6 +2033,26 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         return Some((field, ReturnTransform::Replace(from_str, to_str)));
     }
 
+    // SUBSTRING(b.field, start, len)
+    if su.starts_with("SUBSTRING(") && s.ends_with(')') {
+        let inner = &s["SUBSTRING(".len()..s.len() - 1];
+        let comma1 = inner.find(',')?;
+        let field_part = inner[..comma1].trim();
+        let field = field_part
+            .strip_prefix("b.")
+            .or_else(|| field_part.strip_prefix("B."))?
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            return None;
+        }
+        let rest = inner[comma1 + 1..].trim_start();
+        let comma2 = rest.find(',')?;
+        let start: usize = rest[..comma2].trim().parse().ok()?;
+        let len: usize = rest[comma2 + 1..].trim().parse().ok()?;
+        return Some((field, ReturnTransform::Substring(start, len)));
+    }
+
     let prefixes: &[(&str, ReturnTransform)] = &[
         ("UPPER(", ReturnTransform::Upper),
         ("LOWER(", ReturnTransform::Lower),
@@ -2020,6 +2061,7 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         ("ROUND(", ReturnTransform::Round),
         ("CEIL(", ReturnTransform::Ceil),
         ("FLOOR(", ReturnTransform::Floor),
+        ("LENGTH(", ReturnTransform::Length),
     ];
     let found = prefixes
         .iter()

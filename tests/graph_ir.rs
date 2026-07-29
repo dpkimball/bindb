@@ -5547,3 +5547,208 @@ fn return_replace_all_occurrences() {
     assert_eq!(rows[0].fields["msg"], serde_json::json!("a/b/c"));
     store.close().unwrap();
 }
+
+// ── RETURN LENGTH / RETURN SUBSTRING tests ────────────────────────────────────
+
+#[test]
+fn return_length_of_string_field() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rlosf://hub"), b"{}".to_vec());
+    tx.put_object(obj("rlosf://a"), br#"{"word":"hello"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rlosf_e1"),
+        obj("rlosf://hub"),
+        obj("rlosf://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rlosf://hub' RETURN LENGTH(b.word)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["word"], serde_json::json!(5));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_length_on_non_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rlonsp://hub"), b"{}".to_vec());
+    tx.put_object(obj("rlonsp://a"), br#"{"n":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rlonsp_e1"),
+        obj("rlonsp://hub"),
+        obj("rlonsp://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rlonsp://hub' RETURN LENGTH(b.n)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["n"], serde_json::json!(42));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_length_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN LENGTH(b.name)").unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("name"),
+        Some(ReturnTransform::Length)
+    ));
+}
+
+#[test]
+fn return_substring_extracts_chars() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rsec://hub"), b"{}".to_vec());
+    tx.put_object(obj("rsec://a"), br#"{"code":"ABCDE"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rsec_e1"),
+        obj("rsec://hub"),
+        obj("rsec://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rsec://hub' RETURN SUBSTRING(b.code, 1, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["code"], serde_json::json!("BCD"));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_substring_start_beyond_end_gives_empty() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rssbe://hub"), b"{}".to_vec());
+    tx.put_object(obj("rssbe://a"), br#"{"s":"hi"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rssbe_e1"),
+        obj("rssbe://hub"),
+        obj("rssbe://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rssbe://hub' RETURN SUBSTRING(b.s, 10, 3)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["s"], serde_json::json!(""));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_substring_on_non_string_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rsonsp://hub"), b"{}".to_vec());
+    tx.put_object(obj("rsonsp://a"), br#"{"val":99}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rsonsp_e1"),
+        obj("rsonsp://hub"),
+        obj("rsonsp://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rsonsp://hub' RETURN SUBSTRING(b.val, 0, 2)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["val"], serde_json::json!(99));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_substring_parses_correctly() {
+    use bindb::ReturnTransform;
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x' RETURN SUBSTRING(b.text, 2, 5)")
+            .unwrap();
+    assert!(matches!(
+        q.return_field_transforms.get("text"),
+        Some(ReturnTransform::Substring(2, 5))
+    ));
+}
+
+#[test]
+fn return_substring_zero_len_gives_empty() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("rszlge://hub"), b"{}".to_vec());
+    tx.put_object(obj("rszlge://a"), br#"{"name":"Alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("rszlge_e1"),
+        obj("rszlge://hub"),
+        obj("rszlge://a"),
+        "X",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:X]->(b) WHERE id(a) = 'rszlge://hub' RETURN SUBSTRING(b.name, 0, 0)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows[0].fields["name"], serde_json::json!(""));
+    store.close().unwrap();
+}

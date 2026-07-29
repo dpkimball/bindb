@@ -3018,3 +3018,124 @@ fn select_replace_parses_correctly() {
         Some(SqlFieldTransform::Replace(f, t)) if f == "foo" && t == "bar"
     ));
 }
+
+// ── SUBSTRING / CAST(PAYLOAD_FIELD) in SELECT tests ───────────────────────────
+
+#[test]
+fn select_substring_extracts_chars() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://ssec:a"), br#"{"code":"ABCDE"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SUBSTRING(PAYLOAD_FIELD('code'), 1, 3) FROM 'obs://ssec'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("code").and_then(|v| v.as_str()), Some("BCD"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_substring_start_beyond_length_gives_empty() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sssbe:a"), br#"{"tag":"hi"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT SUBSTRING(PAYLOAD_FIELD('tag'), 10, 3) FROM 'obs://sssbe'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("tag").and_then(|v| v.as_str()), Some(""));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_substring_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT SUBSTRING(PAYLOAD_FIELD('name'), 2, 4) FROM 'obs://x'")
+        .unwrap();
+    assert!(matches!(
+        q.field_transforms.get("name"),
+        Some(SqlFieldTransform::Substring(2, 4))
+    ));
+}
+
+#[test]
+fn select_cast_as_int_from_float() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scaif:a"), br#"{"price":9.7}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT CAST(PAYLOAD_FIELD('price') AS INT) FROM 'obs://scaif'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("price").and_then(|v| v.as_i64()), Some(9));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_cast_as_int_from_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scaifs:a"), br#"{"count":"42"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT CAST(PAYLOAD_FIELD('count') AS INT) FROM 'obs://scaifs'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("count").and_then(|v| v.as_i64()), Some(42));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_cast_as_float_from_string() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scaff:a"), br#"{"temp":"3.14"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT CAST(PAYLOAD_FIELD('temp') AS FLOAT) FROM 'obs://scaff'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].get("temp").and_then(|v| v.as_f64()).unwrap();
+    assert!((v - 3.14).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+#[test]
+fn select_cast_as_string_from_number() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scasfn:a"), br#"{"id":100}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT CAST(PAYLOAD_FIELD('id') AS STRING) FROM 'obs://scasfn'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("id").and_then(|v| v.as_str()), Some("100"));
+    store.close().unwrap();
+}
+
+#[test]
+fn select_cast_parses_correctly() {
+    use bindb::SqlFieldTransform;
+    let q = SqlProjectQuery::parse("SELECT CAST(PAYLOAD_FIELD('score') AS INT) FROM 'obs://x'")
+        .unwrap();
+    assert!(matches!(
+        q.field_transforms.get("score"),
+        Some(SqlFieldTransform::CastInt)
+    ));
+}
