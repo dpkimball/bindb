@@ -1715,3 +1715,52 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
         return_all_fields,
     )
 }
+
+impl GraphIrUnionQuery {
+    /// Parse a `MATCH … RETURN … UNION [ALL] MATCH … RETURN …` query.
+    ///
+    /// Splits on ` UNION MATCH ` or ` UNION ALL MATCH ` (case-insensitive,
+    /// after whitespace collapsing). Each branch is parsed independently with
+    /// `GraphIrQuery::parse`. Requires at least two branches.
+    pub fn parse(src: &str) -> Result<Self, GraphIrError> {
+        let collapsed = collapse_ws(src.trim());
+        let upper = collapsed.to_ascii_uppercase();
+
+        let mut raw_branches: Vec<String> = Vec::new();
+        let mut union_all = false;
+        let mut scan = 0usize;
+        let mut seg_start = 0usize;
+
+        while scan < upper.len() {
+            if upper[scan..].starts_with(" UNION ALL MATCH ") {
+                raw_branches.push(collapsed[seg_start..scan].trim().to_string());
+                union_all = true;
+                scan += " UNION ALL ".len();
+                seg_start = scan;
+            } else if upper[scan..].starts_with(" UNION MATCH ") {
+                raw_branches.push(collapsed[seg_start..scan].trim().to_string());
+                scan += " UNION ".len();
+                seg_start = scan;
+            } else {
+                scan += 1;
+            }
+        }
+        raw_branches.push(collapsed[seg_start..].trim().to_string());
+
+        if raw_branches.len() < 2 {
+            return Err(GraphIrError::Unsupported(
+                "UNION query requires at least two MATCH clauses separated by UNION".into(),
+            ));
+        }
+
+        let branches = raw_branches
+            .iter()
+            .map(|s| GraphIrQuery::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            branches,
+            all: union_all,
+        })
+    }
+}

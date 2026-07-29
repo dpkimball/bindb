@@ -753,6 +753,35 @@ impl BinderStore {
         self.graph_ir_parsed(&q)
     }
 
+    /// Execute a `MATCH … RETURN … UNION [ALL] MATCH … RETURN …` query string.
+    ///
+    /// Branches are executed independently and their rows merged. Plain UNION
+    /// deduplicates by `object_id`; UNION ALL preserves duplicates.
+    pub fn graph_ir_union(&self, query: &str) -> Result<Vec<GraphIrRow>, StoreError> {
+        let q = GraphIrUnionQuery::parse(query).map_err(|e| StoreError::InvalidArgument {
+            message: e.to_string(),
+        })?;
+        self.graph_ir_union_projected(&q)
+    }
+
+    /// Execute a pre-parsed UNION query with field projections.
+    pub fn graph_ir_union_projected(
+        &self,
+        q: &GraphIrUnionQuery,
+    ) -> Result<Vec<GraphIrRow>, StoreError> {
+        let mut all_rows: Vec<GraphIrRow> = Vec::new();
+        for branch in &q.branches {
+            let rows = self.graph_ir_projected(branch)?;
+            all_rows.extend(rows);
+        }
+        if !q.all {
+            // UNION: deduplicate by object_id — first occurrence wins.
+            let mut seen = std::collections::HashSet::new();
+            all_rows.retain(|row| seen.insert(row.object_id.clone()));
+        }
+        Ok(all_rows)
+    }
+
     /// Execute a pre-parsed restricted graph IR query.
     pub fn graph_ir_parsed(&self, q: &GraphIrQuery) -> Result<Vec<GraphQueryMatch>, StoreError> {
         let mut matches = build_graph_query(self, q).execute()?;
