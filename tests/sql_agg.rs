@@ -4189,3 +4189,190 @@ fn select_cbrt_string_passes_through() {
     assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("root"));
     store.close().unwrap();
 }
+
+// --- Window functions ---
+
+#[test]
+fn window_row_number_global() {
+    // Three rows with different scores; ROW_NUMBER() OVER (ORDER BY score ASC) = 1,2,3
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wrng:a"), br#"{"score":30}"#.to_vec());
+    tx.put_object(oid("obs://wrng:b"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wrng:c"), br#"{"score":20}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let mut rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score'), ROW_NUMBER() OVER (ORDER BY PAYLOAD_FIELD('score') ASC) AS rn FROM 'obs://wrng'",
+        )
+        .unwrap();
+    // Sort output by score so assertions are deterministic.
+    rows.sort_by_key(|r| r.get("score").and_then(|v| v.as_i64()).unwrap_or(0));
+    assert_eq!(rows[0].get("rn").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(rows[1].get("rn").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(rows[2].get("rn").and_then(|v| v.as_u64()), Some(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_row_number_partition_by() {
+    // Two departments; ROW_NUMBER() per dept ordered by score.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://wrnp:a"),
+        br#"{"dept":"eng","score":10}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://wrnp:b"),
+        br#"{"dept":"eng","score":20}"#.to_vec(),
+    );
+    tx.put_object(oid("obs://wrnp:c"), br#"{"dept":"mkt","score":5}"#.to_vec());
+    tx.put_object(
+        oid("obs://wrnp:d"),
+        br#"{"dept":"mkt","score":15}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('dept'), PAYLOAD_FIELD('score'), \
+             ROW_NUMBER() OVER (PARTITION BY PAYLOAD_FIELD('dept') ORDER BY PAYLOAD_FIELD('score') ASC) AS rn \
+             FROM 'obs://wrnp'",
+        )
+        .unwrap();
+    // Each dept should have rn=1 and rn=2; no rn > 2.
+    let max_rn = rows
+        .iter()
+        .filter_map(|r| r.get("rn").and_then(|v| v.as_u64()))
+        .max()
+        .unwrap();
+    assert_eq!(max_rn, 2);
+    // rn=1 for score=10 in eng and score=5 in mkt.
+    let rn1_scores: std::collections::HashSet<i64> = rows
+        .iter()
+        .filter(|r| r.get("rn").and_then(|v| v.as_u64()) == Some(1))
+        .filter_map(|r| r.get("score").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(rn1_scores.contains(&10));
+    assert!(rn1_scores.contains(&5));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_rank_ties() {
+    // Two rows with same score get same rank; next rank skips.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wrt:a"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wrt:b"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wrt:c"), br#"{"score":20}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score'), RANK() OVER (ORDER BY PAYLOAD_FIELD('score') ASC) AS rnk \
+             FROM 'obs://wrt'",
+        )
+        .unwrap();
+    let ranks: std::collections::HashSet<u64> = rows
+        .iter()
+        .filter_map(|r| r.get("rnk").and_then(|v| v.as_u64()))
+        .collect();
+    // Ranks should be {1, 3} — two rows at rank 1 (tie), then rank 3 skips 2.
+    assert!(ranks.contains(&1));
+    assert!(ranks.contains(&3));
+    assert!(!ranks.contains(&2));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_dense_rank_ties() {
+    // Two rows with same score get same dense_rank; next dense_rank does NOT skip.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wdrt:a"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wdrt:b"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wdrt:c"), br#"{"score":20}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score'), DENSE_RANK() OVER (ORDER BY PAYLOAD_FIELD('score') ASC) AS dr \
+             FROM 'obs://wdrt'",
+        )
+        .unwrap();
+    let dense_ranks: std::collections::HashSet<u64> = rows
+        .iter()
+        .filter_map(|r| r.get("dr").and_then(|v| v.as_u64()))
+        .collect();
+    // Dense ranks should be {1, 2} — no gap.
+    assert!(dense_ranks.contains(&1));
+    assert!(dense_ranks.contains(&2));
+    assert!(!dense_ranks.contains(&3));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_rank_desc_order() {
+    // RANK() ORDER BY score DESC — highest score gets rank 1.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wrdo:a"), br#"{"score":100}"#.to_vec());
+    tx.put_object(oid("obs://wrdo:b"), br#"{"score":50}"#.to_vec());
+    tx.put_object(oid("obs://wrdo:c"), br#"{"score":75}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score'), RANK() OVER (ORDER BY PAYLOAD_FIELD('score') DESC) AS rnk \
+             FROM 'obs://wrdo'",
+        )
+        .unwrap();
+    let rank_for = |score: i64| {
+        rows.iter()
+            .find(|r| r.get("score").and_then(|v| v.as_i64()) == Some(score))
+            .and_then(|r| r.get("rnk").and_then(|v| v.as_u64()))
+            .unwrap()
+    };
+    assert_eq!(rank_for(100), 1);
+    assert_eq!(rank_for(75), 2);
+    assert_eq!(rank_for(50), 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn window_with_limit() {
+    // Window functions are computed before LIMIT; LIMIT then trims the output.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for i in 1u64..=5 {
+        tx.put_object(
+            oid(&format!("obs://wlim:{i}")),
+            format!(r#"{{"n":{i}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('n'), ROW_NUMBER() OVER (ORDER BY PAYLOAD_FIELD('n') ASC) AS rn \
+             FROM 'obs://wlim' ORDER BY PAYLOAD_FIELD('n') ASC LIMIT 3",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    // Row numbers in first 3 rows should be 1, 2, 3.
+    let rns: Vec<u64> = rows
+        .iter()
+        .filter_map(|r| r.get("rn").and_then(|v| v.as_u64()))
+        .collect();
+    assert_eq!(rns, vec![1, 2, 3]);
+    store.close().unwrap();
+}
