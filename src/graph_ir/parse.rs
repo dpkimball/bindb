@@ -1392,6 +1392,30 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         return Some((field, ReturnTransform::Substring(start, len)));
     }
 
+    // REPEAT(b.field, n) / LEFT(b.field, n) / RIGHT(b.field, n)
+    for (kw, mk) in [("REPEAT(", 0usize), ("LEFT(", 1usize), ("RIGHT(", 2usize)] {
+        if su.starts_with(kw) && s.ends_with(')') {
+            let inner = &s[kw.len()..s.len() - 1];
+            let comma = inner.find(',')?;
+            let field_part = inner[..comma].trim();
+            let field = field_part
+                .strip_prefix("b.")
+                .or_else(|| field_part.strip_prefix("B."))?
+                .trim()
+                .to_string();
+            if field.is_empty() {
+                return None;
+            }
+            let n: usize = inner[comma + 1..].trim().parse().ok()?;
+            let transform = match mk {
+                0 => ReturnTransform::Repeat(n),
+                1 => ReturnTransform::Left(n),
+                _ => ReturnTransform::Right(n),
+            };
+            return Some((field, transform));
+        }
+    }
+
     // LPAD(b.field, n, 'c') / RPAD(b.field, n, 'c')
     for (kw, is_lpad) in [("LPAD(", true), ("RPAD(", false)] {
         if su.starts_with(kw) && s.ends_with(')') {
