@@ -4907,6 +4907,186 @@ fn named_window_count_star() {
 }
 
 #[test]
+fn sql_case_when_basic() {
+    // SELECT CASE PAYLOAD_FIELD('role') WHEN 'admin' THEN 'A' WHEN 'user' THEN 'U' ELSE 'X' END AS tier
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scwb:a"), br#"{"role":"admin"}"#.to_vec());
+    tx.put_object(oid("obs://scwb:b"), br#"{"role":"user"}"#.to_vec());
+    tx.put_object(oid("obs://scwb:c"), br#"{"role":"guest"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT CASE PAYLOAD_FIELD('role') \
+             WHEN 'admin' THEN 'A' WHEN 'user' THEN 'U' ELSE 'X' END AS tier \
+             FROM 'obs://scwb'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let mut tiers: Vec<String> = rows
+        .iter()
+        .filter_map(|r| {
+            r.get("tier")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    tiers.sort();
+    assert_eq!(tiers, vec!["A", "U", "X"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_case_when_no_else() {
+    // Without ELSE, unmatched rows receive empty string.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scwne:a"), br#"{"status":"active"}"#.to_vec());
+    tx.put_object(oid("obs://scwne:b"), br#"{"status":"inactive"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT CASE PAYLOAD_FIELD('status') WHEN 'active' THEN 'yes' END AS flag \
+             FROM 'obs://scwne'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let yes = rows
+        .iter()
+        .filter(|r| r.get("flag").and_then(|v| v.as_str()) == Some("yes"))
+        .count();
+    assert_eq!(yes, 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_case_when_combined_with_field() {
+    // CASE alongside a regular PAYLOAD_FIELD projection.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://scwcf:a"),
+        br#"{"name":"alice","role":"admin"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://scwcf:b"),
+        br#"{"name":"bob","role":"user"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name'), \
+             CASE PAYLOAD_FIELD('role') WHEN 'admin' THEN 'elevated' ELSE 'standard' END AS access \
+             FROM 'obs://scwcf'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let access = r.get("access").and_then(|v| v.as_str()).unwrap_or("");
+        if name == "alice" {
+            assert_eq!(access, "elevated");
+        } else if name == "bob" {
+            assert_eq!(access, "standard");
+        }
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_nth_value_basic() {
+    // NTH_VALUE returns the nth row's field value from the partition-ordered sequence.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (k, v) in [("a", 10), ("b", 30), ("c", 20), ("d", 40)] {
+        tx.put_object(
+            oid(&format!("obs://wnvb:{k}")),
+            format!(r#"{{"v":{v}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             NTH_VALUE(PAYLOAD_FIELD('v'), 2) OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS nth2 \
+             FROM 'obs://wnvb'",
+        )
+        .unwrap();
+    // 2nd value in ascending order is v=20; all rows share it.
+    assert_eq!(rows.len(), 4);
+    for r in &rows {
+        assert_eq!(r.get("nth2").and_then(|v| v.as_i64()), Some(20));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_nth_value_out_of_bounds() {
+    // NTH_VALUE returns null when n exceeds the partition size.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wnvob:a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(oid("obs://wnvob:b"), br#"{"v":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             NTH_VALUE(PAYLOAD_FIELD('v'), 5) OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS nth5 \
+             FROM 'obs://wnvob'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert!(r.get("nth5").is_none_or(|v| v.is_null()));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_nth_value_partition_by() {
+    // NTH_VALUE with PARTITION BY resets per group.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wnvp:a"), br#"{"g":"x","v":1}"#.to_vec());
+    tx.put_object(oid("obs://wnvp:b"), br#"{"g":"x","v":5}"#.to_vec());
+    tx.put_object(oid("obs://wnvp:c"), br#"{"g":"y","v":10}"#.to_vec());
+    tx.put_object(oid("obs://wnvp:d"), br#"{"g":"y","v":50}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('g'), PAYLOAD_FIELD('v'), \
+             NTH_VALUE(PAYLOAD_FIELD('v'), 2) \
+             OVER (PARTITION BY PAYLOAD_FIELD('g') ORDER BY PAYLOAD_FIELD('v') ASC) AS nth2 \
+             FROM 'obs://wnvp'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for r in &rows {
+        let g = r.get("g").and_then(|v| v.as_str()).unwrap_or("");
+        let nth2 = r.get("nth2").and_then(|v| v.as_i64()).unwrap_or(-1);
+        // 2nd in group x (v=1,5) is 5; 2nd in group y (v=10,50) is 50
+        if g == "x" {
+            assert_eq!(nth2, 5, "group x 2nd");
+        } else {
+            assert_eq!(nth2, 50, "group y 2nd");
+        }
+    }
+    store.close().unwrap();
+}
+
+#[test]
 fn window_ntile_basic() {
     // NTILE(3) over 6 ordered rows assigns equal-size bucket numbers 1,1,2,2,3,3.
     let dir = tmp();
