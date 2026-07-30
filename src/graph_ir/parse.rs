@@ -189,6 +189,7 @@ impl GraphIrQuery {
             return_path,
             return_id,
             return_all_fields,
+            return_computed,
         ) = parse_return_spec(ret_spec, path_var.as_deref());
         let (order_by, limit, skip) = parse_multi_ordering_tail(ordering_tail)?;
 
@@ -221,6 +222,7 @@ impl GraphIrQuery {
             optional_clause,
             with_clause,
             path_var,
+            return_computed,
         })
     }
 }
@@ -406,7 +408,8 @@ fn parse_hops(h: &str) -> Result<(usize, usize), GraphIrError> {
     if let Some((a, b)) = h.split_once("..") {
         let min: usize = a.trim().parse().map_err(|_| GraphIrError::BadHops)?;
         let max: usize = b.trim().parse().map_err(|_| GraphIrError::BadHops)?;
-        if min == 0 || max == 0 || min > max {
+        // min=0 is valid (zero-hop paths); max=0 is not.
+        if max == 0 || min > max {
             return Err(GraphIrError::BadHops);
         }
         Ok((min, max))
@@ -1275,6 +1278,7 @@ pub(super) type ReturnSpec = (
     bool,
     bool,
     bool,
+    Vec<ComputedReturnField>,
 );
 
 /// Detect `UPPER/LOWER/TRIM/ABS/ROUND/CEIL/FLOOR(b.field)` in a RETURN selector.
@@ -1615,21 +1619,34 @@ fn split_selector_alias(p: &str) -> (&str, Option<String>) {
     (p, None)
 }
 
-/// Split a RETURN selector list on commas that are not inside parentheses.
+/// Split a RETURN selector list on commas that are not inside parentheses or single-quoted
+/// string literals.
 fn split_return_parts(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth: usize = 0;
+    let mut in_single_quote = false;
     let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (byte_pos, c) = chars[i];
+        if in_single_quote {
+            if c == '\'' {
+                in_single_quote = false;
             }
-            _ => {}
+        } else {
+            match c {
+                '\'' => in_single_quote = true,
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(&s[start..byte_pos]);
+                    start = byte_pos + c.len_utf8();
+                }
+                _ => {}
+            }
         }
+        i += 1;
     }
     parts.push(&s[start..]);
     parts
@@ -1720,6 +1737,213 @@ fn parse_case_when(s: &str) -> Option<(String, ReturnTransform, Option<String>)>
     ))
 }
 
+/// Try to parse a computed RETURN part that is a numeric binary expression.
+///
+/// Recognises `b.lhs OP b.rhs AS alias` or `b.lhs OP numlit AS alias` where
+/// OP is one of `+`, `-`, `*`, `/`, `%` (surrounded by spaces).
+/// Returns `None` when the part does not match this pattern.
+fn parse_num_bin_expr_part(p: &str) -> Option<ComputedReturnField> {
+    // Quick check: must start with b./B. and contain an arithmetic operator surrounded
+    // by spaces and an AS alias.
+    let pu = p.to_ascii_uppercase();
+    // Must contain " AS " (computed fields require an alias).
+    let as_pos = pu.find(" AS ")?;
+    let expr_part = p[..as_pos].trim();
+    let alias = p[as_pos + 4..].trim().to_string();
+    if alias.is_empty() {
+        return None;
+    }
+
+    // Must start with b.
+    let after_b = expr_part
+        .strip_prefix("b.")
+        .or_else(|| expr_part.strip_prefix("B."))?;
+
+    // Parse lhs field name (alphanumeric + underscore)
+    let lhs_end = after_b
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(after_b.len());
+    if lhs_end == 0 {
+        return None;
+    }
+    let lhs_field = after_b[..lhs_end].to_string();
+    let after_lhs = after_b[lhs_end..].trim_start();
+
+    // Detect operator (must be followed by a space or immediately the RHS)
+    let (op, after_op) = if let Some(r) = after_lhs.strip_prefix("+ ") {
+        (NumBinOp::Add, r.trim_start())
+    } else if let Some(r) = after_lhs.strip_prefix("- ") {
+        (NumBinOp::Sub, r.trim_start())
+    } else if let Some(r) = after_lhs.strip_prefix("* ") {
+        (NumBinOp::Mul, r.trim_start())
+    } else if let Some(r) = after_lhs.strip_prefix("/ ") {
+        (NumBinOp::Div, r.trim_start())
+    } else if let Some(r) = after_lhs.strip_prefix("% ") {
+        (NumBinOp::Rem, r.trim_start())
+    } else {
+        return None;
+    };
+
+    // Parse RHS: either b.field or a numeric literal
+    let rhs = if after_op.starts_with("b.") || after_op.starts_with("B.") {
+        let after_rb = &after_op[2..];
+        let rhs_end = after_rb
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after_rb.len());
+        if rhs_end == 0 {
+            return None;
+        }
+        NumArg::Field(after_rb[..rhs_end].to_string())
+    } else {
+        // Try to parse as a numeric literal (possibly negative)
+        let num_end = after_op
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_op.len());
+        if num_end == 0 {
+            return None;
+        }
+        let n: f64 = after_op[..num_end].parse().ok()?;
+        NumArg::Literal(n)
+    };
+
+    Some(ComputedReturnField {
+        alias,
+        expr: ReturnComputedExpr::NumBin(NumBinExpr {
+            lhs: NumArg::Field(lhs_field),
+            op,
+            rhs,
+        }),
+    })
+}
+
+/// Try to parse a string concatenation RETURN part.
+///
+/// Recognises `b.f1 || 'sep' || b.f2 AS alias` (chain of field refs and single-quoted
+/// literals joined by `||`). Returns `None` when the part does not match.
+fn parse_str_concat_part(p: &str) -> Option<ComputedReturnField> {
+    // Must contain " || " and " AS ".
+    if !p.contains(" || ") {
+        return None;
+    }
+    let pu = p.to_ascii_uppercase();
+    let as_pos = pu.find(" AS ")?;
+    let expr_part = p[..as_pos].trim();
+    let alias = p[as_pos + 4..].trim().to_string();
+    if alias.is_empty() {
+        return None;
+    }
+
+    // Split on " || " to get individual parts
+    let raw_parts: Vec<&str> = expr_part.split(" || ").collect();
+    if raw_parts.len() < 2 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for rp in raw_parts {
+        let rp = rp.trim();
+        if rp.starts_with("b.") || rp.starts_with("B.") {
+            let field = rp[2..].to_string();
+            if field.is_empty() {
+                return None;
+            }
+            parts.push(StrPart::Field(field));
+        } else if rp.starts_with('\'') && rp.ends_with('\'') && rp.len() >= 2 {
+            // Single-quoted literal (may be empty string '')
+            let lit = rp[1..rp.len() - 1].to_string();
+            parts.push(StrPart::Literal(lit));
+        } else {
+            return None;
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(ComputedReturnField {
+        alias,
+        expr: ReturnComputedExpr::StrConcat(StrConcatExpr { parts }),
+    })
+}
+
+/// Try to parse a searched CASE WHEN … END AS alias in a RETURN part.
+///
+/// Distinguishes from the value CASE form by requiring `CASE WHEN b.` (no field name
+/// between CASE and WHEN). Uses the existing `parse_payload_pred` logic for each branch.
+fn parse_searched_case_when(p: &str) -> Option<ComputedReturnField> {
+    let pu = p.to_ascii_uppercase();
+    // Must start with "CASE WHEN " (not "CASE b." which is value CASE)
+    if !pu.starts_with("CASE WHEN ") {
+        return None;
+    }
+    let mut rest = &p["CASE ".len()..];
+
+    let mut branches: Vec<SearchedCaseBranch> = Vec::new();
+    loop {
+        let ru = rest.to_ascii_uppercase();
+        if !ru.starts_with("WHEN ") {
+            break;
+        }
+        rest = rest["WHEN ".len()..].trim_start();
+        // Parse the predicate: expects "b.field OP value"
+        if !rest.starts_with("b.") && !rest.starts_with("B.") {
+            return None;
+        }
+        let (pred, after_pred) = parse_payload_pred(rest).ok()?;
+        rest = after_pred.trim_start();
+        // Expect THEN 'output'
+        let ru2 = rest.to_ascii_uppercase();
+        if !ru2.starts_with("THEN ") {
+            return None;
+        }
+        rest = rest["THEN ".len()..].trim_start();
+        let (out_val, after_out) = parse_single_quoted_graph(rest)?;
+        rest = after_out.trim_start();
+        branches.push(SearchedCaseBranch {
+            pred,
+            output: out_val,
+        });
+    }
+    if branches.is_empty() {
+        return None;
+    }
+
+    // Optional ELSE 'default'
+    let ru = rest.to_ascii_uppercase();
+    let else_val = if ru.starts_with("ELSE ") {
+        rest = rest["ELSE ".len()..].trim_start();
+        let (ev, after_ev) = parse_single_quoted_graph(rest)?;
+        rest = after_ev.trim_start();
+        ev
+    } else {
+        String::new()
+    };
+
+    // Expect END
+    let ru = rest.to_ascii_uppercase();
+    if !ru.starts_with("END") {
+        return None;
+    }
+    rest = rest["END".len()..].trim_start();
+
+    // Expect AS alias
+    let ru = rest.to_ascii_uppercase();
+    if !ru.starts_with("AS ") {
+        return None;
+    }
+    let after_as = rest["AS ".len()..].trim_start();
+    let alias_end = after_as
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(after_as.len());
+    if alias_end == 0 {
+        return None;
+    }
+    let alias = after_as[..alias_end].to_string();
+
+    Some(ComputedReturnField {
+        alias,
+        expr: ReturnComputedExpr::SearchedCase { branches, else_val },
+    })
+}
+
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
 pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let s = s.trim();
@@ -1733,6 +1957,7 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
             false,
             false,
             false,
+            vec![],
         );
     }
     let mut b_fields = Vec::new();
@@ -1743,10 +1968,20 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let mut return_path = false;
     let mut return_id = false;
     let mut return_all_fields = false;
+    let mut computed_fields: Vec<ComputedReturnField> = Vec::new();
     for part in split_return_parts(s) {
         let p = part.trim();
-        // Handle CASE b.field WHEN ... END [AS alias] before the generic alias splitter.
-        if p.to_ascii_uppercase().starts_with("CASE ") {
+        // Handle searched CASE WHEN b.field OP val THEN ... END AS alias first
+        // (before value CASE which starts with "CASE b.")
+        let pu = p.to_ascii_uppercase();
+        if pu.starts_with("CASE WHEN ") {
+            if let Some(cf) = parse_searched_case_when(p) {
+                computed_fields.push(cf);
+                continue;
+            }
+        }
+        // Handle CASE b.field WHEN ... END [AS alias] (value-match CASE)
+        if pu.starts_with("CASE ") {
             if let Some((field, transform, case_alias)) = parse_case_when(p) {
                 b_transforms.insert(field.clone(), transform);
                 if let Some(a) = case_alias {
@@ -1755,6 +1990,27 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
                 b_fields.push(field);
             }
             continue;
+        }
+        // Handle string concatenation: b.f1 || 'sep' || b.f2 AS alias
+        if p.contains(" || ") {
+            if let Some(cf) = parse_str_concat_part(p) {
+                computed_fields.push(cf);
+                continue;
+            }
+        }
+        // Handle numeric binary expression: b.x + b.y AS total
+        // Check for arithmetic operators surrounded by spaces
+        if (p.starts_with("b.") || p.starts_with("B."))
+            && (p.contains(" + ")
+                || p.contains(" - ")
+                || p.contains(" * ")
+                || p.contains(" / ")
+                || p.contains(" % "))
+        {
+            if let Some(cf) = parse_num_bin_expr_part(p) {
+                computed_fields.push(cf);
+                continue;
+            }
         }
         // Detect optional `AS alias` suffix, respecting parenthesis depth.
         let (selector, alias) = split_selector_alias(p);
@@ -1811,6 +2067,7 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
         return_path,
         return_id,
         return_all_fields,
+        computed_fields,
     )
 }
 
