@@ -4734,3 +4734,174 @@ fn window_sum_partition_by() {
     }
     store.close().unwrap();
 }
+
+// ── Named window functions ──────────────────────────────────────────────────
+
+#[test]
+fn named_window_row_number() {
+    // WINDOW w AS (...) reused by ROW_NUMBER() OVER w.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nwrn:a"), br#"{"grp":"x","v":3}"#.to_vec());
+    tx.put_object(oid("obs://nwrn:b"), br#"{"grp":"x","v":1}"#.to_vec());
+    tx.put_object(oid("obs://nwrn:c"), br#"{"grp":"x","v":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), ROW_NUMBER() OVER w AS rn \
+             FROM 'obs://nwrn' \
+             WINDOW w AS (ORDER BY PAYLOAD_FIELD('v') ASC)",
+        )
+        .unwrap();
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("v").and_then(|v| v.as_i64()).unwrap_or(0));
+    assert_eq!(rows[0].get("rn").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(rows[1].get("rn").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(rows[2].get("rn").and_then(|v| v.as_i64()), Some(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn named_window_shared_across_two_functions() {
+    // Same named window referenced by both ROW_NUMBER and SUM.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nws2:a"), br#"{"v":10}"#.to_vec());
+    tx.put_object(oid("obs://nws2:b"), br#"{"v":20}"#.to_vec());
+    tx.put_object(oid("obs://nws2:c"), br#"{"v":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             ROW_NUMBER() OVER w AS rn, \
+             SUM(PAYLOAD_FIELD('v')) OVER w AS running \
+             FROM 'obs://nws2' \
+             WINDOW w AS (ORDER BY PAYLOAD_FIELD('v') ASC)",
+        )
+        .unwrap();
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("v").and_then(|v| v.as_i64()).unwrap_or(0));
+    // rn: 1, 2, 3
+    assert_eq!(rows[0].get("rn").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(rows[2].get("rn").and_then(|v| v.as_i64()), Some(3));
+    // running sum: 10, 30, 60
+    assert_eq!(rows[0].get("running").and_then(|v| v.as_f64()), Some(10.0));
+    assert_eq!(rows[1].get("running").and_then(|v| v.as_f64()), Some(30.0));
+    assert_eq!(rows[2].get("running").and_then(|v| v.as_f64()), Some(60.0));
+    store.close().unwrap();
+}
+
+#[test]
+fn named_window_partition_by() {
+    // Named window with PARTITION BY — SUM resets per group.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nwpb:a"), br#"{"g":"a","v":1}"#.to_vec());
+    tx.put_object(oid("obs://nwpb:b"), br#"{"g":"a","v":2}"#.to_vec());
+    tx.put_object(oid("obs://nwpb:c"), br#"{"g":"b","v":10}"#.to_vec());
+    tx.put_object(oid("obs://nwpb:d"), br#"{"g":"b","v":20}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('g'), PAYLOAD_FIELD('v'), \
+             SUM(PAYLOAD_FIELD('v')) OVER w AS grp_total \
+             FROM 'obs://nwpb' \
+             WINDOW w AS (PARTITION BY PAYLOAD_FIELD('g'))",
+        )
+        .unwrap();
+    for r in &rows {
+        let g = r.get("g").and_then(|v| v.as_str()).unwrap_or("");
+        let t = r.get("grp_total").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if g == "a" {
+            assert_eq!(t, 3.0);
+        } else {
+            assert_eq!(t, 30.0);
+        }
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn named_window_multiple_definitions() {
+    // Two different named windows in one WINDOW clause.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nwmd:a"), br#"{"g":"x","v":5}"#.to_vec());
+    tx.put_object(oid("obs://nwmd:b"), br#"{"g":"x","v":3}"#.to_vec());
+    tx.put_object(oid("obs://nwmd:c"), br#"{"g":"y","v":8}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('g'), PAYLOAD_FIELD('v'), \
+             ROW_NUMBER() OVER w1 AS rn, \
+             SUM(PAYLOAD_FIELD('v')) OVER w2 AS grp_sum \
+             FROM 'obs://nwmd' \
+             WINDOW w1 AS (ORDER BY PAYLOAD_FIELD('v') ASC), \
+                    w2 AS (PARTITION BY PAYLOAD_FIELD('g'))",
+        )
+        .unwrap();
+    // rn is global across all rows by v order
+    let mut by_v = rows.clone();
+    by_v.sort_by_key(|r| r.get("v").and_then(|v| v.as_i64()).unwrap_or(0));
+    assert_eq!(by_v[0].get("rn").and_then(|v| v.as_i64()), Some(1)); // v=3
+    assert_eq!(by_v[1].get("rn").and_then(|v| v.as_i64()), Some(2)); // v=5
+    assert_eq!(by_v[2].get("rn").and_then(|v| v.as_i64()), Some(3)); // v=8
+                                                                     // grp_sum: group x = 8, group y = 8
+    for r in &rows {
+        let g = r.get("g").and_then(|v| v.as_str()).unwrap_or("");
+        let s = r.get("grp_sum").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if g == "x" {
+            assert_eq!(s, 8.0);
+        } else {
+            assert_eq!(s, 8.0); // y group has only v=8
+        }
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn named_window_unknown_name_errors() {
+    // Referencing an undefined window name returns an error.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nwun:a"), br#"{"v":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let result =
+        store.sql_project("SELECT ROW_NUMBER() OVER missing_window AS rn FROM 'obs://nwun'");
+    assert!(result.is_err());
+    store.close().unwrap();
+}
+
+#[test]
+fn named_window_count_star() {
+    // COUNT(*) OVER named window gives total row count.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://nwcs:a"), br#"{"v":1}"#.to_vec());
+    tx.put_object(oid("obs://nwcs:b"), br#"{"v":2}"#.to_vec());
+    tx.put_object(oid("obs://nwcs:c"), br#"{"v":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), COUNT(*) OVER w AS cnt \
+             FROM 'obs://nwcs' \
+             WINDOW w AS ()",
+        )
+        .unwrap();
+    for r in &rows {
+        assert_eq!(r.get("cnt").and_then(|v| v.as_f64()), Some(3.0));
+    }
+    store.close().unwrap();
+}
