@@ -132,6 +132,24 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 
 ---
 
+## sql_project computed-column SLAs (issue #5)
+
+These SLAs apply to the `sql_project` columnar-projection API when the SELECT list includes
+computed columns (arithmetic, string concat, searched CASE WHEN).  Scale is 1 K JSON-payload
+objects (a realistic single-user "recent observations" result set).
+
+| Computed column type | Scale | p99 |
+|---------------------|-------|-----|
+| Arithmetic (`+`, `-`, `*`, `/`) | 1 K rows | ≤ 100 ms |
+| String concat (`\|\|`) | 1 K rows | ≤ 100 ms |
+| Searched CASE WHEN | 1 K rows | ≤ 100 ms |
+
+Thresholds are intentionally conservative (latency is dominated by JSON
+deserialisation of 1 K payloads, not arithmetic).  The tests guard against
+accidental O(n²) regressions and catastrophic allocation bugs.
+
+---
+
 ## Vector search SLAs (ANN / HNSW)
 
 Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the

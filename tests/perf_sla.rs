@@ -42,6 +42,11 @@ const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — 50 K b
 /// Apple Health import scenario: one object per data point, 64-byte payload.
 const HEALTH_IMPORT_500K_S_MAX: f64 = 90.0;
 
+// ── sql_project computed-column threshold constants (1 K JSON-payload rows) ──
+const SQL_PROJECT_ARITH_1K_P99_MS_MAX: u64 = 100; // ms — arithmetic (+,-,*,/) computed column
+const SQL_PROJECT_CONCAT_1K_P99_MS_MAX: u64 = 100; // ms — string-concat (||) computed column
+const SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX: u64 = 100; // ms — searched CASE WHEN column
+
 // ── vector / ANN threshold constants ─────────────────────────────────────────
 const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
 const VECTOR_SEARCH_P99_MS_MAX: u64 = 5; // ms — knn_search p99 at 100 K vectors (OKR O3/KR3.1)
@@ -933,5 +938,113 @@ fn sla_health_import_500k_lte_90s() {
         "500 K health import took {:.1} s — SLA ≤ {:.0} s",
         elapsed,
         HEALTH_IMPORT_500K_S_MAX
+    );
+}
+
+// ── sql_project computed-column SLAs (issue #5) ──────────────────────────────
+
+/// Shared setup: 1 K objects with numeric JSON payloads for computed-column tests.
+fn build_arith_store_1k(dir: &TempDir) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for i in 0..1_000usize {
+        let payload = format!(r#"{{"a":{},"b":{},"score":{},"first":"fn{}","last":"ln{}"}}"#,
+            i, i + 1, i % 10, i, i);
+        tx.put_object(
+            ObjectId::new(format!("obs://sla_arith:{:04}", i)),
+            payload.into_bytes(),
+        );
+    }
+    store.commit_buffered(tx, "test", "").unwrap();
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_arith_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT PAYLOAD_FIELD('a') + PAYLOAD_FIELD('b') AS total \
+                 FROM 'obs://sla_arith'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_ARITH_1K_P99_MS_MAX,
+        "sql_project arith p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_ARITH_1K_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_concat_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT PAYLOAD_FIELD('first') || ' ' || PAYLOAD_FIELD('last') AS full_name \
+                 FROM 'obs://sla_arith'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_CONCAT_1K_P99_MS_MAX,
+        "sql_project concat p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_CONCAT_1K_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_searched_case_when_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT CASE WHEN PAYLOAD_FIELD('score') > 5 THEN 'hi' \
+                           WHEN PAYLOAD_FIELD('score') > 2 THEN 'mid' \
+                           ELSE 'lo' END AS tier \
+                 FROM 'obs://sla_arith'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX,
+        "sql_project searched CASE WHEN p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX,
     );
 }
