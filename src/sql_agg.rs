@@ -1505,6 +1505,7 @@ impl SqlProjectQuery {
         if !starts_with_keyword(raw, "SELECT") {
             return Err(SqlAggError::Unsupported("must start with SELECT".into()));
         }
+        let (raw, named_windows) = pre_parse_window_clause(raw)?;
         let mut s = skip_keyword(raw, "SELECT");
 
         // Optional DISTINCT keyword immediately after SELECT.
@@ -1579,7 +1580,24 @@ impl SqlProjectQuery {
                     ));
                 }
                 let after_over = skip_keyword(after_func, "OVER").trim_start();
-                let (partition_by, win_order_by, after_close) = parse_over_clause(after_over)?;
+                let (partition_by, win_order_by, after_close) = if after_over.starts_with('(') {
+                    parse_over_clause(after_over)?
+                } else {
+                    // Named window reference: OVER window_name
+                    let id_end = after_over
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_over.len());
+                    if id_end == 0 {
+                        return Err(SqlAggError::Unsupported(
+                            "expected '(' or window name after OVER".into(),
+                        ));
+                    }
+                    let wname = &after_over[..id_end];
+                    let (pb, ob) = named_windows.get(wname).ok_or_else(|| {
+                        SqlAggError::Unsupported(format!("unknown window name: {wname}"))
+                    })?;
+                    (pb.clone(), ob.clone(), &after_over[id_end..])
+                };
                 let after_close = after_close.trim_start();
                 let (alias, rest_after_alias) = if starts_with_keyword(after_close, "AS") {
                     let after_as = skip_keyword(after_close, "AS").trim_start();
@@ -2516,6 +2534,89 @@ fn parse_single_field_window_func<'a>(func_name: &str, s: &'a str) -> Option<(St
     let after_pf_close = inner[quote_end + 1..].trim_start_matches(')').trim_start();
     let after_close = after_pf_close.trim_start_matches(')');
     Some((field, after_close))
+}
+
+type NamedWindowMap = std::collections::HashMap<String, (Vec<String>, Vec<SqlProjectOrderBy>)>;
+
+/// Pre-scan `sql` for an optional `WINDOW name AS (...)` clause at depth=0.
+/// Returns `(main_sql, named_windows)` where `main_sql` is everything before the WINDOW keyword.
+/// Multiple named windows may be separated by commas: `WINDOW w1 AS (...), w2 AS (...)`.
+fn pre_parse_window_clause(sql: &str) -> Result<(&str, NamedWindowMap), SqlAggError> {
+    let upper = sql.to_ascii_uppercase();
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut pos = 0;
+    let mut window_start = None;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'(' => {
+                depth += 1;
+                pos += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                pos += 1;
+            }
+            b'\'' => {
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != b'\'' {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            _ => {
+                if depth == 0 && upper[pos..].starts_with("WINDOW") {
+                    let before_ok = pos == 0 || {
+                        let b = bytes[pos - 1];
+                        !b.is_ascii_alphanumeric() && b != b'_'
+                    };
+                    let after_pos = pos + 6;
+                    let after_ok = after_pos >= bytes.len() || {
+                        let b = bytes[after_pos];
+                        !b.is_ascii_alphanumeric() && b != b'_'
+                    };
+                    if before_ok && after_ok {
+                        window_start = Some(pos);
+                        break;
+                    }
+                }
+                pos += 1;
+            }
+        }
+    }
+
+    let Some(ws) = window_start else {
+        return Ok((sql, NamedWindowMap::new()));
+    };
+
+    let main = sql[..ws].trim_end();
+    let mut rest = sql[ws + "WINDOW".len()..].trim_start();
+    let mut map = NamedWindowMap::new();
+    loop {
+        let id_end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if id_end == 0 {
+            break;
+        }
+        let name = rest[..id_end].to_string();
+        rest = rest[id_end..].trim_start();
+        if !starts_with_keyword(rest, "AS") {
+            return Err(SqlAggError::Unsupported(format!(
+                "expected AS after window name '{name}'"
+            )));
+        }
+        rest = skip_keyword(rest, "AS").trim_start();
+        let (pb, ob, after) = parse_over_clause(rest)?;
+        map.insert(name, (pb, ob));
+        rest = after.trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    Ok((main, map))
 }
 
 /// Parse `(PARTITION BY PAYLOAD_FIELD('f'), … ORDER BY PAYLOAD_FIELD('g') ASC|DESC, …)`.
