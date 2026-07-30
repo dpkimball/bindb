@@ -822,7 +822,7 @@ fn parse_with_where(s: &str) -> Result<(NodeIdPred, Vec<PayloadPred>, &str), Gra
 /// Return true if `s` starts with a known aggregation function name followed by `(`.
 pub(super) fn is_agg_func_start(s: &str) -> bool {
     let s = s.trim_start();
-    for prefix in &["count(", "sum(", "avg(", "min(", "max("] {
+    for prefix in &["count(", "sum(", "avg(", "min(", "max(", "collect("] {
         if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
             return true;
         }
@@ -903,9 +903,11 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
         (AggFunc::Min, &s[4..])
     } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("max(") {
         (AggFunc::Max, &s[4..])
+    } else if s.len() >= 8 && s[..8].eq_ignore_ascii_case("collect(") {
+        (AggFunc::Collect, &s[8..])
     } else {
         return Err(GraphIrError::Unsupported(format!(
-            "expected aggregation function (count/sum/avg/min/max) near: {}",
+            "expected aggregation function (count/sum/avg/min/max/collect) near: {}",
             &s[..s.len().min(20)]
         )));
     };
@@ -940,7 +942,7 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
     }
     let after_close = after_arg[1..].trim_start();
 
-    // Require field for sum/avg/min/max.
+    // Require field for sum/avg/min/max (collect accepts both b and b.field).
     if matches!(
         func,
         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max

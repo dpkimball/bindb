@@ -8097,3 +8097,269 @@ fn chained_match_parse_error_on_single_match() {
     let err = GraphIrChainedQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://a' RETURN b.name");
     assert!(err.is_err());
 }
+
+// ── COLLECT aggregation ──────────────────────────────────────────────────────
+
+#[test]
+fn collect_field_values() {
+    // collect(b.name) returns a JSON array of all name values.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://col:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://col:a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("obs://col:b"), br#"{"name":"bob"}"#.to_vec());
+    tx.put_object(obj("obs://col:c"), br#"{"name":"carol"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://col:1"),
+        obj("obs://col:hub"),
+        obj("obs://col:a"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://col:2"),
+        obj("obs://col:hub"),
+        obj("obs://col:b"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://col:3"),
+        obj("obs://col:hub"),
+        obj("obs://col:c"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'obs://col:hub' \
+             WITH collect(b.name) AS names RETURN names",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let arr = rows[0].get("names").and_then(|v| v.as_array()).unwrap();
+    let mut names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["alice", "bob", "carol"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn collect_node_ids() {
+    // collect(b) returns a JSON array of object_id strings.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cid:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://cid:x"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://cid:y"), br#"{}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://cid:1"),
+        obj("obs://cid:hub"),
+        obj("obs://cid:x"),
+        "LINK",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://cid:2"),
+        obj("obs://cid:hub"),
+        obj("obs://cid:y"),
+        "LINK",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://cid:hub' \
+             WITH collect(b) AS ids RETURN ids",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let arr = rows[0].get("ids").and_then(|v| v.as_array()).unwrap();
+    let mut ids: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["obs://cid:x", "obs://cid:y"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn collect_grouped_by_field() {
+    // collect(b.name) GROUP BY b.role — each role gets its own list of names.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cgf:hub"), br#"{}"#.to_vec());
+    tx.put_object(
+        obj("obs://cgf:a"),
+        br#"{"role":"admin","name":"alice"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("obs://cgf:b"),
+        br#"{"role":"admin","name":"bob"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("obs://cgf:c"),
+        br#"{"role":"user","name":"carol"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://cgf:1"),
+        obj("obs://cgf:hub"),
+        obj("obs://cgf:a"),
+        "HAS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://cgf:2"),
+        obj("obs://cgf:hub"),
+        obj("obs://cgf:b"),
+        "HAS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://cgf:3"),
+        obj("obs://cgf:hub"),
+        obj("obs://cgf:c"),
+        "HAS",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let mut rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:HAS*1..1]->(b) WHERE id(a) = 'obs://cgf:hub' \
+             WITH collect(b.name) AS members GROUP BY b.role RETURN members",
+        )
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    assert_eq!(rows.len(), 2);
+
+    // admin group has alice and bob
+    let admin_arr = rows[0].get("members").and_then(|v| v.as_array()).unwrap();
+    let mut admin_names: Vec<&str> = admin_arr.iter().filter_map(|v| v.as_str()).collect();
+    admin_names.sort();
+    assert_eq!(admin_names, vec!["alice", "bob"]);
+
+    // user group has only carol
+    let user_arr = rows[1].get("members").and_then(|v| v.as_array()).unwrap();
+    let user_names: Vec<&str> = user_arr.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(user_names, vec!["carol"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn collect_combined_with_count() {
+    // collect(b.name) and count(b) in the same WITH clause.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://ccc:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://ccc:a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("obs://ccc:b"), br#"{"name":"bob"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://ccc:1"),
+        obj("obs://ccc:hub"),
+        obj("obs://ccc:a"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://ccc:2"),
+        obj("obs://ccc:hub"),
+        obj("obs://ccc:b"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'obs://ccc:hub' \
+             WITH count(b) AS cnt, collect(b.name) AS names RETURN cnt, names",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("cnt").and_then(|v| v.as_i64()), Some(2));
+    let arr = rows[0].get("names").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(arr.len(), 2);
+    store.close().unwrap();
+}
+
+#[test]
+fn collect_empty_result() {
+    // collect on a MATCH that finds nothing returns an empty array.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cer:hub"), br#"{}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'obs://cer:hub' \
+             WITH collect(b.name) AS names RETURN names",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let arr = rows[0].get("names").and_then(|v| v.as_array()).unwrap();
+    assert!(arr.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn collect_missing_field_gives_null_entries() {
+    // Nodes that lack the collected field contribute JSON null to the array.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cmf:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://cmf:a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("obs://cmf:b"), br#"{}"#.to_vec()); // no name field
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://cmf:1"),
+        obj("obs://cmf:hub"),
+        obj("obs://cmf:a"),
+        "LINK",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://cmf:2"),
+        obj("obs://cmf:hub"),
+        obj("obs://cmf:b"),
+        "LINK",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://cmf:hub' \
+             WITH collect(b.name) AS names RETURN names",
+        )
+        .unwrap();
+    let arr = rows[0].get("names").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(arr.len(), 2);
+    let nulls = arr.iter().filter(|v| v.is_null()).count();
+    let strings = arr.iter().filter(|v| v.is_string()).count();
+    assert_eq!(nulls, 1);
+    assert_eq!(strings, 1);
+    store.close().unwrap();
+}
