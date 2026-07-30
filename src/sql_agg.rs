@@ -1439,6 +1439,16 @@ pub enum SqlWindowFunc {
     Min { field: String },
     /// `MAX(PAYLOAD_FIELD('f'))` — maximum of field; running if ORDER BY present.
     Max { field: String },
+    /// `NTILE(n)` — divides the partition into n equal-sized buckets; assigns 1-based bucket number.
+    Ntile { buckets: usize },
+    /// `FIRST_VALUE(PAYLOAD_FIELD('f'))` — value of field from the first row in the partition window.
+    FirstValue { field: String },
+    /// `LAST_VALUE(PAYLOAD_FIELD('f'))` — value of field from the last row in the partition window.
+    LastValue { field: String },
+    /// `PERCENT_RANK()` — relative rank: (rank−1)/(n−1); 0.0 for the first row, 1.0 for the last.
+    PercentRank,
+    /// `CUME_DIST()` — cumulative distribution: fraction of rows with ORDER BY key ≤ current row.
+    CumeDist,
 }
 
 /// A window column: `FUNC() OVER (PARTITION BY … ORDER BY …) AS alias`.
@@ -1569,6 +1579,18 @@ impl SqlProjectQuery {
                 Some((SqlWindowFunc::DenseRank, &s["DENSE_RANK()".len()..]))
             } else if su.starts_with("RANK()") {
                 Some((SqlWindowFunc::Rank, &s["RANK()".len()..]))
+            } else if su.starts_with("NTILE(") {
+                parse_ntile_func(s)
+            } else if su.starts_with("FIRST_VALUE(PAYLOAD_FIELD(") {
+                parse_single_field_window_func("FIRST_VALUE", s)
+                    .map(|(f, r)| (SqlWindowFunc::FirstValue { field: f }, r))
+            } else if su.starts_with("LAST_VALUE(PAYLOAD_FIELD(") {
+                parse_single_field_window_func("LAST_VALUE", s)
+                    .map(|(f, r)| (SqlWindowFunc::LastValue { field: f }, r))
+            } else if su.starts_with("PERCENT_RANK()") {
+                Some((SqlWindowFunc::PercentRank, &s["PERCENT_RANK()".len()..]))
+            } else if su.starts_with("CUME_DIST()") {
+                Some((SqlWindowFunc::CumeDist, &s["CUME_DIST()".len()..]))
             } else {
                 None
             };
@@ -1622,6 +1644,11 @@ impl SqlProjectQuery {
                         SqlWindowFunc::Count => "count",
                         SqlWindowFunc::Min { .. } => "min",
                         SqlWindowFunc::Max { .. } => "max",
+                        SqlWindowFunc::Ntile { .. } => "ntile",
+                        SqlWindowFunc::FirstValue { .. } => "first_value",
+                        SqlWindowFunc::LastValue { .. } => "last_value",
+                        SqlWindowFunc::PercentRank => "percent_rank",
+                        SqlWindowFunc::CumeDist => "cume_dist",
                     };
                     (default.to_string(), after_close)
                 };
@@ -2536,6 +2563,22 @@ fn parse_single_field_window_func<'a>(func_name: &str, s: &'a str) -> Option<(St
     Some((field, after_close))
 }
 
+/// Parse `NTILE(n)` at the start of `s`, returning `(SqlWindowFunc::Ntile{buckets:n}, rest)`.
+fn parse_ntile_func(s: &str) -> Option<(SqlWindowFunc, &str)> {
+    // s starts with "NTILE(" (case-insensitive already checked)
+    let after_open = &s["NTILE(".len()..];
+    let n_end = after_open
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after_open.len());
+    if n_end == 0 {
+        return None;
+    }
+    let buckets: usize = after_open[..n_end].parse().ok()?;
+    let after_n = after_open[n_end..].trim_start();
+    let after_close = after_n.strip_prefix(')')?;
+    Some((SqlWindowFunc::Ntile { buckets }, after_close))
+}
+
 type NamedWindowMap = std::collections::HashMap<String, (Vec<String>, Vec<SqlProjectOrderBy>)>;
 
 /// Pre-scan `sql` for an optional `WINDOW name AS (...)` clause at depth=0.
@@ -3260,13 +3303,18 @@ impl BinderStore {
                     | SqlWindowFunc::Sum { field }
                     | SqlWindowFunc::Avg { field }
                     | SqlWindowFunc::Min { field }
-                    | SqlWindowFunc::Max { field } => {
+                    | SqlWindowFunc::Max { field }
+                    | SqlWindowFunc::FirstValue { field }
+                    | SqlWindowFunc::LastValue { field } => {
                         extras.push(field.clone());
                     }
                     SqlWindowFunc::Count
                     | SqlWindowFunc::RowNumber
                     | SqlWindowFunc::Rank
-                    | SqlWindowFunc::DenseRank => {}
+                    | SqlWindowFunc::DenseRank
+                    | SqlWindowFunc::Ntile { .. }
+                    | SqlWindowFunc::PercentRank
+                    | SqlWindowFunc::CumeDist => {}
                 }
                 extras
             })
@@ -3587,6 +3635,86 @@ impl BinderStore {
                         };
                         for (pos, &idx) in sorted.iter().enumerate() {
                             rows[idx].insert(wc.alias.clone(), values[pos].clone());
+                        }
+                    }
+                    SqlWindowFunc::Ntile { buckets } => {
+                        let n = sorted.len();
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            // bucket = floor(pos * buckets / n) + 1, clamped to buckets
+                            let bucket = if n == 0 || *buckets == 0 {
+                                1usize
+                            } else {
+                                (pos * buckets / n + 1).min(*buckets)
+                            };
+                            rows[idx]
+                                .insert(wc.alias.clone(), serde_json::Value::Number(bucket.into()));
+                        }
+                    }
+                    SqlWindowFunc::FirstValue { field } => {
+                        let first_val = sorted
+                            .first()
+                            .and_then(|&idx| rows[idx].get(field).cloned())
+                            .unwrap_or(serde_json::Value::Null);
+                        for &idx in &sorted {
+                            rows[idx].insert(wc.alias.clone(), first_val.clone());
+                        }
+                    }
+                    SqlWindowFunc::LastValue { field } => {
+                        let last_val = sorted
+                            .last()
+                            .and_then(|&idx| rows[idx].get(field).cloned())
+                            .unwrap_or(serde_json::Value::Null);
+                        for &idx in &sorted {
+                            rows[idx].insert(wc.alias.clone(), last_val.clone());
+                        }
+                    }
+                    SqlWindowFunc::PercentRank => {
+                        let n = sorted.len();
+                        // Compute rank (with gaps, same as RANK) then (rank-1)/(n-1).
+                        let mut cur_rank = 1usize;
+                        let mut gap = 0usize;
+                        for (pos, (&idx, key)) in sorted.iter().zip(order_keys.iter()).enumerate() {
+                            if pos == 0 {
+                                cur_rank = 1;
+                                gap = 0;
+                            } else if key == &order_keys[pos - 1] {
+                                gap += 1;
+                            } else {
+                                cur_rank += 1 + gap;
+                                gap = 0;
+                            }
+                            let pct = if n <= 1 {
+                                0.0f64
+                            } else {
+                                (cur_rank - 1) as f64 / (n - 1) as f64
+                            };
+                            rows[idx].insert(
+                                wc.alias.clone(),
+                                serde_json::Number::from_f64(pct)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                    }
+                    SqlWindowFunc::CumeDist => {
+                        let n = sorted.len();
+                        // For each position, cume_dist = (number of rows with key <= current key) / n.
+                        // Rows with the same ORDER BY key share the same cume_dist value.
+                        let mut pos = 0usize;
+                        while pos < n {
+                            let key = &order_keys[pos];
+                            let mut end = pos + 1;
+                            while end < n && &order_keys[end] == key {
+                                end += 1;
+                            }
+                            let cd = end as f64 / n as f64;
+                            let v = serde_json::Number::from_f64(cd)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null);
+                            for &idx in &sorted[pos..end] {
+                                rows[idx].insert(wc.alias.clone(), v.clone());
+                            }
+                            pos = end;
                         }
                     }
                 }

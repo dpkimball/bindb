@@ -4905,3 +4905,202 @@ fn named_window_count_star() {
     }
     store.close().unwrap();
 }
+
+#[test]
+fn window_ntile_basic() {
+    // NTILE(3) over 6 ordered rows assigns equal-size bucket numbers 1,1,2,2,3,3.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (k, v) in [
+        ("a", 10),
+        ("b", 20),
+        ("c", 30),
+        ("d", 40),
+        ("e", 50),
+        ("f", 60),
+    ] {
+        tx.put_object(
+            oid(&format!("obs://ntb:{k}")),
+            format!(r#"{{"v":{v}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             NTILE(3) OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS bucket \
+             FROM 'obs://ntb'",
+        )
+        .unwrap();
+    let mut sorted = rows.clone();
+    sorted.sort_by_key(|r| r.get("v").and_then(|v| v.as_i64()).unwrap_or(0));
+    // buckets: [1,1,2,2,3,3] for v=[10,20,30,40,50,60]
+    let expected = [1i64, 1, 2, 2, 3, 3];
+    for (r, &exp) in sorted.iter().zip(expected.iter()) {
+        assert_eq!(r.get("bucket").and_then(|v| v.as_i64()), Some(exp));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_first_value() {
+    // FIRST_VALUE returns the value from the first row in the partition ordering.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (k, v) in [("a", 3), ("b", 1), ("c", 4), ("d", 2)] {
+        tx.put_object(
+            oid(&format!("obs://wfv:{k}")),
+            format!(r#"{{"v":{v}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             FIRST_VALUE(PAYLOAD_FIELD('v')) OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS fv \
+             FROM 'obs://wfv'",
+        )
+        .unwrap();
+    // All rows share FIRST_VALUE = 1 (smallest v after ORDER BY ASC).
+    assert_eq!(rows.len(), 4);
+    for r in &rows {
+        assert_eq!(r.get("fv").and_then(|v| v.as_i64()), Some(1));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_last_value() {
+    // LAST_VALUE returns the value from the last row in the partition ordering.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (k, v) in [("a", 3), ("b", 1), ("c", 4), ("d", 2)] {
+        tx.put_object(
+            oid(&format!("obs://wlv:{k}")),
+            format!(r#"{{"v":{v}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             LAST_VALUE(PAYLOAD_FIELD('v')) OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS lv \
+             FROM 'obs://wlv'",
+        )
+        .unwrap();
+    // All rows share LAST_VALUE = 4 (largest v after ORDER BY ASC).
+    assert_eq!(rows.len(), 4);
+    for r in &rows {
+        assert_eq!(r.get("lv").and_then(|v| v.as_i64()), Some(4));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_percent_rank() {
+    // PERCENT_RANK over 4 distinct-value rows: 0.0, 1/3, 2/3, 1.0.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (k, v) in [("a", 10), ("b", 20), ("c", 30), ("d", 40)] {
+        tx.put_object(
+            oid(&format!("obs://wpr:{k}")),
+            format!(r#"{{"v":{v}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             PERCENT_RANK() OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS pr \
+             FROM 'obs://wpr'",
+        )
+        .unwrap();
+    let mut sorted = rows.clone();
+    sorted.sort_by_key(|r| r.get("v").and_then(|v| v.as_i64()).unwrap_or(0));
+    let eps = 1e-9;
+    let expected = [0.0f64, 1.0 / 3.0, 2.0 / 3.0, 1.0];
+    for (r, &exp) in sorted.iter().zip(expected.iter()) {
+        let pr = r.get("pr").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+        assert!((pr - exp).abs() < eps, "expected {exp}, got {pr}");
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_cume_dist_with_ties() {
+    // CUME_DIST: ties share the same value; rows with v=20 both get 3/4.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (k, v) in [("a", 10), ("b", 20), ("c", 20), ("d", 40)] {
+        tx.put_object(
+            oid(&format!("obs://wcd:{k}")),
+            format!(r#"{{"v":{v}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             CUME_DIST() OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS cd \
+             FROM 'obs://wcd'",
+        )
+        .unwrap();
+    let mut sorted = rows.clone();
+    sorted.sort_by_key(|r| r.get("v").and_then(|v| v.as_i64()).unwrap_or(0));
+    let eps = 1e-9;
+    // v=10 → 1/4, v=20 (×2) → 3/4, v=40 → 4/4
+    let cd0 = sorted[0].get("cd").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    let cd1 = sorted[1].get("cd").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    let cd2 = sorted[2].get("cd").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    let cd3 = sorted[3].get("cd").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    assert!((cd0 - 0.25).abs() < eps, "got {cd0}");
+    assert!((cd1 - 0.75).abs() < eps, "got {cd1}");
+    assert!((cd2 - 0.75).abs() < eps, "got {cd2}");
+    assert!((cd3 - 1.0).abs() < eps, "got {cd3}");
+    store.close().unwrap();
+}
+
+#[test]
+fn window_first_last_with_partition_by() {
+    // FIRST_VALUE and LAST_VALUE with PARTITION BY reset per group.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wflp:a"), br#"{"g":"x","v":1}"#.to_vec());
+    tx.put_object(oid("obs://wflp:b"), br#"{"g":"x","v":5}"#.to_vec());
+    tx.put_object(oid("obs://wflp:c"), br#"{"g":"y","v":10}"#.to_vec());
+    tx.put_object(oid("obs://wflp:d"), br#"{"g":"y","v":50}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('g'), PAYLOAD_FIELD('v'), \
+             FIRST_VALUE(PAYLOAD_FIELD('v')) OVER (PARTITION BY PAYLOAD_FIELD('g') ORDER BY PAYLOAD_FIELD('v') ASC) AS fv, \
+             LAST_VALUE(PAYLOAD_FIELD('v')) OVER (PARTITION BY PAYLOAD_FIELD('g') ORDER BY PAYLOAD_FIELD('v') ASC) AS lv \
+             FROM 'obs://wflp'",
+        )
+        .unwrap();
+    for r in &rows {
+        let g = r.get("g").and_then(|v| v.as_str()).unwrap_or("");
+        let fv = r.get("fv").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let lv = r.get("lv").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if g == "x" {
+            assert_eq!(fv, 1, "group x first");
+            assert_eq!(lv, 5, "group x last");
+        } else {
+            assert_eq!(fv, 10, "group y first");
+            assert_eq!(lv, 50, "group y last");
+        }
+    }
+    store.close().unwrap();
+}
