@@ -8363,3 +8363,180 @@ fn collect_missing_field_gives_null_entries() {
     assert_eq!(strings, 1);
     store.close().unwrap();
 }
+
+#[test]
+fn case_when_basic() {
+    // CASE b.role WHEN 'admin' THEN 'A' WHEN 'user' THEN 'U' ELSE 'X' END AS tier
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cwb:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://cwb:a"), br#"{"role":"admin"}"#.to_vec());
+    tx.put_object(obj("obs://cwb:b"), br#"{"role":"user"}"#.to_vec());
+    tx.put_object(obj("obs://cwb:c"), br#"{"role":"guest"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for k in ["a", "b", "c"] {
+        tx2.put_edge(
+            eid(&format!("e://cwb:{k}")),
+            obj("obs://cwb:hub"),
+            obj(&format!("obs://cwb:{k}")),
+            "LINK",
+            None,
+        );
+    }
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://cwb:hub' \
+         RETURN CASE b.role WHEN 'admin' THEN 'A' WHEN 'user' THEN 'U' ELSE 'X' END AS tier",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 3);
+    let tiers: std::collections::HashSet<String> = rows
+        .iter()
+        .filter_map(|r| {
+            r.fields
+                .get("tier")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert!(tiers.contains("A"), "missing A: {tiers:?}");
+    assert!(tiers.contains("U"), "missing U: {tiers:?}");
+    assert!(tiers.contains("X"), "missing X: {tiers:?}");
+    store.close().unwrap();
+}
+
+#[test]
+fn case_when_no_else_uses_empty_string() {
+    // Without ELSE, unmatched nodes get an empty string.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cwne:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://cwne:a"), br#"{"status":"active"}"#.to_vec());
+    tx.put_object(obj("obs://cwne:b"), br#"{"status":"inactive"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for k in ["a", "b"] {
+        tx2.put_edge(
+            eid(&format!("e://cwne:{k}")),
+            obj("obs://cwne:hub"),
+            obj(&format!("obs://cwne:{k}")),
+            "LINK",
+            None,
+        );
+    }
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://cwne:hub' \
+         RETURN CASE b.status WHEN 'active' THEN 'yes' END AS flag",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 2);
+    let yes_count = rows
+        .iter()
+        .filter(|r| r.fields.get("flag").and_then(|v| v.as_str()) == Some("yes"))
+        .count();
+    assert_eq!(yes_count, 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn case_when_combined_with_other_fields() {
+    // CASE alongside regular field projection.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cwcf:hub"), br#"{}"#.to_vec());
+    tx.put_object(
+        obj("obs://cwcf:a"),
+        br#"{"name":"alice","role":"admin"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("obs://cwcf:b"),
+        br#"{"name":"bob","role":"user"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for k in ["a", "b"] {
+        tx2.put_edge(
+            eid(&format!("e://cwcf:{k}")),
+            obj("obs://cwcf:hub"),
+            obj(&format!("obs://cwcf:{k}")),
+            "LINK",
+            None,
+        );
+    }
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://cwcf:hub' \
+         RETURN b.name, CASE b.role WHEN 'admin' THEN 'elevated' ELSE 'standard' END AS access",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        let name = r.fields.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let access = r
+            .fields
+            .get("access")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if name == "alice" {
+            assert_eq!(access, "elevated");
+        } else if name == "bob" {
+            assert_eq!(access, "standard");
+        }
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn case_when_numeric_field_match() {
+    // CASE on a numeric field; match values are compared as their JSON string representation.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://cwnm:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://cwnm:a"), br#"{"score":1}"#.to_vec());
+    tx.put_object(obj("obs://cwnm:b"), br#"{"score":2}"#.to_vec());
+    tx.put_object(obj("obs://cwnm:c"), br#"{"score":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for k in ["a", "b", "c"] {
+        tx2.put_edge(
+            eid(&format!("e://cwnm:{k}")),
+            obj("obs://cwnm:hub"),
+            obj(&format!("obs://cwnm:{k}")),
+            "LINK",
+            None,
+        );
+    }
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://cwnm:hub' \
+         RETURN CASE b.score WHEN '1' THEN 'low' WHEN '2' THEN 'mid' ELSE 'high' END AS band",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 3);
+    let mut bands: Vec<String> = rows
+        .iter()
+        .filter_map(|r| {
+            r.fields
+                .get("band")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    bands.sort();
+    assert_eq!(bands, vec!["high", "low", "mid"]);
+    store.close().unwrap();
+}

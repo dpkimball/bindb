@@ -428,6 +428,20 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             val
         }
+        ReturnTransform::CaseWhen { branches, else_val } => {
+            let field_str = match &val {
+                serde_json::Value::String(s) => s.as_str().to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => String::new(),
+            };
+            for (match_val, output) in branches {
+                if field_str == *match_val {
+                    return serde_json::Value::String(output.clone());
+                }
+            }
+            serde_json::Value::String(else_val.clone())
+        }
     }
 }
 

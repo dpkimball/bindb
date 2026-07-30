@@ -165,6 +165,12 @@ pub enum ReturnTransform {
     Trunc,
     /// `CBRT(b.field)` — cube root of a numeric field.
     Cbrt,
+    /// `CASE b.field WHEN 'v1' THEN 'out1' [WHEN 'v2' THEN 'out2'] [ELSE 'default'] END`
+    /// — value-match conditional; returns first matching output or `else_val`.
+    CaseWhen {
+        branches: Vec<(String, String)>,
+        else_val: String,
+    },
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
