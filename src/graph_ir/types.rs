@@ -171,6 +171,9 @@ pub enum ReturnTransform {
         branches: Vec<(String, String)>,
         else_val: String,
     },
+    /// `RETURN b.field[n]` — extract the nth element (0-based) from a JSON array field.
+    /// Non-array values pass through unchanged; out-of-bounds returns null.
+    Index(usize),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -442,6 +445,12 @@ pub struct GraphIrQuery {
     pub return_id: bool,
     /// When true, all JSON fields from matched node payload are returned (`RETURN b.*`).
     pub return_all_fields: bool,
+    /// When true, the edge type/label of the via-edge is included in `GraphIrRow::edge_fields`
+    /// under the key `"type(r)"`.
+    pub return_edge_type: bool,
+    /// When true, the traversal hop depth is included in `GraphIrRow::fields` under the key
+    /// `"depth"`.
+    pub return_depth: bool,
     /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
     pub distinct: bool,
     /// ORDER BY sort keys (multi-key, evaluated left to right). Empty = no sort.

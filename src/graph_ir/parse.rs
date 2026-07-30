@@ -190,6 +190,8 @@ impl GraphIrQuery {
             return_id,
             return_all_fields,
             return_computed,
+            return_edge_type,
+            return_depth,
         ) = parse_return_spec(ret_spec, path_var.as_deref());
         let (order_by, limit, skip) = parse_multi_ordering_tail(ordering_tail)?;
 
@@ -212,6 +214,8 @@ impl GraphIrQuery {
             return_field_aliases,
             return_field_transforms,
             return_all_fields,
+            return_edge_type,
+            return_depth,
             edge_return_fields,
             return_path,
             return_id,
@@ -1279,6 +1283,8 @@ pub(super) type ReturnSpec = (
     bool,
     bool,
     Vec<ComputedReturnField>,
+    bool,
+    bool,
 );
 
 /// Detect `UPPER/LOWER/TRIM/ABS/ROUND/CEIL/FLOOR(b.field)` in a RETURN selector.
@@ -1958,6 +1964,8 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
             false,
             false,
             vec![],
+            false,
+            false,
         );
     }
     let mut b_fields = Vec::new();
@@ -1969,6 +1977,8 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let mut return_id = false;
     let mut return_all_fields = false;
     let mut computed_fields: Vec<ComputedReturnField> = Vec::new();
+    let mut return_edge_type = false;
+    let mut return_depth = false;
     for part in split_return_parts(s) {
         let p = part.trim();
         // Handle searched CASE WHEN b.field OP val THEN ... END AS alias first
@@ -2021,23 +2031,45 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
             return_id = true;
         } else if selector.eq_ignore_ascii_case("b.*") {
             return_all_fields = true;
+        } else if selector.eq_ignore_ascii_case("type(r)") || selector.eq_ignore_ascii_case("type(a)") {
+            return_edge_type = true;
+        } else if selector.eq_ignore_ascii_case("depth") {
+            return_depth = true;
         } else if let Some((field, transform)) = parse_return_transform(selector) {
-            // UPPER(b.field) / LOWER(b.field) / TRIM(b.field)
+            // UPPER(b.field) / LOWER(b.field) / TRIM(b.field) / etc.
             b_transforms.insert(field.clone(), transform);
             if let Some(a) = alias {
                 b_aliases.insert(field.clone(), a);
             }
             b_fields.push(field);
-        } else if let Some(field) = selector
+        } else if let Some(raw_field) = selector
             .strip_prefix("b.")
             .or_else(|| selector.strip_prefix("B."))
         {
-            let f = field.trim().to_string();
-            if !f.is_empty() {
-                if let Some(a) = alias {
-                    b_aliases.insert(f.clone(), a);
+            // Check for list-index suffix: b.field[n]
+            if let Some(bracket) = raw_field.find('[') {
+                let base = raw_field[..bracket].trim().to_string();
+                let rest = raw_field[bracket..].trim();
+                if let Some(close) = rest.find(']') {
+                    let idx_str = rest[1..close].trim();
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if !base.is_empty() {
+                            b_transforms.insert(base.clone(), ReturnTransform::Index(idx));
+                            if let Some(a) = alias {
+                                b_aliases.insert(base.clone(), a);
+                            }
+                            b_fields.push(base);
+                        }
+                    }
                 }
-                b_fields.push(f);
+            } else {
+                let f = raw_field.trim().to_string();
+                if !f.is_empty() {
+                    if let Some(a) = alias {
+                        b_aliases.insert(f.clone(), a);
+                    }
+                    b_fields.push(f);
+                }
             }
         } else if let Some(field) = selector
             .strip_prefix("r.")
@@ -2068,6 +2100,8 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
         return_id,
         return_all_fields,
         computed_fields,
+        return_edge_type,
+        return_depth,
     )
 }
 
