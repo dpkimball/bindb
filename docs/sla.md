@@ -132,6 +132,18 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 
 ---
 
+## sql_project CASE WHEN / NTH_VALUE SLAs (issue #5)
+
+These SLAs apply when the SELECT list contains a CASE WHEN expression or an NTH_VALUE
+window function.  Scale is 1 K JSON-payload objects.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| Simple CASE WHEN (field equality branches) | 1 K rows | ≤ 100 ms |
+| NTH_VALUE window (global partition, ordered) | 1 K rows | ≤ 100 ms |
+
+---
+
 ## Vector search SLAs (ANN / HNSW)
 
 Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the

@@ -42,6 +42,10 @@ const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — 50 K b
 /// Apple Health import scenario: one object per data point, 64-byte payload.
 const HEALTH_IMPORT_500K_S_MAX: f64 = 90.0;
 
+// ── sql_project CASE WHEN / NTH_VALUE threshold constants (1 K rows) ─────────
+const SQL_PROJECT_CASE_WHEN_1K_P99_MS_MAX: u64 = 100; // ms — simple CASE WHEN expression
+const SQL_PROJECT_NTH_VALUE_1K_P99_MS_MAX: u64 = 100; // ms — NTH_VALUE window function
+
 // ── vector / ANN threshold constants ─────────────────────────────────────────
 const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
 const VECTOR_SEARCH_P99_MS_MAX: u64 = 5; // ms — knn_search p99 at 100 K vectors (OKR O3/KR3.1)
@@ -933,5 +937,88 @@ fn sla_health_import_500k_lte_90s() {
         "500 K health import took {:.1} s — SLA ≤ {:.0} s",
         elapsed,
         HEALTH_IMPORT_500K_S_MAX
+    );
+}
+
+// ── sql_project CASE WHEN / NTH_VALUE SLAs (issue #5) ────────────────────────
+
+fn build_case_when_store_1k(dir: &TempDir) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    let roles = ["admin", "user", "guest", "moderator"];
+    let mut tx = Transaction::new();
+    for i in 0..1_000usize {
+        let role = roles[i % roles.len()];
+        let payload = format!(r#"{{"role":"{}","v":{}}}"#, role, i % 20);
+        tx.put_object(
+            ObjectId::new(format!("obs://sla_cw:{:04}", i)),
+            payload.into_bytes(),
+        );
+    }
+    store.commit_buffered(tx, "test", "").unwrap();
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_case_when_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_case_when_store_1k(&dir);
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT CASE PAYLOAD_FIELD('role') \
+                       WHEN 'admin' THEN 'A' \
+                       WHEN 'user' THEN 'U' \
+                       WHEN 'moderator' THEN 'M' \
+                       ELSE 'X' END AS tier \
+                 FROM 'obs://sla_cw'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_CASE_WHEN_1K_P99_MS_MAX,
+        "sql_project CASE WHEN p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_CASE_WHEN_1K_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_nth_value_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_case_when_store_1k(&dir);
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT PAYLOAD_FIELD('v'), \
+                       NTH_VALUE(PAYLOAD_FIELD('v'), 10) \
+                         OVER (ORDER BY PAYLOAD_FIELD('v') ASC) AS nth10 \
+                 FROM 'obs://sla_cw'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_NTH_VALUE_1K_P99_MS_MAX,
+        "sql_project NTH_VALUE p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_NTH_VALUE_1K_P99_MS_MAX,
     );
 }
