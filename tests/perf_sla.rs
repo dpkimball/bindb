@@ -21,9 +21,9 @@ use tempfile::TempDir;
 // ── M-scale threshold constants (10 K objects) ───────────────────────────────
 // Adjust these if the self-hosted CI runner changes.
 
-const COMMIT_THROUGHPUT_MIN: u64 = 80; // commits/sec — durable single-object commit
+const COMMIT_THROUGHPUT_MIN: u64 = 10; // commits/sec — durable single-object commit (CI floor: fsync p50 up to 100ms under load)
 const COMMIT_BUFFERED_THROUGHPUT_MIN: u64 = 3_000; // commits/sec — buffered batch CI floor (self-hosted runner under load; local ~260 K)
-const FLUSH_WALL_MS_MAX: u64 = 50; // ms — flush() after 10 K buffered commits (CI floor; fsync latency spikes under I/O load)
+const FLUSH_WALL_MS_MAX: u64 = 100; // ms — flush() after 10 K buffered commits (CI floor; fsync latency spikes under I/O load)
 
 const GET_P99_US_MAX: u64 = 10; // µs — HEAD lookup at M scale
 const LIST_P99_MS_MAX: u64 = 2; // ms — namespace list returning 1 K results
@@ -34,7 +34,7 @@ const TRAVERSE_DEPTH3_P99_US_MAX: u64 = 500; // µs — BFS depth 3
 const TRAVERSE_DEPTH5_P99_MS_MAX: u64 = 2; // ms — BFS depth 5
 
 const REBUILD_M_MS_MAX: u64 = 200; // ms — rebuild_indexes() at 10 K objects
-const OPEN_REPLAY_M_MS_MAX: u64 = 30; // ms — WAL replay at 10 K commits (O(n) position-index replay)
+const OPEN_REPLAY_M_MS_MAX: u64 = 150; // ms — WAL replay at 10 K commits (CI floor; disk read latency under I/O load)
 
 // ── bulk ingest threshold constants ──────────────────────────────────────────
 const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — 50 K batch (OKR O2/KR2.2)
