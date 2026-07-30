@@ -1429,6 +1429,16 @@ pub enum SqlWindowFunc {
     Lag { field: String, offset: usize },
     /// `LEAD(PAYLOAD_FIELD('f'), n)` — payload field value from n rows after in the partition.
     Lead { field: String, offset: usize },
+    /// `SUM(PAYLOAD_FIELD('f'))` — sum of field; running if ORDER BY present, full-partition otherwise.
+    Sum { field: String },
+    /// `AVG(PAYLOAD_FIELD('f'))` — average of field; running if ORDER BY present.
+    Avg { field: String },
+    /// `COUNT(*)` — row count; running if ORDER BY present, full-partition otherwise.
+    Count,
+    /// `MIN(PAYLOAD_FIELD('f'))` — minimum of field; running if ORDER BY present.
+    Min { field: String },
+    /// `MAX(PAYLOAD_FIELD('f'))` — maximum of field; running if ORDER BY present.
+    Max { field: String },
 }
 
 /// A window column: `FUNC() OVER (PARTITION BY … ORDER BY …) AS alias`.
@@ -1538,6 +1548,20 @@ impl SqlProjectQuery {
                 parse_lag_lead_func(true, s)
             } else if su.starts_with("LEAD(PAYLOAD_FIELD(") {
                 parse_lag_lead_func(false, s)
+            } else if su.starts_with("SUM(PAYLOAD_FIELD(") {
+                parse_single_field_window_func("SUM", s)
+                    .map(|(f, r)| (SqlWindowFunc::Sum { field: f }, r))
+            } else if su.starts_with("AVG(PAYLOAD_FIELD(") {
+                parse_single_field_window_func("AVG", s)
+                    .map(|(f, r)| (SqlWindowFunc::Avg { field: f }, r))
+            } else if su.starts_with("MIN(PAYLOAD_FIELD(") {
+                parse_single_field_window_func("MIN", s)
+                    .map(|(f, r)| (SqlWindowFunc::Min { field: f }, r))
+            } else if su.starts_with("MAX(PAYLOAD_FIELD(") {
+                parse_single_field_window_func("MAX", s)
+                    .map(|(f, r)| (SqlWindowFunc::Max { field: f }, r))
+            } else if su.starts_with("COUNT(*)") {
+                Some((SqlWindowFunc::Count, &s["COUNT(*)".len()..]))
             } else if su.starts_with("ROW_NUMBER()") {
                 Some((SqlWindowFunc::RowNumber, &s["ROW_NUMBER()".len()..]))
             } else if su.starts_with("DENSE_RANK()") {
@@ -1575,6 +1599,11 @@ impl SqlProjectQuery {
                         SqlWindowFunc::DenseRank => "dense_rank",
                         SqlWindowFunc::Lag { .. } => "lag",
                         SqlWindowFunc::Lead { .. } => "lead",
+                        SqlWindowFunc::Sum { .. } => "sum",
+                        SqlWindowFunc::Avg { .. } => "avg",
+                        SqlWindowFunc::Count => "count",
+                        SqlWindowFunc::Min { .. } => "min",
+                        SqlWindowFunc::Max { .. } => "max",
                     };
                     (default.to_string(), after_close)
                 };
@@ -2472,6 +2501,23 @@ fn parse_lag_lead_func(is_lag: bool, s: &str) -> Option<(SqlWindowFunc, &str)> {
     Some((func, after_lag_close))
 }
 
+/// Parse `FUNC_NAME(PAYLOAD_FIELD('fieldname'))` at the start of `s`.
+/// `func_name` is the uppercase function name (e.g. `"SUM"`).
+/// Returns `(field_name, rest_after_closing_paren)` or `None`.
+fn parse_single_field_window_func<'a>(func_name: &str, s: &'a str) -> Option<(String, &'a str)> {
+    let after_open = &s[func_name.len() + 1..]; // skip "FUNC_NAME("
+    let upper = after_open.to_ascii_uppercase();
+    if !upper.starts_with("PAYLOAD_FIELD('") {
+        return None;
+    }
+    let inner = &after_open["PAYLOAD_FIELD('".len()..];
+    let quote_end = inner.find('\'')?;
+    let field = inner[..quote_end].to_string();
+    let after_pf_close = inner[quote_end + 1..].trim_start_matches(')').trim_start();
+    let after_close = after_pf_close.trim_start_matches(')');
+    Some((field, after_close))
+}
+
 /// Parse `(PARTITION BY PAYLOAD_FIELD('f'), … ORDER BY PAYLOAD_FIELD('g') ASC|DESC, …)`.
 /// `s` must start with `(`. Returns `(partition_by, order_by, rest_after_close_paren)`.
 fn parse_over_clause(s: &str) -> Result<(Vec<String>, Vec<SqlProjectOrderBy>, &str), SqlAggError> {
@@ -3108,10 +3154,18 @@ impl BinderStore {
                     .cloned()
                     .collect();
                 match &wc.func {
-                    SqlWindowFunc::Lag { field, .. } | SqlWindowFunc::Lead { field, .. } => {
+                    SqlWindowFunc::Lag { field, .. }
+                    | SqlWindowFunc::Lead { field, .. }
+                    | SqlWindowFunc::Sum { field }
+                    | SqlWindowFunc::Avg { field }
+                    | SqlWindowFunc::Min { field }
+                    | SqlWindowFunc::Max { field } => {
                         extras.push(field.clone());
                     }
-                    _ => {}
+                    SqlWindowFunc::Count
+                    | SqlWindowFunc::RowNumber
+                    | SqlWindowFunc::Rank
+                    | SqlWindowFunc::DenseRank => {}
                 }
                 extras
             })
@@ -3288,6 +3342,148 @@ impl BinderStore {
                                 }
                             })
                             .collect();
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(wc.alias.clone(), values[pos].clone());
+                        }
+                    }
+                    SqlWindowFunc::Sum { field } => {
+                        let running = !wc.order_by.is_empty();
+                        let values: Vec<serde_json::Value> = if running {
+                            let mut acc = 0.0f64;
+                            sorted
+                                .iter()
+                                .map(|&idx| {
+                                    if let Some(f) = rows[idx].get(field).and_then(|v| v.as_f64()) {
+                                        acc += f;
+                                    }
+                                    serde_json::Number::from_f64(acc)
+                                        .map(serde_json::Value::Number)
+                                        .unwrap_or(serde_json::Value::Null)
+                                })
+                                .collect()
+                        } else {
+                            let total: f64 = sorted
+                                .iter()
+                                .filter_map(|&idx| rows[idx].get(field).and_then(|v| v.as_f64()))
+                                .sum();
+                            let v = serde_json::Number::from_f64(total)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null);
+                            vec![v; sorted.len()]
+                        };
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(wc.alias.clone(), values[pos].clone());
+                        }
+                    }
+                    SqlWindowFunc::Avg { field } => {
+                        let running = !wc.order_by.is_empty();
+                        let values: Vec<serde_json::Value> = if running {
+                            let mut sum = 0.0f64;
+                            let mut cnt = 0usize;
+                            sorted
+                                .iter()
+                                .map(|&idx| {
+                                    if let Some(f) = rows[idx].get(field).and_then(|v| v.as_f64()) {
+                                        sum += f;
+                                        cnt += 1;
+                                    }
+                                    if cnt == 0 {
+                                        serde_json::Value::Null
+                                    } else {
+                                        serde_json::Number::from_f64(sum / cnt as f64)
+                                            .map(serde_json::Value::Number)
+                                            .unwrap_or(serde_json::Value::Null)
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            let nums: Vec<f64> = sorted
+                                .iter()
+                                .filter_map(|&idx| rows[idx].get(field).and_then(|v| v.as_f64()))
+                                .collect();
+                            if nums.is_empty() {
+                                vec![serde_json::Value::Null; sorted.len()]
+                            } else {
+                                let avg = nums.iter().sum::<f64>() / nums.len() as f64;
+                                let v = serde_json::Number::from_f64(avg)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null);
+                                vec![v; sorted.len()]
+                            }
+                        };
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(wc.alias.clone(), values[pos].clone());
+                        }
+                    }
+                    SqlWindowFunc::Count => {
+                        let running = !wc.order_by.is_empty();
+                        let values: Vec<serde_json::Value> = if running {
+                            (1..=sorted.len())
+                                .map(|n| serde_json::Value::Number(n.into()))
+                                .collect()
+                        } else {
+                            vec![serde_json::Value::Number(sorted.len().into()); sorted.len()]
+                        };
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(wc.alias.clone(), values[pos].clone());
+                        }
+                    }
+                    SqlWindowFunc::Min { field } => {
+                        let running = !wc.order_by.is_empty();
+                        let values: Vec<serde_json::Value> = if running {
+                            let mut cur: Option<f64> = None;
+                            sorted
+                                .iter()
+                                .map(|&idx| {
+                                    if let Some(f) = rows[idx].get(field).and_then(|v| v.as_f64()) {
+                                        cur = Some(cur.map_or(f, |m: f64| m.min(f)));
+                                    }
+                                    cur.and_then(serde_json::Number::from_f64)
+                                        .map(serde_json::Value::Number)
+                                        .unwrap_or(serde_json::Value::Null)
+                                })
+                                .collect()
+                        } else {
+                            let min = sorted
+                                .iter()
+                                .filter_map(|&idx| rows[idx].get(field).and_then(|v| v.as_f64()))
+                                .reduce(f64::min);
+                            let v = min
+                                .and_then(serde_json::Number::from_f64)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null);
+                            vec![v; sorted.len()]
+                        };
+                        for (pos, &idx) in sorted.iter().enumerate() {
+                            rows[idx].insert(wc.alias.clone(), values[pos].clone());
+                        }
+                    }
+                    SqlWindowFunc::Max { field } => {
+                        let running = !wc.order_by.is_empty();
+                        let values: Vec<serde_json::Value> = if running {
+                            let mut cur: Option<f64> = None;
+                            sorted
+                                .iter()
+                                .map(|&idx| {
+                                    if let Some(f) = rows[idx].get(field).and_then(|v| v.as_f64()) {
+                                        cur = Some(cur.map_or(f, |m: f64| m.max(f)));
+                                    }
+                                    cur.and_then(serde_json::Number::from_f64)
+                                        .map(serde_json::Value::Number)
+                                        .unwrap_or(serde_json::Value::Null)
+                                })
+                                .collect()
+                        } else {
+                            let max = sorted
+                                .iter()
+                                .filter_map(|&idx| rows[idx].get(field).and_then(|v| v.as_f64()))
+                                .reduce(f64::max);
+                            let v = max
+                                .and_then(serde_json::Number::from_f64)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null);
+                            vec![v; sorted.len()]
+                        };
                         for (pos, &idx) in sorted.iter().enumerate() {
                             rows[idx].insert(wc.alias.clone(), values[pos].clone());
                         }

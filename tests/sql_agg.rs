@@ -4575,3 +4575,162 @@ fn window_lead_different_field() {
     assert_eq!(rows[2].get("next_name"), Some(&serde_json::Value::Null));
     store.close().unwrap();
 }
+
+// ── Aggregate window functions ──────────────────────────────────────────────
+
+#[test]
+fn window_sum_full_partition() {
+    // SUM with no ORDER BY → every row gets the partition total.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wsf:a"), br#"{"score":10}"#.to_vec());
+    tx.put_object(oid("obs://wsf:b"), br#"{"score":20}"#.to_vec());
+    tx.put_object(oid("obs://wsf:c"), br#"{"score":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score'), \
+             SUM(PAYLOAD_FIELD('score')) OVER () AS total \
+             FROM 'obs://wsf'",
+        )
+        .unwrap();
+    for r in &rows {
+        assert_eq!(r.get("total").and_then(|v| v.as_f64()), Some(60.0));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_sum_running() {
+    // SUM with ORDER BY → running cumulative sum.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wsr:a"), br#"{"n":1}"#.to_vec());
+    tx.put_object(oid("obs://wsr:b"), br#"{"n":2}"#.to_vec());
+    tx.put_object(oid("obs://wsr:c"), br#"{"n":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('n'), \
+             SUM(PAYLOAD_FIELD('n')) OVER (ORDER BY PAYLOAD_FIELD('n') ASC) AS running \
+             FROM 'obs://wsr'",
+        )
+        .unwrap();
+    let mut rows = rows;
+    rows.sort_by_key(|r| r.get("n").and_then(|v| v.as_i64()).unwrap_or(0));
+    assert_eq!(rows[0].get("running").and_then(|v| v.as_f64()), Some(1.0));
+    assert_eq!(rows[1].get("running").and_then(|v| v.as_f64()), Some(3.0));
+    assert_eq!(rows[2].get("running").and_then(|v| v.as_f64()), Some(6.0));
+    store.close().unwrap();
+}
+
+#[test]
+fn window_avg_full_partition() {
+    // AVG with no ORDER BY → every row gets the partition average.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wav:a"), br#"{"x":10}"#.to_vec());
+    tx.put_object(oid("obs://wav:b"), br#"{"x":20}"#.to_vec());
+    tx.put_object(oid("obs://wav:c"), br#"{"x":30}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('x'), \
+             AVG(PAYLOAD_FIELD('x')) OVER () AS avg_x \
+             FROM 'obs://wav'",
+        )
+        .unwrap();
+    for r in &rows {
+        assert_eq!(r.get("avg_x").and_then(|v| v.as_f64()), Some(20.0));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_count_star() {
+    // COUNT(*) OVER () → every row gets total row count.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wcs:a"), br#"{"k":1}"#.to_vec());
+    tx.put_object(oid("obs://wcs:b"), br#"{"k":2}"#.to_vec());
+    tx.put_object(oid("obs://wcs:c"), br#"{"k":3}"#.to_vec());
+    tx.put_object(oid("obs://wcs:d"), br#"{"k":4}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('k'), \
+             COUNT(*) OVER () AS cnt \
+             FROM 'obs://wcs'",
+        )
+        .unwrap();
+    for r in &rows {
+        assert_eq!(r.get("cnt").and_then(|v| v.as_f64()), Some(4.0));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_min_max() {
+    // MIN and MAX over full partition.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wmm:a"), br#"{"v":5}"#.to_vec());
+    tx.put_object(oid("obs://wmm:b"), br#"{"v":2}"#.to_vec());
+    tx.put_object(oid("obs://wmm:c"), br#"{"v":8}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             MIN(PAYLOAD_FIELD('v')) OVER () AS lo, \
+             MAX(PAYLOAD_FIELD('v')) OVER () AS hi \
+             FROM 'obs://wmm'",
+        )
+        .unwrap();
+    for r in &rows {
+        assert_eq!(r.get("lo").and_then(|v| v.as_f64()), Some(2.0));
+        assert_eq!(r.get("hi").and_then(|v| v.as_f64()), Some(8.0));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn window_sum_partition_by() {
+    // SUM OVER (PARTITION BY group) → each group gets its own total.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://wsp:a"), br#"{"grp":"x","v":1}"#.to_vec());
+    tx.put_object(oid("obs://wsp:b"), br#"{"grp":"x","v":2}"#.to_vec());
+    tx.put_object(oid("obs://wsp:c"), br#"{"grp":"y","v":10}"#.to_vec());
+    tx.put_object(oid("obs://wsp:d"), br#"{"grp":"y","v":20}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('grp'), PAYLOAD_FIELD('v'), \
+             SUM(PAYLOAD_FIELD('v')) OVER (PARTITION BY PAYLOAD_FIELD('grp')) AS grp_total \
+             FROM 'obs://wsp'",
+        )
+        .unwrap();
+
+    for r in &rows {
+        let grp = r.get("grp").and_then(|v| v.as_str()).unwrap_or("");
+        let total = r.get("grp_total").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if grp == "x" {
+            assert_eq!(total, 3.0);
+        } else {
+            assert_eq!(total, 30.0);
+        }
+    }
+    store.close().unwrap();
+}
