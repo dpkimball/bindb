@@ -1404,6 +1404,12 @@ pub enum SqlFieldTransform {
     Trunc,
     /// `CBRT(PAYLOAD_FIELD('f'))` — cube root of a numeric field.
     Cbrt,
+    /// `CASE PAYLOAD_FIELD('f') WHEN 'v1' THEN 'out1' [WHEN …] [ELSE 'default'] END`
+    /// — value-match conditional; returns first matching output or `else_val` (empty string if no ELSE).
+    CaseWhen {
+        branches: Vec<(String, String)>,
+        else_val: String,
+    },
 }
 
 /// Sort direction for `ORDER BY` in a projection query.
@@ -1449,6 +1455,8 @@ pub enum SqlWindowFunc {
     PercentRank,
     /// `CUME_DIST()` — cumulative distribution: fraction of rows with ORDER BY key ≤ current row.
     CumeDist,
+    /// `NTH_VALUE(PAYLOAD_FIELD('f'), n)` — value of field from the nth row (1-based) in the partition.
+    NthValue { field: String, n: usize },
 }
 
 /// A window column: `FUNC() OVER (PARTITION BY … ORDER BY …) AS alias`.
@@ -1653,6 +1661,8 @@ impl SqlProjectQuery {
                 Some((SqlWindowFunc::PercentRank, &s["PERCENT_RANK()".len()..]))
             } else if su.starts_with("CUME_DIST()") {
                 Some((SqlWindowFunc::CumeDist, &s["CUME_DIST()".len()..]))
+            } else if su.starts_with("NTH_VALUE(PAYLOAD_FIELD(") {
+                parse_nth_value_func(s)
             } else {
                 None
             };
@@ -1711,6 +1721,7 @@ impl SqlProjectQuery {
                         SqlWindowFunc::LastValue { .. } => "last_value",
                         SqlWindowFunc::PercentRank => "percent_rank",
                         SqlWindowFunc::CumeDist => "cume_dist",
+                        SqlWindowFunc::NthValue { .. } => "nth_value",
                     };
                     (default.to_string(), after_close)
                 };
@@ -2205,6 +2216,75 @@ impl SqlProjectQuery {
                     SqlFieldTransform::Right(n)
                 };
                 field_transforms.insert(field.clone(), transform);
+                if starts_with_keyword(s, "AS") {
+                    let after_as = skip_keyword(s, "AS").trim_start();
+                    let alias_end = after_as
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(after_as.len());
+                    if alias_end > 0 {
+                        field_aliases.insert(field.clone(), after_as[..alias_end].to_string());
+                        s = after_as[alias_end..].trim_start();
+                    }
+                }
+                fields.push(field);
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+            // Detect CASE PAYLOAD_FIELD('f') WHEN 'v1' THEN 'out1' ... [ELSE 'default'] END [AS alias]
+            let su = s.to_ascii_uppercase();
+            if su.starts_with("CASE PAYLOAD_FIELD(") {
+                let inner = &s["CASE PAYLOAD_FIELD(".len()..];
+                let (field, after_field) = parse_quoted_sql(inner)?;
+                let mut rest = after_field
+                    .trim_start()
+                    .strip_prefix(')')
+                    .ok_or_else(|| {
+                        SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in CASE".into())
+                    })?
+                    .trim_start();
+                let mut branches: Vec<(String, String)> = Vec::new();
+                loop {
+                    if !rest.to_ascii_uppercase().starts_with("WHEN ") {
+                        break;
+                    }
+                    rest = rest["WHEN ".len()..].trim_start();
+                    let (mv, after_mv) = parse_quoted_sql(rest)?;
+                    rest = after_mv.trim_start();
+                    if !rest.to_ascii_uppercase().starts_with("THEN ") {
+                        return Err(SqlAggError::Unsupported(
+                            "expected THEN after WHEN value in CASE".into(),
+                        ));
+                    }
+                    rest = rest["THEN ".len()..].trim_start();
+                    let (ov, after_ov) = parse_quoted_sql(rest)?;
+                    rest = after_ov.trim_start();
+                    branches.push((mv, ov));
+                }
+                if branches.is_empty() {
+                    return Err(SqlAggError::Unsupported(
+                        "CASE requires at least one WHEN branch".into(),
+                    ));
+                }
+                let else_val = if rest.to_ascii_uppercase().starts_with("ELSE ") {
+                    rest = rest["ELSE ".len()..].trim_start();
+                    let (ev, after_ev) = parse_quoted_sql(rest)?;
+                    rest = after_ev.trim_start();
+                    ev
+                } else {
+                    String::new()
+                };
+                if !rest.to_ascii_uppercase().starts_with("END") {
+                    return Err(SqlAggError::Unsupported(
+                        "expected END to close CASE".into(),
+                    ));
+                }
+                s = rest["END".len()..].trim_start();
+                field_transforms.insert(
+                    field.clone(),
+                    SqlFieldTransform::CaseWhen { branches, else_val },
+                );
                 if starts_with_keyword(s, "AS") {
                     let after_as = skip_keyword(s, "AS").trim_start();
                     let alias_end = after_as
@@ -2841,6 +2921,32 @@ fn parse_single_field_window_func<'a>(func_name: &str, s: &'a str) -> Option<(St
     let after_pf_close = inner[quote_end + 1..].trim_start_matches(')').trim_start();
     let after_close = after_pf_close.trim_start_matches(')');
     Some((field, after_close))
+}
+
+/// Parse `NTH_VALUE(PAYLOAD_FIELD('f'), n)` at the start of `s`.
+fn parse_nth_value_func(s: &str) -> Option<(SqlWindowFunc, &str)> {
+    // s starts with "NTH_VALUE(PAYLOAD_FIELD(" (case-insensitive already checked by caller)
+    let after_pf_open = &s["NTH_VALUE(PAYLOAD_FIELD(".len()..];
+    // Parse 'fieldname')
+    let sq = after_pf_open.strip_prefix('\'')?;
+    let quote_end = sq.find('\'')?;
+    let field = sq[..quote_end].to_string();
+    let after_quote = sq[quote_end + 1..].trim_start();
+    // closing ) for PAYLOAD_FIELD
+    let after_pf_close = after_quote.strip_prefix(')')?;
+    let rest = after_pf_close.trim_start().strip_prefix(',')?;
+    let rest = rest.trim_start();
+    let n_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if n_end == 0 {
+        return None;
+    }
+    let n: usize = rest[..n_end].parse().ok()?;
+    let after_n = rest[n_end..].trim_start();
+    // closing ) for NTH_VALUE
+    let after_close = after_n.strip_prefix(')')?;
+    Some((SqlWindowFunc::NthValue { field, n }, after_close))
 }
 
 /// Parse `NTILE(n)` at the start of `s`, returning `(SqlWindowFunc::Ntile{buckets:n}, rest)`.
@@ -3483,6 +3589,20 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
             }
             val
         }
+        SqlFieldTransform::CaseWhen { branches, else_val } => {
+            let field_str = match &val {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => String::new(),
+            };
+            for (match_val, output) in branches {
+                if field_str == *match_val {
+                    return serde_json::Value::String(output.clone());
+                }
+            }
+            serde_json::Value::String(else_val.clone())
+        }
     }
 }
 
@@ -3585,7 +3705,8 @@ impl BinderStore {
                     | SqlWindowFunc::Min { field }
                     | SqlWindowFunc::Max { field }
                     | SqlWindowFunc::FirstValue { field }
-                    | SqlWindowFunc::LastValue { field } => {
+                    | SqlWindowFunc::LastValue { field }
+                    | SqlWindowFunc::NthValue { field, .. } => {
                         extras.push(field.clone());
                     }
                     SqlWindowFunc::Count
@@ -4076,6 +4197,20 @@ impl BinderStore {
                                 rows[idx].insert(wc.alias.clone(), v.clone());
                             }
                             pos = end;
+                        }
+                    }
+                    SqlWindowFunc::NthValue { field, n } => {
+                        // n is 1-based; null when n > partition size.
+                        let nth_val = if *n == 0 || *n > sorted.len() {
+                            serde_json::Value::Null
+                        } else {
+                            rows[sorted[n - 1]]
+                                .get(field)
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null)
+                        };
+                        for &idx in &sorted {
+                            rows[idx].insert(wc.alias.clone(), nth_val.clone());
                         }
                     }
                 }
