@@ -1635,6 +1635,91 @@ fn split_return_parts(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Parse `CASE b.field WHEN 'v1' THEN 'out1' [...] [ELSE 'default'] END [AS alias]`.
+/// Returns `(field_name, CaseWhen_transform, alias)` or `None`.
+fn parse_case_when(s: &str) -> Option<(String, ReturnTransform, Option<String>)> {
+    let su = s.to_ascii_uppercase();
+    if !su.starts_with("CASE ") {
+        return None;
+    }
+    let after_case = s["CASE ".len()..].trim_start();
+    // Extract b.fieldname
+    let after_b = after_case
+        .strip_prefix("b.")
+        .or_else(|| after_case.strip_prefix("B."))?;
+    let field_end = after_b
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(after_b.len());
+    if field_end == 0 {
+        return None;
+    }
+    let field = after_b[..field_end].to_string();
+    let mut rest = after_b[field_end..].trim_start();
+
+    // Collect WHEN 'val' THEN 'out' branches
+    let mut branches: Vec<(String, String)> = Vec::new();
+    loop {
+        let ru = rest.to_ascii_uppercase();
+        if !ru.starts_with("WHEN ") {
+            break;
+        }
+        rest = rest["WHEN ".len()..].trim_start();
+        let (match_val, after_mv) = parse_single_quoted_graph(rest)?;
+        rest = after_mv.trim_start();
+        let ru2 = rest.to_ascii_uppercase();
+        if !ru2.starts_with("THEN ") {
+            return None;
+        }
+        rest = rest["THEN ".len()..].trim_start();
+        let (out_val, after_ov) = parse_single_quoted_graph(rest)?;
+        rest = after_ov.trim_start();
+        branches.push((match_val, out_val));
+    }
+    if branches.is_empty() {
+        return None;
+    }
+
+    // Optional ELSE 'default'
+    let ru = rest.to_ascii_uppercase();
+    let else_val = if ru.starts_with("ELSE ") {
+        rest = rest["ELSE ".len()..].trim_start();
+        let (ev, after_ev) = parse_single_quoted_graph(rest)?;
+        rest = after_ev.trim_start();
+        ev
+    } else {
+        String::new()
+    };
+
+    // Expect END
+    let ru = rest.to_ascii_uppercase();
+    if !ru.starts_with("END") {
+        return None;
+    }
+    rest = rest["END".len()..].trim_start();
+
+    // Optional AS alias
+    let ru = rest.to_ascii_uppercase();
+    let alias = if ru.starts_with("AS ") {
+        let after_as = rest["AS ".len()..].trim_start();
+        let alias_end = after_as
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after_as.len());
+        if alias_end == 0 {
+            None
+        } else {
+            Some(after_as[..alias_end].to_string())
+        }
+    } else {
+        None
+    };
+
+    Some((
+        field,
+        ReturnTransform::CaseWhen { branches, else_val },
+        alias,
+    ))
+}
+
 /// Plain `RETURN b`, `RETURN r`, and `RETURN c` are valid but produce no fields.
 pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let s = s.trim();
@@ -1660,6 +1745,17 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
     let mut return_all_fields = false;
     for part in split_return_parts(s) {
         let p = part.trim();
+        // Handle CASE b.field WHEN ... END [AS alias] before the generic alias splitter.
+        if p.to_ascii_uppercase().starts_with("CASE ") {
+            if let Some((field, transform, case_alias)) = parse_case_when(p) {
+                b_transforms.insert(field.clone(), transform);
+                if let Some(a) = case_alias {
+                    b_aliases.insert(field.clone(), a);
+                }
+                b_fields.push(field);
+            }
+            continue;
+        }
         // Detect optional `AS alias` suffix, respecting parenthesis depth.
         let (selector, alias) = split_selector_alias(p);
         let is_path_var = path_var.is_some_and(|v| selector.eq_ignore_ascii_case(v));
