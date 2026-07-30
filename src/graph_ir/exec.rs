@@ -442,6 +442,13 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             serde_json::Value::String(else_val.clone())
         }
+        ReturnTransform::Index(n) => {
+            if let serde_json::Value::Array(arr) = val {
+                arr.into_iter().nth(*n).unwrap_or(serde_json::Value::Null)
+            } else {
+                val
+            }
+        }
     }
 }
 
@@ -946,6 +953,12 @@ impl BinderStore {
                     serde_json::Value::String(m.object.object_id.0.clone()),
                 );
             }
+            if q.return_depth {
+                b_fields.insert(
+                    "depth".to_string(),
+                    serde_json::Value::Number(m.depth.into()),
+                );
+            }
 
             let mut r_fields = HashMap::new();
             if !q.edge_return_fields.is_empty() {
@@ -963,6 +976,15 @@ impl BinderStore {
                         .unwrap_or(serde_json::Value::Null);
                     r_fields.insert(key.clone(), val);
                 }
+            }
+            if q.return_edge_type {
+                let label = m
+                    .via_edge
+                    .as_ref()
+                    .and_then(|e| e.relationship_type.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                r_fields.insert("type(r)".to_string(), serde_json::Value::String(label));
             }
 
             let (path, edge_path) = if q.return_path {

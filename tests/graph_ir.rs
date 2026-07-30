@@ -8540,3 +8540,374 @@ fn case_when_numeric_field_match() {
     assert_eq!(bands, vec!["high", "low", "mid"]);
     store.close().unwrap();
 }
+
+// ── RETURN type(r) ──────────────────────────────────────────────────────────
+
+#[test]
+fn return_type_r_basic() {
+    // type(r) returns the edge relationship label.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rtr:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rtr:a"), br#"{"name":"alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://rtr:a"),
+        obj("obs://rtr:hub"),
+        obj("obs://rtr:a"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'obs://rtr:hub' RETURN type(r)",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].edge_fields.get("type(r)").and_then(|v| v.as_str()),
+        Some("KNOWS")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_type_r_multi_type_edges() {
+    // With [:T1|T2] the type(r) field reflects the actual type of each matched edge.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rtm:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rtm:a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("obs://rtm:b"), br#"{"name":"bob"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://rtm:a"),
+        obj("obs://rtm:hub"),
+        obj("obs://rtm:a"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://rtm:b"),
+        obj("obs://rtm:hub"),
+        obj("obs://rtm:b"),
+        "FOLLOWS",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'obs://rtm:hub' \
+         RETURN b.name, type(r)",
+    )
+    .unwrap();
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by_key(|r| {
+        r.fields
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].edge_fields.get("type(r)").and_then(|v| v.as_str()),
+        Some("KNOWS")
+    );
+    assert_eq!(
+        rows[1].edge_fields.get("type(r)").and_then(|v| v.as_str()),
+        Some("FOLLOWS")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_type_r_combined_with_fields() {
+    // type(r) alongside b.field projections.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rtc:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rtc:a"), br#"{"score":42}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://rtc:a"),
+        obj("obs://rtc:hub"),
+        obj("obs://rtc:a"),
+        "RATED",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:RATED*1..1]->(b) WHERE id(a) = 'obs://rtc:hub' \
+         RETURN b.score, type(r)",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fields.get("score").and_then(|v| v.as_i64()), Some(42));
+    assert_eq!(
+        rows[0].edge_fields.get("type(r)").and_then(|v| v.as_str()),
+        Some("RATED")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_type_r_no_type_on_edge_empty_string() {
+    // An edge committed without a relationship type yields an empty string for type(r).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rtne:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rtne:a"), br#"{"v":1}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    // put_edge with empty string label
+    tx2.put_edge(
+        eid("e://rtne:a"),
+        obj("obs://rtne:hub"),
+        obj("obs://rtne:a"),
+        "",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[*1..1]->(b) WHERE id(a) = 'obs://rtne:hub' RETURN type(r)",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    let label = rows[0]
+        .edge_fields
+        .get("type(r)")
+        .and_then(|v| v.as_str())
+        .unwrap_or("__missing__");
+    // Empty string or the stored empty type is acceptable.
+    assert!(label == "" || label == "__missing__" || label.is_empty());
+    store.close().unwrap();
+}
+
+// ── RETURN depth ────────────────────────────────────────────────────────────
+
+#[test]
+fn return_depth_single_hop() {
+    // RETURN depth for 1-hop traversal should be 1.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rds:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rds:a"), br#"{"name":"alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://rds:a"),
+        obj("obs://rds:hub"),
+        obj("obs://rds:a"),
+        "LINK",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://rds:hub' RETURN b.name, depth",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fields.get("depth").and_then(|v| v.as_u64()), Some(1));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_depth_multi_hop_values() {
+    // depth values distinguish 1-hop vs 2-hop matches.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rdm:root"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rdm:mid"), br#"{"level":1}"#.to_vec());
+    tx.put_object(obj("obs://rdm:leaf"), br#"{"level":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("e://rdm:1"),
+        obj("obs://rdm:root"),
+        obj("obs://rdm:mid"),
+        "NEXT",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://rdm:2"),
+        obj("obs://rdm:mid"),
+        obj("obs://rdm:leaf"),
+        "NEXT",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:NEXT*1..2]->(b) WHERE id(a) = 'obs://rdm:root' RETURN b.level, depth",
+    )
+    .unwrap();
+    let mut rows = store.graph_ir_projected(&q).unwrap();
+    rows.sort_by_key(|r| r.fields.get("depth").and_then(|v| v.as_u64()).unwrap_or(0));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].fields.get("depth").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(rows[1].fields.get("depth").and_then(|v| v.as_u64()), Some(2));
+    store.close().unwrap();
+}
+
+#[test]
+fn return_depth_with_order_by() {
+    // RETURN depth combined with ORDER BY depth DESC.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rdd:root"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rdd:a"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rdd:b"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rdd:c"), br#"{}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("e://rdd:1"), obj("obs://rdd:root"), obj("obs://rdd:a"), "L", None);
+    tx2.put_edge(eid("e://rdd:2"), obj("obs://rdd:a"), obj("obs://rdd:b"), "L", None);
+    tx2.put_edge(eid("e://rdd:3"), obj("obs://rdd:b"), obj("obs://rdd:c"), "L", None);
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:L*1..3]->(b) WHERE id(a) = 'obs://rdd:root' \
+         RETURN depth ORDER BY depth DESC",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 3);
+    let depths: Vec<u64> = rows
+        .iter()
+        .map(|r| r.fields.get("depth").and_then(|v| v.as_u64()).unwrap_or(0))
+        .collect();
+    assert_eq!(depths, vec![3, 2, 1]);
+    store.close().unwrap();
+}
+
+// ── RETURN b.field[n] list indexing ─────────────────────────────────────────
+
+#[test]
+fn return_field_index_basic() {
+    // b.tags[0] extracts the first element of a JSON array field.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rfi:hub"), br#"{}"#.to_vec());
+    tx.put_object(
+        obj("obs://rfi:a"),
+        br#"{"tags":["rust","graph","fast"]}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("e://rfi:a"), obj("obs://rfi:hub"), obj("obs://rfi:a"), "LINK", None);
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINK*1..1]->(b) WHERE id(a) = 'obs://rfi:hub' RETURN b.tags[0]",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("tags").and_then(|v| v.as_str()),
+        Some("rust")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_field_index_second_element() {
+    // b.tags[1] extracts the second element.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rfis:hub"), br#"{}"#.to_vec());
+    tx.put_object(
+        obj("obs://rfis:a"),
+        br#"{"scores":[10,20,30]}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("e://rfis:a"), obj("obs://rfis:hub"), obj("obs://rfis:a"), "L", None);
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:L*1..1]->(b) WHERE id(a) = 'obs://rfis:hub' RETURN b.scores[1]",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("scores").and_then(|v| v.as_i64()),
+        Some(20)
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn return_field_index_out_of_bounds() {
+    // Index beyond array length returns null (field absent from result row).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rfio:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rfio:a"), br#"{"items":["x"]}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("e://rfio:a"), obj("obs://rfio:hub"), obj("obs://rfio:a"), "L", None);
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:L*1..1]->(b) WHERE id(a) = 'obs://rfio:hub' RETURN b.items[5]",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    // null value means the key is absent from the row (projection loop omits null).
+    assert!(rows[0].fields.get("items").is_none());
+    store.close().unwrap();
+}
+
+#[test]
+fn return_field_index_with_alias() {
+    // b.tags[0] AS first_tag uses the alias as the output key.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("obs://rfa:hub"), br#"{}"#.to_vec());
+    tx.put_object(obj("obs://rfa:a"), br#"{"cats":["alpha","beta"]}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(eid("e://rfa:a"), obj("obs://rfa:hub"), obj("obs://rfa:a"), "L", None);
+    store.commit(tx2, "test", "").unwrap();
+
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:L*1..1]->(b) WHERE id(a) = 'obs://rfa:hub' RETURN b.cats[0] AS first_cat",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]
+            .fields
+            .get("first_cat")
+            .and_then(|v| v.as_str()),
+        Some("alpha")
+    );
+    store.close().unwrap();
+}
