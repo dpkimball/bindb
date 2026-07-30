@@ -230,6 +230,8 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `collect(b)` / `collect(b.field)` — builds a JSON array of node IDs or field values.
+    Collect,
 }
 
 /// One aggregation item in a `WITH count(b) AS alias` clause.

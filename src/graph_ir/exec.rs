@@ -1297,6 +1297,27 @@ fn compute_aggregation(matches: &[GraphQueryMatch], agg: &WithAggregation) -> se
                 .map(|v| serde_json::json!(v))
                 .unwrap_or(serde_json::Value::Null)
         }
+        AggFunc::Collect => {
+            let vals: Vec<serde_json::Value> = if let Some(field) = &agg.field {
+                matches
+                    .iter()
+                    .map(|m| {
+                        let bytes = m.object.payload.as_deref().unwrap_or(b"");
+                        let text = std::str::from_utf8(bytes).unwrap_or("");
+                        serde_json::from_str::<serde_json::Value>(text)
+                            .ok()
+                            .and_then(|v| v.get(field).cloned())
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect()
+            } else {
+                matches
+                    .iter()
+                    .map(|m| serde_json::Value::String(m.object.object_id.0.clone()))
+                    .collect()
+            };
+            serde_json::Value::Array(vals)
+        }
     }
 }
 
@@ -1381,6 +1402,27 @@ fn compute_aggregation_slice(
                 .reduce(f64::max)
                 .map(|v| serde_json::json!(v))
                 .unwrap_or(serde_json::Value::Null)
+        }
+        AggFunc::Collect => {
+            let vals: Vec<serde_json::Value> = if let Some(field) = &agg.field {
+                group
+                    .iter()
+                    .map(|m| {
+                        let bytes = m.object.payload.as_deref().unwrap_or(b"");
+                        let text = std::str::from_utf8(bytes).unwrap_or("");
+                        serde_json::from_str::<serde_json::Value>(text)
+                            .ok()
+                            .and_then(|v| v.get(field).cloned())
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect()
+            } else {
+                group
+                    .iter()
+                    .map(|m| serde_json::Value::String(m.object.object_id.0.clone()))
+                    .collect()
+            };
+            serde_json::Value::Array(vals)
         }
     }
 }
