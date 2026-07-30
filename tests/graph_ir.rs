@@ -1,7 +1,7 @@
 use bindb::{
-    AggFunc, BinderStore, CmpOp, CmpValue, EdgeId, GraphIrQuery, GraphIrUnionQuery, GraphIrWrite,
-    GraphIrWriteError, NodeIdPred, ObjectId, OrderByField, OrderDirection, Transaction,
-    WithAggregation,
+    AggFunc, BinderStore, CmpOp, CmpValue, EdgeId, GraphIrChainedQuery, GraphIrQuery,
+    GraphIrUnionQuery, GraphIrWrite, GraphIrWriteError, NodeIdPred, ObjectId, OrderByField,
+    OrderDirection, Transaction, WithAggregation,
 };
 use tempfile::TempDir;
 
@@ -7852,5 +7852,248 @@ fn write_ir_delete_edge_removes_it() {
 #[test]
 fn write_ir_set_delete_parse_error_unknown_verb() {
     let err = GraphIrWrite::parse("UPSERT NODE id=\"x://n\" payload={}");
+    assert!(err.is_err());
+}
+
+// --- Chained MATCH (multi-hop traversal) ---
+
+#[test]
+fn chained_match_two_hops() {
+    // Alice -KNOWS-> Bob -LIKES-> Carol; chained MATCH finds Carol from Alice.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ch://alice"), b"{}".to_vec());
+    tx.put_object(obj("ch://bob"), br#"{"name":"bob"}"#.to_vec());
+    tx.put_object(obj("ch://carol"), br#"{"name":"carol"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ch_e1"),
+        obj("ch://alice"),
+        obj("ch://bob"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ch_e2"),
+        obj("ch://bob"),
+        obj("ch://carol"),
+        "LIKES",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_chained(
+            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'ch://alice' \
+             MATCH (a)-[:LIKES]->(b) RETURN b.name",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name").and_then(|v| v.as_str()),
+        Some("carol")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn chained_match_three_hops() {
+    // Alice -KNOWS-> Bob -LIKES-> Carol -FOLLOWS-> Dave
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ch3://alice"), b"{}".to_vec());
+    tx.put_object(obj("ch3://bob"), b"{}".to_vec());
+    tx.put_object(obj("ch3://carol"), b"{}".to_vec());
+    tx.put_object(obj("ch3://dave"), br#"{"name":"dave"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ch3_e1"),
+        obj("ch3://alice"),
+        obj("ch3://bob"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ch3_e2"),
+        obj("ch3://bob"),
+        obj("ch3://carol"),
+        "LIKES",
+        None,
+    );
+    tx2.put_edge(
+        eid("ch3_e3"),
+        obj("ch3://carol"),
+        obj("ch3://dave"),
+        "FOLLOWS",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_chained(
+            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'ch3://alice' \
+             MATCH (a)-[:LIKES]->(b) \
+             MATCH (a)-[:FOLLOWS]->(b) RETURN b.name",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name").and_then(|v| v.as_str()),
+        Some("dave")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn chained_match_fan_out() {
+    // Alice -KNOWS-> Bob and Alice -KNOWS-> Carol; Bob and Carol both -LIKES-> Dave.
+    // Two-hop chain returns Dave twice (once per path).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("chf://alice"), b"{}".to_vec());
+    tx.put_object(obj("chf://bob"), b"{}".to_vec());
+    tx.put_object(obj("chf://carol"), b"{}".to_vec());
+    tx.put_object(obj("chf://dave"), br#"{"name":"dave"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("chf_e1"),
+        obj("chf://alice"),
+        obj("chf://bob"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("chf_e2"),
+        obj("chf://alice"),
+        obj("chf://carol"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("chf_e3"),
+        obj("chf://bob"),
+        obj("chf://dave"),
+        "LIKES",
+        None,
+    );
+    tx2.put_edge(
+        eid("chf_e4"),
+        obj("chf://carol"),
+        obj("chf://dave"),
+        "LIKES",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_chained(
+            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'chf://alice' \
+             MATCH (a)-[:LIKES]->(b) RETURN b.name",
+        )
+        .unwrap();
+    // Two paths both reach dave.
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| r.fields.get("name").and_then(|v| v.as_str()) == Some("dave")));
+    store.close().unwrap();
+}
+
+#[test]
+fn chained_match_no_results_when_hop_missing() {
+    // Alice -KNOWS-> Bob; no LIKES edge from Bob — chain returns empty.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("chn://alice"), b"{}".to_vec());
+    tx.put_object(obj("chn://bob"), b"{}".to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("chn_e1"),
+        obj("chn://alice"),
+        obj("chn://bob"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_chained(
+            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'chn://alice' \
+             MATCH (a)-[:LIKES]->(b) RETURN b.name",
+        )
+        .unwrap();
+    assert!(rows.is_empty());
+    store.close().unwrap();
+}
+
+#[test]
+fn chained_match_with_end_predicate() {
+    // Alice -KNOWS-> Bob (score=5) and Alice -KNOWS-> Carol (score=10).
+    // Both -LIKES-> Dave; second step filters b.score > 8 so only Carol's path continues.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("chp://alice"), b"{}".to_vec());
+    tx.put_object(obj("chp://bob"), br#"{"score":5}"#.to_vec());
+    tx.put_object(obj("chp://carol"), br#"{"score":10}"#.to_vec());
+    tx.put_object(obj("chp://dave"), br#"{"name":"dave"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("chp_e1"),
+        obj("chp://alice"),
+        obj("chp://bob"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("chp_e2"),
+        obj("chp://alice"),
+        obj("chp://carol"),
+        "KNOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("chp_e3"),
+        obj("chp://bob"),
+        obj("chp://dave"),
+        "LIKES",
+        None,
+    );
+    tx2.put_edge(
+        eid("chp_e4"),
+        obj("chp://carol"),
+        obj("chp://dave"),
+        "LIKES",
+        None,
+    );
+    store.commit(tx2, "test", "").unwrap();
+
+    // First step: KNOWS from alice, filter b.score > 8 → only carol
+    let rows = store
+        .graph_ir_chained(
+            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'chp://alice' AND b.score > 8 \
+             MATCH (a)-[:LIKES]->(b) RETURN b.name",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("name").and_then(|v| v.as_str()),
+        Some("dave")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn chained_match_parse_error_on_single_match() {
+    let err = GraphIrChainedQuery::parse("MATCH (a)-[:X]->(b) WHERE id(a) = 'x://a' RETURN b.name");
     assert!(err.is_err());
 }

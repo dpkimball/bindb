@@ -782,6 +782,60 @@ impl BinderStore {
         Ok(all_rows)
     }
 
+    /// Parse and execute a chained MATCH query (multi-hop traversal).
+    pub fn graph_ir_chained(&self, query: &str) -> Result<Vec<GraphIrRow>, StoreError> {
+        let q = GraphIrChainedQuery::parse(query).map_err(|e| StoreError::InvalidArgument {
+            message: e.to_string(),
+        })?;
+        self.graph_ir_chained_projected(&q)
+    }
+
+    /// Execute a pre-parsed chained MATCH query.
+    ///
+    /// Runs `steps[0]` normally. For each subsequent step, iterates over the
+    /// `object_id`s produced by the previous step and runs that step with the
+    /// bound start ID, collecting all results. Returns the projected rows from
+    /// the final step.
+    pub fn graph_ir_chained_projected(
+        &self,
+        q: &GraphIrChainedQuery,
+    ) -> Result<Vec<GraphIrRow>, StoreError> {
+        if q.steps.is_empty() {
+            return Ok(vec![]);
+        }
+        if q.steps.len() == 1 {
+            return self.graph_ir_projected(&q.steps[0]);
+        }
+
+        // Step 0: run normally, collect end-node IDs.
+        let step0_rows = self.graph_ir_projected(&q.steps[0])?;
+        let mut bound_ids: Vec<crate::types::ObjectId> =
+            step0_rows.into_iter().map(|r| r.object_id).collect();
+
+        // Intermediate steps: pipeline bound IDs through each step.
+        for step in &q.steps[1..q.steps.len() - 1] {
+            let mut next_ids = Vec::new();
+            for start in &bound_ids {
+                let mut s = step.clone();
+                s.start = start.clone();
+                let rows = self.graph_ir_projected(&s)?;
+                next_ids.extend(rows.into_iter().map(|r| r.object_id));
+            }
+            bound_ids = next_ids;
+        }
+
+        // Last step: return full projected rows.
+        let last = &q.steps[q.steps.len() - 1];
+        let mut all_rows = Vec::new();
+        for start in &bound_ids {
+            let mut s = last.clone();
+            s.start = start.clone();
+            let rows = self.graph_ir_projected(&s)?;
+            all_rows.extend(rows);
+        }
+        Ok(all_rows)
+    }
+
     /// Execute a pre-parsed restricted graph IR query.
     pub fn graph_ir_parsed(&self, q: &GraphIrQuery) -> Result<Vec<GraphQueryMatch>, StoreError> {
         let mut matches = build_graph_query(self, q).execute()?;

@@ -1764,3 +1764,99 @@ impl GraphIrUnionQuery {
         })
     }
 }
+
+/// Return `true` if the uppercase segment text already contains a RETURN clause.
+fn has_return_clause(upper: &str) -> bool {
+    upper.contains(" RETURN ") || upper.ends_with(" RETURN")
+}
+
+/// Ensure a query string has a RETURN clause; append `RETURN b` if absent.
+fn ensure_return(s: &str) -> String {
+    let upper = s.to_ascii_uppercase();
+    if has_return_clause(&upper) {
+        s.to_string()
+    } else {
+        format!("{} RETURN b", s)
+    }
+}
+
+/// Rewrite a continuation MATCH segment (no `WHERE id(a) = …`) into a parseable query
+/// by inserting a sentinel start ID. Missing RETURN is added automatically.
+fn normalize_chained_step(seg: &str) -> String {
+    let seg = seg.trim();
+    let upper = seg.to_ascii_uppercase();
+    let sep_where = " WHERE ";
+    let sep_return = " RETURN ";
+    let base = if let Some(wpos) = upper.find(sep_where) {
+        // Has WHERE — insert dummy start before existing predicates.
+        format!(
+            "MATCH {} WHERE id(a) = '__chained__' AND {}",
+            seg[..wpos].trim(),
+            seg[wpos + sep_where.len()..].trim_start()
+        )
+    } else if let Some(rpos) = upper.find(sep_return) {
+        // No WHERE but has RETURN — insert WHERE before RETURN.
+        format!(
+            "MATCH {} WHERE id(a) = '__chained__'{}",
+            seg[..rpos].trim(),
+            &seg[rpos..]
+        )
+    } else {
+        // No WHERE, no RETURN.
+        format!("MATCH {} WHERE id(a) = '__chained__'", seg)
+    };
+    ensure_return(&base)
+}
+
+impl GraphIrChainedQuery {
+    /// Parse a multi-hop chained MATCH query.
+    ///
+    /// The first step must supply `WHERE id(a) = '…'`; subsequent steps omit it
+    /// (the start is bound from the previous step at execution time).
+    ///
+    /// Requires at least two MATCH clauses. Returns `Err` for a single MATCH.
+    pub fn parse(src: &str) -> Result<Self, GraphIrError> {
+        let collapsed = collapse_ws(src.trim());
+        if collapsed.is_empty() {
+            return Err(GraphIrError::Empty);
+        }
+        let upper = collapsed.to_ascii_uppercase();
+        if !upper.starts_with("MATCH ") {
+            return Err(GraphIrError::Unsupported("must start with MATCH".into()));
+        }
+
+        // Split on " MATCH " (case-insensitive via upper) to locate segment boundaries.
+        const SEP: &str = " MATCH ";
+        let mut raw_segs: Vec<String> = Vec::new();
+        let mut seg_start = 0usize;
+        let mut scan = 0usize;
+        while scan < upper.len() {
+            if upper[scan..].starts_with(SEP) {
+                raw_segs.push(collapsed[seg_start..scan].trim().to_string());
+                scan += SEP.len();
+                seg_start = scan;
+            } else {
+                scan += 1;
+            }
+        }
+        raw_segs.push(collapsed[seg_start..].trim().to_string());
+
+        if raw_segs.len() < 2 {
+            return Err(GraphIrError::Unsupported(
+                "chained query requires at least two MATCH clauses".into(),
+            ));
+        }
+
+        // Step 0: already has "MATCH …" prefix; add RETURN b if absent (for intermediate steps).
+        let mut steps = Vec::with_capacity(raw_segs.len());
+        steps.push(GraphIrQuery::parse(&ensure_return(&raw_segs[0]))?);
+
+        // Steps 1+: normalize (insert dummy start) then parse.
+        for seg in &raw_segs[1..] {
+            let normalized = normalize_chained_step(seg);
+            steps.push(GraphIrQuery::parse(&normalized)?);
+        }
+
+        Ok(Self { steps })
+    }
+}

@@ -405,3 +405,23 @@ pub struct GraphIrUnionQuery {
     /// When `true` (UNION ALL), duplicates are preserved.
     pub all: bool,
 }
+
+/// A multi-hop chained MATCH query where each step's matched end node becomes the
+/// start node for the next step.
+///
+/// Steps share variable names `(a)` and `(b)` across the chain. The first step
+/// must provide `WHERE id(a) = '…'`; subsequent steps omit the start ID — it is
+/// bound at execution time from the previous step's results.
+///
+/// ```text
+/// MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'sn://alice'
+/// MATCH (a)-[:LIKES]->(b) RETURN b.title
+/// ```
+///
+/// Predicates in steps 2+ (`WHERE b.field OP val`, `RETURN b.field`, etc.) apply
+/// to the end node `b` of that step. The start node `a` is always the bound result
+/// from the preceding step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrChainedQuery {
+    pub steps: Vec<GraphIrQuery>,
+}
