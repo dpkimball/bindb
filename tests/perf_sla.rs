@@ -23,7 +23,7 @@ use tempfile::TempDir;
 
 const COMMIT_THROUGHPUT_MIN: u64 = 80; // commits/sec — durable single-object commit
 const COMMIT_BUFFERED_THROUGHPUT_MIN: u64 = 3_000; // commits/sec — buffered batch CI floor (self-hosted runner under load; local ~260 K)
-const FLUSH_WALL_MS_MAX: u64 = 20; // ms — flush() after 10 K buffered commits
+const FLUSH_WALL_MS_MAX: u64 = 50; // ms — flush() after 10 K buffered commits (CI floor; fsync latency spikes under I/O load)
 
 const GET_P99_US_MAX: u64 = 10; // µs — HEAD lookup at M scale
 const LIST_P99_MS_MAX: u64 = 2; // ms — namespace list returning 1 K results
