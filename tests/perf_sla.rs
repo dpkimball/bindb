@@ -13,7 +13,10 @@
 ///   1. Add the target to docs/sla.md.
 ///   2. Write the test here with a matching threshold constant.
 ///   3. Use `#[ignore = "perf: ..."]` so it is excluded from the default test run.
-use bindb::{BinderStore, EdgeId, ObjectId, Transaction, VectorEntry, VectorFilter, VectorIndex};
+use bindb::{
+    BinderStore, EdgeId, GraphIrQuery, ObjectId, Transaction, VectorEntry, VectorFilter,
+    VectorIndex,
+};
 use std::collections::HashSet;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -41,6 +44,11 @@ const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — 50 K b
 /// 500 K single-field observation import must complete in ≤ 90 s (OKR O2/KR2.3).
 /// Apple Health import scenario: one object per data point, 64-byte payload.
 const HEALTH_IMPORT_500K_S_MAX: f64 = 90.0;
+
+// ── graph_ir RETURN type(r) / depth / field-index threshold constants ─────────
+const GRAPH_IR_TYPE_R_P99_MS_MAX: u64 = 10; // ms — RETURN type(r) at 1 K nodes depth 1
+const GRAPH_IR_DEPTH_P99_MS_MAX: u64 = 10; // ms — RETURN depth at 1 K nodes depth 1
+const GRAPH_IR_FIELD_INDEX_P99_MS_MAX: u64 = 10; // ms — RETURN b.field[n] at 1 K nodes depth 1
 
 // ── vector / ANN threshold constants ─────────────────────────────────────────
 const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
@@ -933,5 +941,125 @@ fn sla_health_import_500k_lte_90s() {
         "500 K health import took {:.1} s — SLA ≤ {:.0} s",
         elapsed,
         HEALTH_IMPORT_500K_S_MAX
+    );
+}
+
+// ── graph_ir RETURN type(r) / depth / field-index SLAs (issue #2) ─────────────
+
+/// Hub-and-spoke graph: 1 hub + `spokes` leaves with typed edges and array payloads.
+fn build_graph_typed_1k(dir: &TempDir, spokes: usize) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(ObjectId::new("g://hub"), br#"{"name":"hub"}"#.to_vec());
+    for i in 0..spokes {
+        let label = if i % 2 == 0 { "KNOWS" } else { "FOLLOWS" };
+        let payload = format!(
+            r#"{{"name":"n{}","tags":["alpha","beta","gamma"],"depth_hint":{}}}"#,
+            i, i
+        );
+        tx.put_object(ObjectId::new(format!("g://n:{:04}", i)), payload.into_bytes());
+        let _ = label; // stored separately below
+    }
+    store.commit_buffered(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for i in 0..spokes {
+        let label = if i % 2 == 0 { "KNOWS" } else { "FOLLOWS" };
+        tx2.put_edge(
+            EdgeId::new(format!("g://e:{:04}", i)),
+            ObjectId::new("g://hub"),
+            ObjectId::new(format!("g://n:{:04}", i)),
+            label,
+            None,
+        );
+    }
+    store.commit_buffered(tx2, "test", "").unwrap();
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_return_type_r_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_typed_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'g://hub' \
+         RETURN b.name, type(r)",
+    )
+    .unwrap();
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_TYPE_R_P99_MS_MAX,
+        "graph_ir RETURN type(r) p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_TYPE_R_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_return_depth_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_typed_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'g://hub' \
+         RETURN b.name, depth",
+    )
+    .unwrap();
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_DEPTH_P99_MS_MAX,
+        "graph_ir RETURN depth p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_DEPTH_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_return_field_index_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_typed_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'g://hub' \
+         RETURN b.tags[0]",
+    )
+    .unwrap();
+    let iterations = 200usize;
+
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_FIELD_INDEX_P99_MS_MAX,
+        "graph_ir RETURN b.field[n] p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_FIELD_INDEX_P99_MS_MAX,
     );
 }

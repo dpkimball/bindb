@@ -132,6 +132,19 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 
 ---
 
+## graph_ir RETURN type(r) / depth / field-index SLAs (issue #2)
+
+These SLAs apply to graph traversal queries that project edge metadata or use
+JSON array element indexing in RETURN.  Scale is 1 K nodes, hub-and-spoke, depth-1.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| `RETURN type(r)` — edge label projection | 1 K nodes, depth 1 | ≤ 10 ms |
+| `RETURN depth` — traversal depth projection | 1 K nodes, depth 1 | ≤ 10 ms |
+| `RETURN b.field[n]` — JSON array element | 1 K nodes, depth 1 | ≤ 10 ms |
+
+---
+
 ## Vector search SLAs (ANN / HNSW)
 
 Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the
