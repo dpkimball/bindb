@@ -347,6 +347,28 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
             .ok_or_else(|| SqlAggError::Unsupported("expected ')' closing COLLECT(...)".into()))?;
         return Ok((Aggregate::Collect(field), false, rest));
     }
+    // STRING_AGG(PAYLOAD_FIELD('fieldname'), 'sep')
+    if u.starts_with("STRING_AGG(PAYLOAD_FIELD(") {
+        let after_pf = &s["STRING_AGG(PAYLOAD_FIELD(".len()..];
+        let (field, rest) = parse_quoted_sql(after_pf)?;
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(')').ok_or_else(|| {
+            SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in STRING_AGG".into())
+        })?;
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(',').ok_or_else(|| {
+            SqlAggError::Unsupported("expected ',' before separator in STRING_AGG".into())
+        })?;
+        let rest = rest.trim_start();
+        let (sep, rest) = parse_quoted_sql(rest).map_err(|_| {
+            SqlAggError::Unsupported("STRING_AGG separator must be a quoted string".into())
+        })?;
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(')').ok_or_else(|| {
+            SqlAggError::Unsupported("expected ')' closing STRING_AGG(...)".into())
+        })?;
+        return Ok((Aggregate::StringAgg { field, sep }, false, rest));
+    }
     let patterns: &[(&str, Aggregate, bool)] = &[
         ("COUNT(*)", Aggregate::Count, false),
         ("AVG(VALUE)", Aggregate::Avg, true),
@@ -362,7 +384,7 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
         }
     }
     Err(SqlAggError::Unsupported(
-        "aggregate must be COUNT(*), AVG/SUM/MIN/MAX/P50/P99(VALUE), or COLLECT(PAYLOAD_FIELD('field'))".into(),
+        "aggregate must be COUNT(*), AVG/SUM/MIN/MAX/P50/P99(VALUE), COLLECT(PAYLOAD_FIELD('field')), or STRING_AGG(PAYLOAD_FIELD('field'), 'sep')".into(),
     ))
 }
 
@@ -1418,6 +1440,9 @@ pub enum SqlFieldTransform {
     Trunc,
     /// `CBRT(PAYLOAD_FIELD('f'))` — cube root of a numeric field.
     Cbrt,
+    /// `ARRAY_LENGTH(PAYLOAD_FIELD('f'))` — number of elements in a JSON array field.
+    /// Non-array values pass through unchanged.
+    ArrayLength,
     /// `CASE PAYLOAD_FIELD('f') WHEN 'v1' THEN 'out1' [WHEN …] [ELSE 'default'] END`
     /// — value-match conditional; returns first matching output or `else_val` (empty string if no ELSE).
     CaseWhen {
@@ -2677,6 +2702,10 @@ impl SqlProjectQuery {
                 ("ACOS(PAYLOAD_FIELD(", SqlFieldTransform::Acos),
                 ("TRUNC(PAYLOAD_FIELD(", SqlFieldTransform::Trunc),
                 ("CBRT(PAYLOAD_FIELD(", SqlFieldTransform::Cbrt),
+                (
+                    "ARRAY_LENGTH(PAYLOAD_FIELD(",
+                    SqlFieldTransform::ArrayLength,
+                ),
             ];
             let transform = transform_prefixes
                 .iter()
@@ -3669,6 +3698,13 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
                 }
             }
             val
+        }
+        SqlFieldTransform::ArrayLength => {
+            if let serde_json::Value::Array(arr) = &val {
+                serde_json::Value::Number((arr.len() as u64).into())
+            } else {
+                val
+            }
         }
         SqlFieldTransform::CaseWhen { branches, else_val } => {
             let field_str = match &val {

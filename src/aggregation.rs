@@ -52,6 +52,10 @@ pub enum Aggregate {
     /// JSON array of a named payload field value from each observation in the group.
     /// `COLLECT(PAYLOAD_FIELD('fieldname'))` — result in `AggregateResult::collected`.
     Collect(String),
+    /// Concatenate string values of a named payload field across the group, separated by `sep`.
+    /// `STRING_AGG(PAYLOAD_FIELD('fieldname'), 'sep')` — result in `AggregateResult::collected`
+    /// as a `Value::String`. Non-string field values are skipped.
+    StringAgg { field: String, sep: String },
 }
 
 /// A single row returned by an aggregation query.
@@ -64,7 +68,7 @@ pub struct AggregateResult {
     pub value: f64,
     /// Number of observations that contributed to this result.
     pub count: usize,
-    /// JSON array of collected field values, populated only for `Aggregate::Collect`.
+    /// Populated for `Aggregate::Collect` (JSON array) and `Aggregate::StringAgg` (JSON string).
     pub collected: Option<serde_json::Value>,
 }
 
@@ -147,9 +151,15 @@ pub(crate) fn run_aggregation(
     let mut groups: HashMap<Option<String>, Vec<f64>> = HashMap::new();
     let mut counts: HashMap<Option<String>, usize> = HashMap::new();
     let mut collect_groups: HashMap<Option<String>, Vec<serde_json::Value>> = HashMap::new();
+    let mut string_agg_groups: HashMap<Option<String>, Vec<String>> = HashMap::new();
 
     let collect_field = if let Aggregate::Collect(ref f) = q.aggregate {
         Some(f.clone())
+    } else {
+        None
+    };
+    let string_agg_params = if let Aggregate::StringAgg { ref field, ref sep } = q.aggregate {
+        Some((field.clone(), sep.clone()))
     } else {
         None
     };
@@ -177,6 +187,23 @@ pub(crate) fn run_aggregation(
                 .or_default()
                 .push(json_val);
             groups.entry(key).or_default();
+        } else if let Some((ref field, _)) = string_agg_params {
+            if let Some(s) = v
+                .payload
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .and_then(|jv| {
+                    jv.get(field.as_str())
+                        .and_then(|f| f.as_str())
+                        .map(str::to_owned)
+                })
+            {
+                string_agg_groups.entry(key.clone()).or_default().push(s);
+            } else {
+                string_agg_groups.entry(key.clone()).or_default();
+            }
+            groups.entry(key).or_default();
         } else {
             let numeric = v
                 .payload
@@ -193,6 +220,8 @@ pub(crate) fn run_aggregation(
 
     let agg = q.aggregate;
     let is_collect = collect_field.is_some();
+    let is_string_agg = string_agg_params.is_some();
+    let string_agg_sep = string_agg_params.map(|(_, sep)| sep).unwrap_or_default();
     let mut results: Vec<AggregateResult> = groups
         .into_iter()
         .map(|(key, mut values)| {
@@ -200,6 +229,12 @@ pub(crate) fn run_aggregation(
             let (value, collected) = if is_collect {
                 let arr = collect_groups.remove(&key).map(serde_json::Value::Array);
                 (0.0, arr)
+            } else if is_string_agg {
+                let joined = string_agg_groups
+                    .remove(&key)
+                    .unwrap_or_default()
+                    .join(&string_agg_sep);
+                (0.0, Some(serde_json::Value::String(joined)))
             } else {
                 let v = match &agg {
                     Aggregate::Count => count as f64,
@@ -215,7 +250,7 @@ pub(crate) fn run_aggregation(
                     Aggregate::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                     Aggregate::P50 => percentile(&mut values, 50.0),
                     Aggregate::P99 => percentile(&mut values, 99.0),
-                    Aggregate::Collect(_) => unreachable!(),
+                    Aggregate::Collect(_) | Aggregate::StringAgg { .. } => unreachable!(),
                 };
                 (v, None)
             };

@@ -449,6 +449,13 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
                 val
             }
         }
+        ReturnTransform::ArrayLength => {
+            if let serde_json::Value::Array(arr) = &val {
+                serde_json::Value::Number((arr.len() as u64).into())
+            } else {
+                val
+            }
+        }
     }
 }
 
@@ -525,8 +532,13 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => false,
                 // Already handled above
                 CmpOp::IsNull | CmpOp::IsNotNull => unreachable!(),
-                // IN/NOT IN handled via StringList arm; Between via NumberRange; Like/ILike on text only
-                CmpOp::In | CmpOp::NotIn | CmpOp::Between | CmpOp::Like | CmpOp::ILike => false,
+                // IN/NOT IN handled via StringList arm; Between via NumberRange; Like/ILike/HAS on text only
+                CmpOp::In
+                | CmpOp::NotIn
+                | CmpOp::Between
+                | CmpOp::Like
+                | CmpOp::ILike
+                | CmpOp::HasElement => false,
             }
         }
         CmpValue::NumberRange(lo, hi) => {
@@ -540,6 +552,15 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
             }
         }
         CmpValue::Text(rhs) => {
+            // HAS checks if a JSON array field contains an element equal to rhs.
+            if pred.op == CmpOp::HasElement {
+                return match field_val {
+                    serde_json::Value::Array(arr) => {
+                        arr.iter().any(|el| el.as_str() == Some(rhs.as_str()))
+                    }
+                    _ => false,
+                };
+            }
             let lhs = match field_val.as_str() {
                 Some(s) => s,
                 None => return false,
@@ -563,6 +584,7 @@ fn apply_payload_pred_inner(payload: &[u8], pred: &PayloadPred) -> bool {
                 CmpOp::Between => false,
                 CmpOp::Like => like_match(lhs, rhs.as_str()),
                 CmpOp::ILike => like_match(&lhs.to_lowercase(), &rhs.to_lowercase()),
+                CmpOp::HasElement => unreachable!(), // handled above
             }
         }
         CmpValue::Null => false,

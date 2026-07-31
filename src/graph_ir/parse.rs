@@ -579,6 +579,27 @@ fn parse_payload_pred_inner<'a>(
         ));
     }
 
+    // HAS 'val' — array element containment predicate
+    if starts_with_keyword(rest, "HAS") {
+        let after_has = skip_keyword(rest, "HAS").trim_start();
+        let (val, rest) = if after_has.starts_with('\'') || after_has.starts_with('"') {
+            parse_quoted(after_has)?
+        } else {
+            return Err(GraphIrError::Unsupported(
+                "HAS requires a quoted string value".into(),
+            ));
+        };
+        return Ok((
+            PayloadPred {
+                field,
+                op: CmpOp::HasElement,
+                value: CmpValue::Text(val),
+                negated: false,
+            },
+            rest.trim_start(),
+        ));
+    }
+
     // Detect keyword operators (STARTS WITH, ENDS WITH, CONTAINS, LIKE, ILIKE) before symbols.
     // NOT ILIKE / NOT LIKE must come before ILIKE / LIKE to avoid ambiguity.
     let (op, rest) = if starts_with_keyword(rest, "NOT ILIKE") {
@@ -1577,6 +1598,7 @@ fn parse_return_transform(s: &str) -> Option<(String, ReturnTransform)> {
         ("ACOS(", ReturnTransform::Acos),
         ("TRUNC(", ReturnTransform::Trunc),
         ("CBRT(", ReturnTransform::Cbrt),
+        ("ARRAY_LENGTH(", ReturnTransform::ArrayLength),
     ];
     let found = prefixes
         .iter()
