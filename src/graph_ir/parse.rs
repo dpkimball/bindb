@@ -43,8 +43,11 @@ impl GraphIrQuery {
             return Err(GraphIrError::Unsupported("expected WHERE".into()));
         }
         let after_where = skip_keyword(after_pattern, "WHERE");
-        let (start, end_pred, after_preds) = parse_where(after_where)?;
+        let (starts, end_pred, after_preds) = parse_where(after_where)?;
         let after_preds = after_preds.trim_start();
+        let mut starts_iter = starts.into_iter();
+        let start = starts_iter.next().ok_or(GraphIrError::MissingStart)?;
+        let extra_starts: Vec<ObjectId> = starts_iter.collect();
 
         // Optional payload predicates: AND/OR [NOT] b.FIELD OP VALUE or AND/OR [NOT] r.FIELD OP VALUE
         let mut payload_preds: Vec<PayloadPred> = Vec::new();
@@ -202,6 +205,7 @@ impl GraphIrQuery {
 
         Ok(GraphIrQuery {
             start,
+            extra_starts,
             edge_types,
             min_depth,
             max_depth,
@@ -426,24 +430,24 @@ fn parse_hops(h: &str) -> Result<(usize, usize), GraphIrError> {
     }
 }
 
-fn parse_where(s: &str) -> Result<(ObjectId, NodeIdPred, &str), GraphIrError> {
+fn parse_where(s: &str) -> Result<(Vec<ObjectId>, NodeIdPred, &str), GraphIrError> {
     let s = s.trim_start();
-    // id(a) = '…'  [AND id(b) STARTS WITH '…' | AND id(b) = '…']
-    let (start, rest) = parse_id_eq(s, "a")?;
+    // id(a) = '…' | id(a) IN ['…', '…']  [AND id(b) STARTS WITH '…' | AND id(b) = '…']
+    let (starts, rest) = parse_id_start(s, "a")?;
     let rest = rest.trim_start();
     if starts_with_keyword(rest, "AND") {
         let after_and = skip_keyword(rest, "AND").trim_start();
         // Peek: if it starts with id(b) parse as end predicate; if b. it's a payload pred.
         if after_and.starts_with("id(") || after_and.starts_with("ID(") {
             let (end_pred, rest2) = parse_end_pred(after_and)?;
-            Ok((start, end_pred, rest2))
+            Ok((starts, end_pred, rest2))
         } else {
             // Payload pred comes after; leave rest pointing at AND so the
             // caller's payload-pred parser sees it.
-            Ok((start, NodeIdPred::Any, rest))
+            Ok((starts, NodeIdPred::Any, rest))
         }
     } else {
-        Ok((start, NodeIdPred::Any, rest))
+        Ok((starts, NodeIdPred::Any, rest))
     }
 }
 
@@ -683,19 +687,32 @@ fn parse_payload_pred_inner<'a>(
     ))
 }
 
-fn parse_id_eq<'a>(s: &'a str, var: &str) -> Result<(ObjectId, &'a str), GraphIrError> {
+/// Parse `id(VAR) = '…'` or `id(VAR) IN ['…', '…']` as a list of start IDs.
+fn parse_id_start<'a>(s: &'a str, var: &str) -> Result<(Vec<ObjectId>, &'a str), GraphIrError> {
     let s = s.trim_start();
     let prefix = format!("id({var})");
     if s.len() < prefix.len() || !s[..prefix.len()].eq_ignore_ascii_case(&prefix) {
         return Err(GraphIrError::MissingStart);
     }
     let after = s[prefix.len()..].trim_start();
-    let Some(after_eq) = after.strip_prefix('=') else {
-        return Err(GraphIrError::Unsupported(format!("expected id({var}) =")));
-    };
-    let after_eq = after_eq.trim_start();
-    let (val, rest) = parse_quoted(after_eq)?;
-    Ok((ObjectId::new(val), rest))
+    if let Some(after_eq) = after.strip_prefix('=') {
+        // Single start: id(a) = '...'
+        let after_eq = after_eq.trim_start();
+        let (val, rest) = parse_quoted(after_eq)?;
+        Ok((vec![ObjectId::new(val)], rest))
+    } else if starts_with_keyword(after, "IN") {
+        // Multi-start: id(a) IN ['id1', 'id2', ...]
+        let after_in = skip_keyword(after, "IN").trim_start();
+        let (ids, rest) = parse_string_list(after_in)?;
+        if ids.is_empty() {
+            return Err(GraphIrError::MissingStart);
+        }
+        Ok((ids.into_iter().map(ObjectId::new).collect(), rest))
+    } else {
+        Err(GraphIrError::Unsupported(format!(
+            "expected id({var}) = '…' or id({var}) IN ['…']"
+        )))
+    }
 }
 
 fn parse_end_pred(s: &str) -> Result<(NodeIdPred, &str), GraphIrError> {

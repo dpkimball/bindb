@@ -1,5 +1,6 @@
 use bindb::{
-    BinderStore, ObjectId, SqlGroupBy, SqlProjectQuery, SqlProjectUnionQuery, Transaction,
+    BinderStore, ObjectId, SqlAggregateQuery, SqlGroupBy, SqlProjectQuery, SqlProjectUnionQuery,
+    Transaction,
 };
 use tempfile::TempDir;
 
@@ -5707,4 +5708,106 @@ fn sql_union_cross_namespace() {
     assert!(roles.contains(&"user"));
     assert!(roles.contains(&"guest"));
     store.close().unwrap();
+}
+
+// ── COLLECT aggregate ────────────────────────────────────────────────────────
+
+fn build_collect_store(dir: &std::path::Path) -> bindb::BinderStore {
+    let store = bindb::BinderStore::open(dir).unwrap();
+    let mut tx = bindb::Transaction::new();
+    tx.put_object(
+        oid("obs://team:alice"),
+        br#"{"name":"Alice","role":"admin","score":90}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://team:bob"),
+        br#"{"name":"Bob","role":"user","score":70}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://team:carol"),
+        br#"{"name":"Carol","role":"admin","score":85}"#.to_vec(),
+    );
+    store.commit(tx, "test", "collect_store").unwrap();
+    store
+}
+
+#[test]
+fn sql_collect_basic_array() {
+    let dir = tmp();
+    let store = build_collect_store(dir.path());
+    let results = store
+        .sql_aggregate("SELECT COLLECT(PAYLOAD_FIELD('name')) FROM 'obs://team'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3);
+    let arr = results[0]
+        .collected
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .expect("collected should be an array");
+    assert_eq!(arr.len(), 3);
+    let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Bob"));
+    assert!(names.contains(&"Carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_collect_grouped_by_role() {
+    let dir = tmp();
+    let store = build_collect_store(dir.path());
+    let results = store
+        .sql_aggregate(
+            "SELECT COLLECT(PAYLOAD_FIELD('name')) FROM 'obs://team' GROUP BY PAYLOAD_FIELD('role')",
+        )
+        .unwrap();
+    // admin: Alice, Carol; user: Bob
+    assert_eq!(results.len(), 2);
+    let admin = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some("admin"))
+        .expect("admin group");
+    let admin_arr = admin
+        .collected
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .expect("admin array");
+    assert_eq!(admin_arr.len(), 2);
+    let admin_names: Vec<&str> = admin_arr.iter().filter_map(|v| v.as_str()).collect();
+    assert!(admin_names.contains(&"Alice"));
+    assert!(admin_names.contains(&"Carol"));
+
+    let user = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some("user"))
+        .expect("user group");
+    let user_arr = user
+        .collected
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .expect("user array");
+    assert_eq!(user_arr.len(), 1);
+    assert_eq!(user_arr[0].as_str(), Some("Bob"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_collect_non_collect_result_has_no_collected() {
+    let dir = tmp();
+    let store = build_collect_store(dir.path());
+    let results = store
+        .sql_aggregate("SELECT COUNT(*) FROM 'obs://team'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].collected.is_none());
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_collect_parse_rejects_bad_form() {
+    let err = SqlAggregateQuery::parse("SELECT COLLECT(name) FROM 'obs://ns'");
+    assert!(err.is_err());
+    let err2 = SqlAggregateQuery::parse("SELECT COLLECT(PAYLOAD_FIELD('f') FROM 'obs://ns'");
+    assert!(err2.is_err());
 }
