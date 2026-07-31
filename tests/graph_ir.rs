@@ -1,7 +1,7 @@
 use bindb::{
     AggFunc, BinderStore, CmpOp, CmpValue, EdgeId, GraphIrChainedQuery, GraphIrQuery,
-    GraphIrUnionQuery, GraphIrWrite, GraphIrWriteError, NodeIdPred, ObjectId, OrderByField,
-    OrderDirection, Transaction, WithAggregation,
+    GraphIrScanQuery, GraphIrUnionQuery, GraphIrWrite, GraphIrWriteError, NodeIdPred, ObjectId,
+    OrderByField, OrderDirection, Transaction, WithAggregation,
 };
 use tempfile::TempDir;
 
@@ -9577,5 +9577,132 @@ fn return_field_index_with_alias() {
         rows[0].fields.get("first_cat").and_then(|v| v.as_str()),
         Some("alpha")
     );
+    store.close().unwrap();
+}
+
+// ── GraphIrScanQuery ────────────────────────────────────────────────────────
+
+fn build_scan_store(dir: &std::path::Path) -> BinderStore {
+    let store = BinderStore::open(dir).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        obj("people://alice"),
+        br#"{"name":"Alice","age":30,"role":"admin"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("people://bob"),
+        br#"{"name":"Bob","age":25,"role":"user"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("people://carol"),
+        br#"{"name":"Carol","age":35,"role":"admin"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("people://dave"),
+        br#"{"name":"Dave","age":22,"role":"user"}"#.to_vec(),
+    );
+    tx.put_object(obj("other://x"), br#"{"name":"X"}"#.to_vec());
+    store.commit(tx, "test", "scan_store").unwrap();
+    store
+}
+
+#[test]
+fn scan_return_all_fields() {
+    let dir = tmp();
+    let store = build_scan_store(dir.path());
+    let rows = store
+        .graph_ir_scan("MATCH (a) WHERE id(a) STARTS WITH 'people://' RETURN a.*")
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Bob"));
+    assert!(names.contains(&"Carol"));
+    assert!(names.contains(&"Dave"));
+    store.close().unwrap();
+}
+
+#[test]
+fn scan_payload_filter() {
+    let dir = tmp();
+    let store = build_scan_store(dir.path());
+    let rows = store
+        .graph_ir_scan(
+            "MATCH (a) WHERE id(a) STARTS WITH 'people://' AND a.role = 'admin' RETURN a.name",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn scan_order_by_and_limit() {
+    let dir = tmp();
+    let store = build_scan_store(dir.path());
+    let rows = store
+        .graph_ir_scan(
+            "MATCH (a) WHERE id(a) STARTS WITH 'people://' RETURN a.name, a.age ORDER BY a.age ASC LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].fields.get("age").and_then(|v| v.as_f64()),
+        Some(22.0)
+    );
+    assert_eq!(
+        rows[1].fields.get("age").and_then(|v| v.as_f64()),
+        Some(25.0)
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn scan_return_id() {
+    let dir = tmp();
+    let store = build_scan_store(dir.path());
+    let rows = store
+        .graph_ir_scan(
+            "MATCH (a) WHERE id(a) STARTS WITH 'people://' AND a.role = 'user' RETURN id(a)",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let ids: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("id(b)").and_then(|v| v.as_str()))
+        .collect();
+    assert!(ids.contains(&"people://bob"));
+    assert!(ids.contains(&"people://dave"));
+    store.close().unwrap();
+}
+
+#[test]
+fn scan_parse_error_on_edge_pattern() {
+    let err = GraphIrScanQuery::parse("MATCH (a)-[:KNOWS]->(b) WHERE id(a) = 'x' RETURN b.*");
+    assert!(err.is_err());
+}
+
+#[test]
+fn scan_numeric_gt_filter() {
+    let dir = tmp();
+    let store = build_scan_store(dir.path());
+    let rows = store
+        .graph_ir_scan("MATCH (a) WHERE id(a) STARTS WITH 'people://' AND a.age > 28 RETURN a.name")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Carol"));
     store.close().unwrap();
 }

@@ -174,6 +174,27 @@ window function.  Scale is 1 K JSON-payload objects.
 
 ---
 
+## graph_ir scan-MATCH SLAs (issue #2)
+
+Applies when `graph_ir_scan_projected` iterates a namespace prefix and filters by payload
+predicates.  No graph traversal — pure scan + filter + project.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| Scan MATCH with payload filter | 1 K nodes | ≤ 10 ms |
+
+---
+
+## sql_project UNION SLAs (issue #5)
+
+Applies when `sql_project_union` / `sql_project_union_parsed` merges two SELECT branches.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| UNION ALL (two branches, 1 K rows each) | 2 K rows total | ≤ 100 ms |
+
+---
+
 ## Vector search SLAs (ANN / HNSW)
 
 Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the

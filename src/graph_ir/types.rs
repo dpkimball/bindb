@@ -498,6 +498,38 @@ pub struct GraphIrUnionQuery {
     pub all: bool,
 }
 
+/// A scan-based MATCH query — iterates all live objects under a namespace prefix and
+/// filters them by payload predicates, without a fixed start node or graph traversal.
+///
+/// ```text
+/// MATCH (a) WHERE id(a) STARTS WITH 'ns://'
+///   [AND a.field OP val]
+///   RETURN a.f1, a.f2
+///   [ORDER BY a.field [ASC|DESC]] [SKIP n] [LIMIT n]
+/// ```
+///
+/// Use `BinderStore::graph_ir_scan_projected` to execute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIrScanQuery {
+    /// Namespace prefix to scan; all live objects with this prefix are candidates.
+    pub namespace_prefix: String,
+    /// Additional id-level predicate beyond STARTS WITH (ENDS WITH, CONTAINS, =, IN, NOT IN).
+    pub end_pred: NodeIdPred,
+    /// Payload field predicates on scanned nodes. Empty = no payload filtering.
+    pub payload_preds: Vec<PayloadPred>,
+    pub pred_combinator: PayloadPredCombinator,
+    pub return_fields: Vec<String>,
+    pub return_field_aliases: HashMap<String, String>,
+    pub return_field_transforms: HashMap<String, ReturnTransform>,
+    pub return_id: bool,
+    pub return_all_fields: bool,
+    pub distinct: bool,
+    pub order_by: Vec<GraphIrOrderBy>,
+    pub limit: Option<usize>,
+    pub skip: Option<usize>,
+    pub return_computed: Vec<ComputedReturnField>,
+}
+
 /// A multi-hop chained MATCH query where each step's matched end node becomes the
 /// start node for the next step.
 ///

@@ -2250,3 +2250,151 @@ impl GraphIrChainedQuery {
         Ok(Self { steps })
     }
 }
+
+impl GraphIrScanQuery {
+    /// Parse a scan-based MATCH query.
+    ///
+    /// Syntax: `MATCH (a) WHERE id(a) STARTS WITH 'ns://' [AND a.field OP val] RETURN a.*`
+    ///
+    /// The `(a)` pattern must NOT be followed by an edge (`-` or `<`); those belong to the
+    /// regular `GraphIrQuery::parse`. The first WHERE predicate must be `id(a) STARTS WITH '...'`
+    /// (the namespace prefix to scan). Additional `AND`/`OR a.field OP val` predicates filter by
+    /// node payload. The RETURN clause accepts the same syntax as regular MATCH (`a.*`, `a.f1`,
+    /// `id(a)`, transforms, computed expressions) — `a.` is mapped internally to the projection
+    /// engine's `b.` variable.
+    pub fn parse(src: &str) -> Result<Self, GraphIrError> {
+        let raw = collapse_ws(src.trim());
+        if raw.is_empty() {
+            return Err(GraphIrError::Empty);
+        }
+        if !starts_with_keyword(&raw, "MATCH") {
+            return Err(GraphIrError::Unsupported("must start with MATCH".into()));
+        }
+        let after_match = skip_keyword(&raw, "MATCH").trim_start();
+
+        // Require (a) — no edge pattern
+        if !after_match.starts_with('(') {
+            return Err(GraphIrError::Unsupported(
+                "scan MATCH expects a node pattern (a)".into(),
+            ));
+        }
+        let close = after_match
+            .find(')')
+            .ok_or_else(|| GraphIrError::Unsupported("unclosed '(' in scan MATCH".into()))?;
+        let after_node = after_match[close + 1..].trim_start();
+        if after_node.starts_with('-') || after_node.starts_with('<') {
+            return Err(GraphIrError::Unsupported(
+                "edge patterns require GraphIrQuery::parse, not GraphIrScanQuery::parse".into(),
+            ));
+        }
+
+        // WHERE
+        if !starts_with_keyword(after_node, "WHERE") {
+            return Err(GraphIrError::Unsupported(
+                "scan MATCH requires WHERE id(a) STARTS WITH '...'".into(),
+            ));
+        }
+        let after_where = skip_keyword(after_node, "WHERE").trim_start();
+
+        // First predicate must be id(a) STARTS WITH '...'
+        let (start_pred, after_id) = parse_end_pred_for_var(after_where, "a")?;
+        let namespace_prefix = match start_pred {
+            NodeIdPred::StartsWith(pfx) => pfx,
+            _ => {
+                return Err(GraphIrError::Unsupported(
+                    "scan MATCH WHERE must begin with id(a) STARTS WITH '...'".into(),
+                ))
+            }
+        };
+
+        // Additional predicates: AND/OR [NOT] a.field OP val | AND id(a) ENDS WITH/CONTAINS/=
+        let mut payload_preds: Vec<PayloadPred> = Vec::new();
+        let mut end_pred = NodeIdPred::Any;
+        let mut pred_combinator = PayloadPredCombinator::And;
+        let mut rest = after_id.trim_start();
+        loop {
+            let is_and = starts_with_keyword(rest, "AND");
+            let is_or = starts_with_keyword(rest, "OR");
+            if !is_and && !is_or {
+                break;
+            }
+            let this_conn = if is_and {
+                PayloadPredCombinator::And
+            } else {
+                PayloadPredCombinator::Or
+            };
+            let kw = if is_and { "AND" } else { "OR" };
+            let after_kw = skip_keyword(rest, kw).trim_start();
+            let (negated, after_not) = if starts_with_keyword(after_kw, "NOT") {
+                (true, skip_keyword(after_kw, "NOT").trim_start())
+            } else {
+                (false, after_kw)
+            };
+            if after_not.starts_with("a.") || after_not.starts_with("A.") {
+                if !payload_preds.is_empty() {
+                    pred_combinator = this_conn;
+                }
+                let (mut pred, next) = parse_payload_pred_for_var(after_not, "a")?;
+                pred.negated ^= negated;
+                payload_preds.push(pred);
+                rest = next.trim_start();
+            } else if (after_not.len() >= 5 && after_not[..5].eq_ignore_ascii_case("id(a)"))
+                && matches!(end_pred, NodeIdPred::Any)
+            {
+                let (pred, next) = parse_end_pred_for_var(after_not, "a")?;
+                end_pred = pred;
+                rest = next.trim_start();
+            } else {
+                break;
+            }
+        }
+
+        // RETURN
+        if !starts_with_keyword(rest, "RETURN") {
+            return Err(GraphIrError::Unsupported(
+                "scan MATCH requires RETURN clause".into(),
+            ));
+        }
+        let after_return = skip_keyword(rest, "RETURN");
+        let (distinct, after_return) = if starts_with_keyword(after_return, "DISTINCT") {
+            (true, skip_keyword(after_return, "DISTINCT"))
+        } else {
+            (false, after_return)
+        };
+
+        // Normalize a. → b. so parse_return_spec / parse_multi_ordering_tail handle it correctly.
+        let normalized = after_return.replace("id(a)", "id(b)").replace("a.", "b.");
+        let (ret_spec_raw, ordering_tail) = split_at_ordering_clause(&normalized);
+        let (
+            return_fields,
+            return_field_aliases,
+            return_field_transforms,
+            _r_fields,
+            _c_fields,
+            _return_path,
+            return_id,
+            return_all_fields,
+            return_computed,
+            _return_edge_type,
+            _return_depth,
+        ) = parse_return_spec(ret_spec_raw, None);
+        let (order_by, limit, skip) = parse_multi_ordering_tail(ordering_tail)?;
+
+        Ok(GraphIrScanQuery {
+            namespace_prefix,
+            end_pred,
+            payload_preds,
+            pred_combinator,
+            return_fields,
+            return_field_aliases,
+            return_field_transforms,
+            return_id,
+            return_all_fields,
+            distinct,
+            order_by,
+            limit,
+            skip,
+            return_computed,
+        })
+    }
+}

@@ -2868,6 +2868,73 @@ impl SqlProjectQuery {
     }
 }
 
+/// A `SELECT … FROM … UNION [ALL] SELECT … FROM …` multi-branch projection query.
+///
+/// Each branch is an independent [`SqlProjectQuery`]. Results are merged in branch order.
+/// Plain UNION deduplicates rows by their serialized key-value content (sorted key order).
+/// UNION ALL preserves all rows including duplicates.
+///
+/// ```text
+/// SELECT PAYLOAD_FIELD('name') FROM 'obs://users'
+/// UNION ALL
+/// SELECT PAYLOAD_FIELD('name') FROM 'obs://guests'
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlProjectUnionQuery {
+    pub branches: Vec<SqlProjectQuery>,
+    /// When `false` (plain UNION), duplicate rows are content-deduplicated.
+    /// When `true` (UNION ALL), all rows are preserved.
+    pub all: bool,
+}
+
+impl SqlProjectUnionQuery {
+    /// Parse a `SELECT … UNION [ALL] SELECT …` query.
+    ///
+    /// Splits on ` UNION ALL SELECT ` or ` UNION SELECT ` (case-insensitive after whitespace
+    /// collapsing). Each segment is parsed as a [`SqlProjectQuery`]. Requires at least two branches.
+    pub fn parse(sql: &str) -> Result<Self, SqlAggError> {
+        let collapsed: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let upper = collapsed.to_ascii_uppercase();
+
+        let mut raw_branches: Vec<String> = Vec::new();
+        let mut union_all = false;
+        let mut scan = 0usize;
+        let mut seg_start = 0usize;
+
+        while scan < upper.len() {
+            if upper[scan..].starts_with(" UNION ALL SELECT ") {
+                raw_branches.push(collapsed[seg_start..scan].trim().to_string());
+                union_all = true;
+                scan += " UNION ALL ".len();
+                seg_start = scan;
+            } else if upper[scan..].starts_with(" UNION SELECT ") {
+                raw_branches.push(collapsed[seg_start..scan].trim().to_string());
+                scan += " UNION ".len();
+                seg_start = scan;
+            } else {
+                scan += 1;
+            }
+        }
+        raw_branches.push(collapsed[seg_start..].trim().to_string());
+
+        if raw_branches.len() < 2 {
+            return Err(SqlAggError::Unsupported(
+                "UNION query requires at least two SELECT branches separated by UNION".into(),
+            ));
+        }
+
+        let branches = raw_branches
+            .iter()
+            .map(|s| SqlProjectQuery::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            branches,
+            all: union_all,
+        })
+    }
+}
+
 /// Parse `LAG(PAYLOAD_FIELD('f'), n)` or `LEAD(PAYLOAD_FIELD('f'), n)` at the start of `s`.
 /// Returns `Some((func, rest_after_closing_paren))` or `None` on any parse failure.
 fn parse_lag_lead_func(is_lag: bool, s: &str) -> Option<(SqlWindowFunc, &str)> {
@@ -4300,6 +4367,44 @@ impl BinderStore {
         }
 
         Ok(rows)
+    }
+
+    /// Parse and execute a `SELECT … UNION [ALL] SELECT …` projection query.
+    pub fn sql_project_union(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError> {
+        let q = SqlProjectUnionQuery::parse(sql).map_err(|e| StoreError::InvalidArgument {
+            message: e.to_string(),
+        })?;
+        self.sql_project_union_parsed(&q)
+    }
+
+    /// Execute a pre-parsed UNION projection query.
+    pub fn sql_project_union_parsed(
+        &self,
+        q: &SqlProjectUnionQuery,
+    ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError> {
+        let mut all_rows: Vec<std::collections::HashMap<String, serde_json::Value>> = Vec::new();
+        for branch in &q.branches {
+            let rows = self.sql_project_parsed(branch)?;
+            all_rows.extend(rows);
+        }
+        if !q.all {
+            // UNION: deduplicate by serialized row content (sorted key order, first wins).
+            let mut seen = std::collections::HashSet::new();
+            all_rows.retain(|row| {
+                let mut pairs: Vec<_> = row.iter().collect();
+                pairs.sort_by_key(|(k, _)| k.as_str());
+                let key: String = pairs
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                seen.insert(key)
+            });
+        }
+        Ok(all_rows)
     }
 }
 

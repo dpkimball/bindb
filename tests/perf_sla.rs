@@ -61,6 +61,10 @@ const SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX: u64 = 100; // ms — searched CAS
 const SQL_PROJECT_CASE_WHEN_1K_P99_MS_MAX: u64 = 100; // ms — simple CASE WHEN expression
 const SQL_PROJECT_NTH_VALUE_1K_P99_MS_MAX: u64 = 100; // ms — NTH_VALUE window function
 
+// ── graph_ir scan / sql_project UNION threshold constants (1 K rows) ─────────
+const GRAPH_IR_SCAN_1K_P99_MS_MAX: u64 = 10; // ms — scan MATCH at 1 K nodes with payload filter
+const SQL_PROJECT_UNION_1K_P99_MS_MAX: u64 = 100; // ms — UNION ALL of two 500-row branches
+
 // ── vector / ANN threshold constants ─────────────────────────────────────────
 const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
 const VECTOR_SEARCH_P99_MS_MAX: u64 = 5; // ms — knn_search p99 at 100 K vectors (OKR O3/KR3.1)
@@ -1317,5 +1321,66 @@ fn sla_sql_project_searched_case_when_p99_lte_100ms_at_1k_rows() {
         "sql_project searched CASE WHEN p99 {} ms > SLA maximum {} ms at 1 K rows",
         p99,
         SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX,
+    );
+}
+
+// ── graph_ir scan SLA ────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_scan_1k() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    const N: usize = 50;
+    let mut timings = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let rows = store
+            .graph_ir_scan(
+                "MATCH (a) WHERE id(a) STARTS WITH 'obs://sla_arith:' \
+                 AND a.score > 3 RETURN a.*",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert!(!rows.is_empty());
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_SCAN_1K_P99_MS_MAX,
+        "graph_ir scan p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_SCAN_1K_P99_MS_MAX,
+    );
+}
+
+// ── sql_project UNION SLA ────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_union_1k() {
+    let dir = tempfile::tempdir().unwrap();
+    // Use two halves of the arith store by splitting via id filter — reuse build_arith_store_1k
+    // which puts obs://sla_arith:0000 … :0999.
+    let store = build_arith_store_1k(&dir);
+    const N: usize = 50;
+    let mut timings = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let rows = store
+            .sql_project_union(
+                "SELECT PAYLOAD_FIELD('a'), PAYLOAD_FIELD('b') FROM 'obs://sla_arith' \
+                 UNION ALL \
+                 SELECT PAYLOAD_FIELD('a'), PAYLOAD_FIELD('b') FROM 'obs://sla_arith'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 2_000); // 1 K per branch × 2 (UNION ALL)
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_UNION_1K_P99_MS_MAX,
+        "sql_project UNION ALL p99 {} ms > SLA maximum {} ms at 2 K rows (2 × 1 K)",
+        p99,
+        SQL_PROJECT_UNION_1K_P99_MS_MAX,
     );
 }

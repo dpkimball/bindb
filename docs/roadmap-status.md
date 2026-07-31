@@ -1,6 +1,6 @@
 # bindb — Issue / roadmap status
 
-Last updated: 2026-07-30 (PRs #32–#72). Prefer this over stale issue bodies.
+Last updated: 2026-07-31 (PRs #32–#75 + in-progress). Prefer this over stale issue bodies.
 
 
 | Issue | State | Shipped | Remaining / follow-up |
