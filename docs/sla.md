@@ -132,6 +132,19 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 
 ---
 
+## graph_ir extended-RETURN SLAs (issue #2)
+
+These SLAs apply to graph traversal queries that use the extended RETURN capabilities
+(zero-hop, arithmetic expressions, string concat, searched CASE WHEN).
+Scale is 1 K nodes with a hub-and-spoke topology, depth-1 traversal.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| Zero-hop match (`[*0..1]` with start-node predicate) | 1 K nodes | ≤ 10 ms |
+| Arithmetic RETURN (`b.x + b.y AS sum`) | 1 K nodes, depth 1 | ≤ 10 ms |
+
+---
+
 ## Vector search SLAs (ANN / HNSW)
 
 Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the
