@@ -195,6 +195,28 @@ Applies when `sql_project_union` / `sql_project_union_parsed` merges two SELECT 
 
 ---
 
+## graph_ir multi-start fan-out SLAs (issue #2)
+
+Applies when `WHERE id(a) IN ['hub1', 'hub2']` fans out BFS from multiple start nodes and
+merges results.  Scale is 2 hubs × 500 spokes each (1 K total result rows).
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| Multi-start fan-out (2 hubs, 500 spokes each) | 1 K rows | ≤ 20 ms |
+
+---
+
+## sql COLLECT aggregate SLAs (issue #5)
+
+Applies when `COLLECT(PAYLOAD_FIELD('field'))` builds JSON arrays per group.
+Scale is 1 K observations grouped into 10 buckets (100 items per array).
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| COLLECT with GROUP BY (10 groups × 100 items) | 1 K observations | ≤ 50 ms |
+
+---
+
 ## Vector search SLAs (ANN / HNSW)
 
 Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the

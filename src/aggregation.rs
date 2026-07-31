@@ -33,7 +33,7 @@ pub struct JoinRow {
 }
 
 /// Aggregate function applied across each group of extracted values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Aggregate {
     /// Number of observations in each group.
     Count,
@@ -49,6 +49,9 @@ pub enum Aggregate {
     P50,
     /// 99th-percentile of extracted values.
     P99,
+    /// JSON array of a named payload field value from each observation in the group.
+    /// `COLLECT(PAYLOAD_FIELD('fieldname'))` — result in `AggregateResult::collected`.
+    Collect(String),
 }
 
 /// A single row returned by an aggregation query.
@@ -57,9 +60,12 @@ pub struct AggregateResult {
     /// The group key, or `None` when no `.group_by()` was specified.
     pub group_key: Option<String>,
     /// Computed aggregate value (e.g. average hours, total count).
+    /// For `COLLECT` queries this is always `0.0`; use `collected` instead.
     pub value: f64,
     /// Number of observations that contributed to this result.
     pub count: usize,
+    /// JSON array of collected field values, populated only for `Aggregate::Collect`.
+    pub collected: Option<serde_json::Value>,
 }
 
 // ── type aliases ──────────────────────────────────────────────────────────────
@@ -138,10 +144,15 @@ pub(crate) fn run_aggregation(
     versions: Vec<BinderObjectVersion>,
     q: ObservationAggregation<'_>,
 ) -> Vec<AggregateResult> {
-    // Collect (group_key, value) pairs.
-    // For Count we still track None values; for all others we skip None.
     let mut groups: HashMap<Option<String>, Vec<f64>> = HashMap::new();
     let mut counts: HashMap<Option<String>, usize> = HashMap::new();
+    let mut collect_groups: HashMap<Option<String>, Vec<serde_json::Value>> = HashMap::new();
+
+    let collect_field = if let Aggregate::Collect(ref f) = q.aggregate {
+        Some(f.clone())
+    } else {
+        None
+    };
 
     for v in versions {
         if let Some(ref f) = q.filter_fn {
@@ -151,52 +162,72 @@ pub(crate) fn run_aggregation(
         }
 
         let key = q.group_fn.as_ref().and_then(|f| f(&v));
-
-        // Always increment count for this group.
         *counts.entry(key.clone()).or_insert(0) += 1;
 
-        let numeric = v
-            .payload
-            .as_deref()
-            .and_then(|p| q.extract_fn.as_ref().and_then(|f| f(p)));
-
-        if let Some(val) = numeric {
-            groups.entry(key).or_default().push(val);
-        } else {
-            // Ensure the group key appears in counts even with no numeric value.
+        if let Some(ref field) = collect_field {
+            let json_val = v
+                .payload
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .and_then(|v| v.get(field.as_str()).cloned())
+                .unwrap_or(serde_json::Value::Null);
+            collect_groups
+                .entry(key.clone())
+                .or_default()
+                .push(json_val);
             groups.entry(key).or_default();
+        } else {
+            let numeric = v
+                .payload
+                .as_deref()
+                .and_then(|p| q.extract_fn.as_ref().and_then(|f| f(p)));
+
+            if let Some(val) = numeric {
+                groups.entry(key).or_default().push(val);
+            } else {
+                groups.entry(key).or_default();
+            }
         }
     }
 
-    // Compute aggregate per group.
+    let agg = q.aggregate;
+    let is_collect = collect_field.is_some();
     let mut results: Vec<AggregateResult> = groups
         .into_iter()
         .map(|(key, mut values)| {
             let count = counts.get(&key).copied().unwrap_or(0);
-            let value = match q.aggregate {
-                Aggregate::Count => count as f64,
-                Aggregate::Sum => values.iter().sum(),
-                Aggregate::Avg => {
-                    if values.is_empty() {
-                        0.0
-                    } else {
-                        values.iter().sum::<f64>() / values.len() as f64
+            let (value, collected) = if is_collect {
+                let arr = collect_groups.remove(&key).map(serde_json::Value::Array);
+                (0.0, arr)
+            } else {
+                let v = match &agg {
+                    Aggregate::Count => count as f64,
+                    Aggregate::Sum => values.iter().sum(),
+                    Aggregate::Avg => {
+                        if values.is_empty() {
+                            0.0
+                        } else {
+                            values.iter().sum::<f64>() / values.len() as f64
+                        }
                     }
-                }
-                Aggregate::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
-                Aggregate::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-                Aggregate::P50 => percentile(&mut values, 50.0),
-                Aggregate::P99 => percentile(&mut values, 99.0),
+                    Aggregate::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
+                    Aggregate::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                    Aggregate::P50 => percentile(&mut values, 50.0),
+                    Aggregate::P99 => percentile(&mut values, 99.0),
+                    Aggregate::Collect(_) => unreachable!(),
+                };
+                (v, None)
             };
             AggregateResult {
                 group_key: key,
                 value,
                 count,
+                collected,
             }
         })
         .collect();
 
-    // Stable output: sort by group_key so results are deterministic.
     results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
     results
 }

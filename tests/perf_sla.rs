@@ -65,6 +65,10 @@ const SQL_PROJECT_NTH_VALUE_1K_P99_MS_MAX: u64 = 100; // ms — NTH_VALUE window
 const GRAPH_IR_SCAN_1K_P99_MS_MAX: u64 = 10; // ms — scan MATCH at 1 K nodes with payload filter
 const SQL_PROJECT_UNION_1K_P99_MS_MAX: u64 = 100; // ms — UNION ALL of two 500-row branches
 
+// ── multi-start fan-out / COLLECT threshold constants ─────────────────────────
+const GRAPH_IR_MULTISTART_1K_P99_MS_MAX: u64 = 20; // ms — 2 hubs × 500 spokes each
+const SQL_COLLECT_1K_P99_MS_MAX: u64 = 50; // ms — COLLECT over 1 K observations
+
 // ── vector / ANN threshold constants ─────────────────────────────────────────
 const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
 const VECTOR_SEARCH_P99_MS_MAX: u64 = 5; // ms — knn_search p99 at 100 K vectors (OKR O3/KR3.1)
@@ -1382,5 +1386,103 @@ fn sla_sql_project_union_1k() {
         "sql_project UNION ALL p99 {} ms > SLA maximum {} ms at 2 K rows (2 × 1 K)",
         p99,
         SQL_PROJECT_UNION_1K_P99_MS_MAX,
+    );
+}
+
+// ── multi-start fan-out SLA ───────────────────────────────────────────────────
+
+fn build_multistart_hub2_500(dir: &TempDir) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(ObjectId::new("ms://hub1"), br#"{"name":"hub1"}"#.to_vec());
+    tx.put_object(ObjectId::new("ms://hub2"), br#"{"name":"hub2"}"#.to_vec());
+    for i in 0..500usize {
+        let payload = format!(r#"{{"name":"n{i}","score":{}}}"#, i % 10);
+        tx.put_object(
+            ObjectId::new(format!("ms://h1:n{:04}", i)),
+            payload.clone().into_bytes(),
+        );
+        tx.put_object(
+            ObjectId::new(format!("ms://h2:n{:04}", i)),
+            payload.into_bytes(),
+        );
+    }
+    store.commit_buffered(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for i in 0..500usize {
+        tx2.put_edge(
+            EdgeId::new(format!("ms://e1:{i}")),
+            ObjectId::new("ms://hub1"),
+            ObjectId::new(format!("ms://h1:n{:04}", i)),
+            "LINKS",
+            None,
+        );
+        tx2.put_edge(
+            EdgeId::new(format!("ms://e2:{i}")),
+            ObjectId::new("ms://hub2"),
+            ObjectId::new(format!("ms://h2:n{:04}", i)),
+            "LINKS",
+            None,
+        );
+    }
+    store.commit_buffered(tx2, "test", "").unwrap();
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_multistart_1k() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_multistart_hub2_500(&dir);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) IN ['ms://hub1', 'ms://hub2'] RETURN b.name",
+    )
+    .unwrap();
+    const N: usize = 50;
+    let mut timings = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_MULTISTART_1K_P99_MS_MAX,
+        "graph_ir multi-start p99 {} ms > SLA maximum {} ms at 2 hubs × 500 spokes",
+        p99,
+        GRAPH_IR_MULTISTART_1K_P99_MS_MAX,
+    );
+}
+
+// ── COLLECT aggregate SLA ─────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_collect_1k() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    const N: usize = 50;
+    let mut timings = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let results = store
+            .sql_aggregate(
+                "SELECT COLLECT(PAYLOAD_FIELD('first')) FROM 'obs://sla_arith' \
+                 GROUP BY PAYLOAD_FIELD('score')",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        // score cycles 0..10, so 10 groups × 100 items each
+        assert_eq!(results.len(), 10);
+        assert!(results[0].collected.is_some());
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_COLLECT_1K_P99_MS_MAX,
+        "sql COLLECT p99 {} ms > SLA maximum {} ms at 1 K observations",
+        p99,
+        SQL_COLLECT_1K_P99_MS_MAX,
     );
 }

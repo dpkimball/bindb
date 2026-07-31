@@ -1106,6 +1106,20 @@ impl BinderStore {
 
     /// Execute a pre-parsed restricted graph IR query.
     pub fn graph_ir_parsed(&self, q: &GraphIrQuery) -> Result<Vec<GraphQueryMatch>, StoreError> {
+        if !q.extra_starts.is_empty() {
+            let mut q_single = q.clone();
+            q_single.extra_starts = vec![];
+            q_single.order_by = vec![];
+            q_single.limit = None;
+            q_single.skip = None;
+            let mut all_matches = self.graph_ir_parsed(&q_single)?;
+            for extra in &q.extra_starts {
+                q_single.start = extra.clone();
+                all_matches.extend(self.graph_ir_parsed(&q_single)?);
+            }
+            apply_order_limit_matches(&mut all_matches, q);
+            return Ok(all_matches);
+        }
         let mut matches = build_graph_query(self, q).execute()?;
         if q.min_depth > 1 {
             matches.retain(|m| m.depth >= q.min_depth);
@@ -1125,6 +1139,26 @@ impl BinderStore {
     /// Fields absent from the payload or non-JSON payloads produce no entry for that key.
     /// For plain `RETURN b` with no optional clause, prefer `graph_ir_parsed`.
     pub fn graph_ir_projected(&self, q: &GraphIrQuery) -> Result<Vec<GraphIrRow>, StoreError> {
+        if !q.extra_starts.is_empty() {
+            let mut q_single = q.clone();
+            q_single.extra_starts = vec![];
+            q_single.order_by = vec![];
+            q_single.limit = None;
+            q_single.skip = None;
+            q_single.distinct = false;
+            let mut all_rows = self.graph_ir_projected(&q_single)?;
+            for extra in &q.extra_starts {
+                q_single.start = extra.clone();
+                all_rows.extend(self.graph_ir_projected(&q_single)?);
+            }
+            if q.distinct {
+                let mut seen = std::collections::HashSet::new();
+                all_rows.retain(|r| seen.insert(r.object_id.clone()));
+            }
+            apply_order_limit_rows(&mut all_rows, q);
+            return Ok(all_rows);
+        }
+
         let (mut matches, parent_map, parent_edge_map) = if q.return_path {
             let (mut ms, pm, pem) =
                 self.execute_graph_query_with_paths(build_graph_query(self, q))?;

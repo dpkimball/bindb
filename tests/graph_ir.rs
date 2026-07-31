@@ -9706,3 +9706,154 @@ fn scan_numeric_gt_filter() {
     assert!(names.contains(&"Carol"));
     store.close().unwrap();
 }
+
+// ── Multi-start fan-out ──────────────────────────────────────────────────────
+
+fn build_multistart_store(dir: &std::path::Path) -> BinderStore {
+    let store = BinderStore::open(dir).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("sn://alice"), br#"{"name":"Alice"}"#.to_vec());
+    tx.put_object(obj("sn://bob"), br#"{"name":"Bob"}"#.to_vec());
+    tx.put_object(obj("sn://carol"), br#"{"name":"Carol"}"#.to_vec());
+    tx.put_object(obj("sn://dave"), br#"{"name":"Dave"}"#.to_vec());
+    tx.put_object(obj("sn://eve"), br#"{"name":"Eve"}"#.to_vec());
+    tx.put_object(obj("sn://shared"), br#"{"name":"Shared"}"#.to_vec());
+    store.commit(tx, "test", "nodes").unwrap();
+    let mut tx2 = Transaction::new();
+    tx2.put_edge(
+        eid("ms:e1"),
+        obj("sn://alice"),
+        obj("sn://bob"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e2"),
+        obj("sn://alice"),
+        obj("sn://carol"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e3"),
+        obj("sn://dave"),
+        obj("sn://eve"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e4"),
+        obj("sn://alice"),
+        obj("sn://shared"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e5"),
+        obj("sn://dave"),
+        obj("sn://shared"),
+        "FOLLOWS",
+        None,
+    );
+    store.commit(tx2, "test", "edges").unwrap();
+    store
+}
+
+#[test]
+fn multi_start_fan_out_merges_results() {
+    let dir = tmp();
+    let store = build_multistart_store(dir.path());
+    // alice → bob, carol, shared; dave → eve, shared (5 rows total without dedup)
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN ['sn://alice', 'sn://dave'] RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"Bob"));
+    assert!(names.contains(&"Carol"));
+    assert!(names.contains(&"Eve"));
+    assert!(names.contains(&"Shared"));
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_start_distinct_deduplicates_shared_neighbor() {
+    let dir = tmp();
+    let store = build_multistart_store(dir.path());
+    // Both alice and dave follow sn://shared — DISTINCT collapses it to one row.
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN ['sn://alice', 'sn://dave'] \
+                 RETURN DISTINCT id(b)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    // unique reachable: bob, carol, shared, eve = 4
+    assert_eq!(rows.len(), 4);
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_start_single_element_matches_eq() {
+    let dir = tmp();
+    let store = build_multistart_store(dir.path());
+    let rows_in = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN ['sn://alice'] RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let rows_eq = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) = 'sn://alice' RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows_in.len(), rows_eq.len());
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_start_limit_applied_globally() {
+    let dir = tmp();
+    let store = build_multistart_store(dir.path());
+    // Without LIMIT we'd get 5 rows; LIMIT 2 should give exactly 2.
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN ['sn://alice', 'sn://dave'] \
+                 RETURN b.name ORDER BY b.name ASC LIMIT 2",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    // Global sort: Bob < Carol < Eve < Shared (alphabetically)
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(names[0], "Bob");
+    assert_eq!(names[1], "Carol");
+    store.close().unwrap();
+}
+
+#[test]
+fn multi_start_parse_error_empty_list() {
+    let err = GraphIrQuery::parse("MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN [] RETURN b.name");
+    assert!(err.is_err());
+}

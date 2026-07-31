@@ -410,6 +410,9 @@ pub struct GraphIrOrderBy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphIrQuery {
     pub start: ObjectId,
+    /// Additional start nodes for multi-start fan-out (`WHERE id(a) IN ['x', 'y']`).
+    /// When non-empty, BFS is run from each of `[start] + extra_starts` and results merged.
+    pub extra_starts: Vec<ObjectId>,
     pub edge_types: Vec<String>,
     /// Minimum hop depth included in results (1 = include immediate neighbours).
     pub min_depth: usize,

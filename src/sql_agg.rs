@@ -333,6 +333,20 @@ fn skip_keyword<'a>(s: &'a str, kw: &str) -> &'a str {
 
 fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
     let u = s.to_ascii_uppercase();
+    // COLLECT(PAYLOAD_FIELD('fieldname')) — variable field name, handled before the table
+    if u.starts_with("COLLECT(PAYLOAD_FIELD(") {
+        let after_pf = &s["COLLECT(PAYLOAD_FIELD(".len()..];
+        let (field, rest) = parse_quoted_sql(after_pf)?;
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(')').ok_or_else(|| {
+            SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in COLLECT".into())
+        })?;
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix(')')
+            .ok_or_else(|| SqlAggError::Unsupported("expected ')' closing COLLECT(...)".into()))?;
+        return Ok((Aggregate::Collect(field), false, rest));
+    }
     let patterns: &[(&str, Aggregate, bool)] = &[
         ("COUNT(*)", Aggregate::Count, false),
         ("AVG(VALUE)", Aggregate::Avg, true),
@@ -344,11 +358,11 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
     ];
     for (pat, agg, needs) in patterns {
         if u.starts_with(pat) {
-            return Ok((*agg, *needs, &s[pat.len()..]));
+            return Ok((agg.clone(), *needs, &s[pat.len()..]));
         }
     }
     Err(SqlAggError::Unsupported(
-        "aggregate must be COUNT(*), AVG/SUM/MIN/MAX/P50/P99(VALUE)".into(),
+        "aggregate must be COUNT(*), AVG/SUM/MIN/MAX/P50/P99(VALUE), or COLLECT(PAYLOAD_FIELD('field'))".into(),
     ))
 }
 
@@ -1105,7 +1119,7 @@ impl BinderStore {
         let mut builder: ObservationAggregation<'_> = self
             .aggregate_observations()
             .namespace(q.namespace.clone())
-            .aggregate(q.aggregate);
+            .aggregate(q.aggregate.clone());
 
         if q.needs_value {
             builder = builder.extract_f64(extract_value);
