@@ -342,9 +342,9 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
             SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in COLLECT".into())
         })?;
         let rest = rest.trim_start();
-        let rest = rest.strip_prefix(')').ok_or_else(|| {
-            SqlAggError::Unsupported("expected ')' closing COLLECT(...)".into())
-        })?;
+        let rest = rest
+            .strip_prefix(')')
+            .ok_or_else(|| SqlAggError::Unsupported("expected ')' closing COLLECT(...)".into()))?;
         return Ok((Aggregate::Collect(field), false, rest));
     }
     let patterns: &[(&str, Aggregate, bool)] = &[

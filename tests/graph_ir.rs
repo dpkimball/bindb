@@ -9720,11 +9720,41 @@ fn build_multistart_store(dir: &std::path::Path) -> BinderStore {
     tx.put_object(obj("sn://shared"), br#"{"name":"Shared"}"#.to_vec());
     store.commit(tx, "test", "nodes").unwrap();
     let mut tx2 = Transaction::new();
-    tx2.put_edge(eid("ms:e1"), obj("sn://alice"), obj("sn://bob"), "FOLLOWS", None);
-    tx2.put_edge(eid("ms:e2"), obj("sn://alice"), obj("sn://carol"), "FOLLOWS", None);
-    tx2.put_edge(eid("ms:e3"), obj("sn://dave"), obj("sn://eve"), "FOLLOWS", None);
-    tx2.put_edge(eid("ms:e4"), obj("sn://alice"), obj("sn://shared"), "FOLLOWS", None);
-    tx2.put_edge(eid("ms:e5"), obj("sn://dave"), obj("sn://shared"), "FOLLOWS", None);
+    tx2.put_edge(
+        eid("ms:e1"),
+        obj("sn://alice"),
+        obj("sn://bob"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e2"),
+        obj("sn://alice"),
+        obj("sn://carol"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e3"),
+        obj("sn://dave"),
+        obj("sn://eve"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e4"),
+        obj("sn://alice"),
+        obj("sn://shared"),
+        "FOLLOWS",
+        None,
+    );
+    tx2.put_edge(
+        eid("ms:e5"),
+        obj("sn://dave"),
+        obj("sn://shared"),
+        "FOLLOWS",
+        None,
+    );
     store.commit(tx2, "test", "edges").unwrap();
     store
 }
@@ -9824,8 +9854,6 @@ fn multi_start_limit_applied_globally() {
 
 #[test]
 fn multi_start_parse_error_empty_list() {
-    let err = GraphIrQuery::parse(
-        "MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN [] RETURN b.name",
-    );
+    let err = GraphIrQuery::parse("MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN [] RETURN b.name");
     assert!(err.is_err());
 }

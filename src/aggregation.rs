@@ -172,7 +172,10 @@ pub(crate) fn run_aggregation(
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
                 .and_then(|v| v.get(field.as_str()).cloned())
                 .unwrap_or(serde_json::Value::Null);
-            collect_groups.entry(key.clone()).or_default().push(json_val);
+            collect_groups
+                .entry(key.clone())
+                .or_default()
+                .push(json_val);
             groups.entry(key).or_default();
         } else {
             let numeric = v
@@ -195,9 +198,7 @@ pub(crate) fn run_aggregation(
         .map(|(key, mut values)| {
             let count = counts.get(&key).copied().unwrap_or(0);
             let (value, collected) = if is_collect {
-                let arr = collect_groups
-                    .remove(&key)
-                    .map(serde_json::Value::Array);
+                let arr = collect_groups.remove(&key).map(serde_json::Value::Array);
                 (0.0, arr)
             } else {
                 let v = match &agg {
