@@ -13,7 +13,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   test:
@@ -22,12 +21,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: bindb
+
+      - uses: actions/checkout@v4
+        with:
+          repository: dpkimball/dpk-build
+          path: dpk-build
 
       - name: cargo fmt
         run: cargo fmt -- --check
+        working-directory: bindb
 
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: cargo test
-        run: cargo test
+      - name: make b
+        run: CI=true make b
+        working-directory: bindb
+        env:
+          BUILD_ROOT: ${{ github.workspace }}/dpk-build
