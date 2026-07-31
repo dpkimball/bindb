@@ -1,0 +1,6 @@
+[project]
+name = "bindb"
+language = "rust"
+
+[skip]
+deploy = true

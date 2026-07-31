@@ -5284,3 +5284,315 @@ fn window_first_last_with_partition_by() {
     }
     store.close().unwrap();
 }
+
+// ── Arithmetic computed columns ─────────────────────────────────────────────
+
+#[test]
+fn sql_project_arith_add_two_fields() {
+    // SELECT PAYLOAD_FIELD('a') + PAYLOAD_FIELD('b') AS total FROM ...
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://arith:x"), br#"{"a":3,"b":4}"#.to_vec());
+    tx.put_object(oid("obs://arith:y"), br#"{"a":10,"b":5}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('a') + PAYLOAD_FIELD('b') AS total FROM 'obs://arith'")
+        .unwrap();
+    let eps = 1e-9;
+    let mut totals: Vec<f64> = rows
+        .iter()
+        .filter_map(|r| r.get("total").and_then(|v| v.as_f64()))
+        .collect();
+    totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!((totals[0] - 7.0).abs() < eps);
+    assert!((totals[1] - 15.0).abs() < eps);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_arith_multiply_field_literal() {
+    // SELECT PAYLOAD_FIELD('price') * 2 AS doubled FROM ...
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://mul:a"), br#"{"price":5}"#.to_vec());
+    tx.put_object(oid("obs://mul:b"), br#"{"price":8}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('price') * 2 AS doubled FROM 'obs://mul'")
+        .unwrap();
+    let eps = 1e-9;
+    let mut vals: Vec<f64> = rows
+        .iter()
+        .filter_map(|r| r.get("doubled").and_then(|v| v.as_f64()))
+        .collect();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!((vals[0] - 10.0).abs() < eps);
+    assert!((vals[1] - 16.0).abs() < eps);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_arith_division_by_zero_null() {
+    // Division by literal zero yields null (not a row).
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://divz:a"), br#"{"v":10}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('v') / 0 AS q FROM 'obs://divz'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // null means the key is absent from the row.
+    assert!(!rows[0].contains_key("q"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_arith_subtract() {
+    // SELECT PAYLOAD_FIELD('a') - PAYLOAD_FIELD('b') AS diff FROM ...
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://sub:a"), br#"{"a":10,"b":3}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('a') - PAYLOAD_FIELD('b') AS diff FROM 'obs://sub'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let diff = rows[0].get("diff").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    assert!((diff - 7.0).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+// ── String concat (||) computed columns ────────────────────────────────────
+
+#[test]
+fn sql_project_concat_field_literal_field() {
+    // SELECT PAYLOAD_FIELD('first') || ' ' || PAYLOAD_FIELD('last') AS full_name FROM ...
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://cat:a"),
+        br#"{"first":"Alice","last":"Smith"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://cat:b"),
+        br#"{"first":"Bob","last":"Jones"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let mut rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('first') || ' ' || PAYLOAD_FIELD('last') AS full_name \
+             FROM 'obs://cat'",
+        )
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("full_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].get("full_name").and_then(|v| v.as_str()),
+        Some("Alice Smith")
+    );
+    assert_eq!(
+        rows[1].get("full_name").and_then(|v| v.as_str()),
+        Some("Bob Jones")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_concat_two_fields() {
+    // PAYLOAD_FIELD('ns') || ':' || PAYLOAD_FIELD('key') AS id_like
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://cat2:a"), br#"{"ns":"user","key":"42"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('ns') || ':' || PAYLOAD_FIELD('key') AS combined \
+             FROM 'obs://cat2'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("combined").and_then(|v| v.as_str()),
+        Some("user:42")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_concat_missing_field_empty() {
+    // Missing field in concat produces empty string for that part.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://catm:a"), br#"{"first":"Alice"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('first') || ' ' || PAYLOAD_FIELD('last') AS name \
+             FROM 'obs://catm'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("Alice "));
+    store.close().unwrap();
+}
+
+// ── Searched CASE WHEN in SELECT ────────────────────────────────────────────
+
+#[test]
+fn sql_project_searched_case_when_basic() {
+    // CASE WHEN PAYLOAD_FIELD('score') > 5 THEN 'hi' ELSE 'lo' END AS tier
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://scw:a"),
+        br#"{"score":8,"name":"alice"}"#.to_vec(),
+    );
+    tx.put_object(oid("obs://scw:b"), br#"{"score":3,"name":"bob"}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let mut rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name'), \
+             CASE WHEN PAYLOAD_FIELD('score') > 5 THEN 'hi' ELSE 'lo' END AS tier \
+             FROM 'obs://scw'",
+        )
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("tier").and_then(|v| v.as_str()), Some("hi"));
+    assert_eq!(rows[1].get("tier").and_then(|v| v.as_str()), Some("lo"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_searched_case_when_multi_branch() {
+    // CASE WHEN … > 7 THEN 'a' WHEN … > 4 THEN 'b' ELSE 'c' END AS band
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for (k, v) in [("x", 9), ("y", 6), ("z", 2)] {
+        tx.put_object(
+            oid(&format!("obs://scwm:{k}")),
+            format!(r#"{{"v":{v}}}"#).into_bytes(),
+        );
+    }
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('v'), \
+             CASE WHEN PAYLOAD_FIELD('v') > 7 THEN 'a' \
+                  WHEN PAYLOAD_FIELD('v') > 4 THEN 'b' \
+                  ELSE 'c' END AS band \
+             FROM 'obs://scwm'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let mut band_map: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for r in &rows {
+        let v = r.get("v").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let band = r
+            .get("band")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        band_map.insert(v, band);
+    }
+    assert_eq!(band_map.get(&9).map(|s| s.as_str()), Some("a"));
+    assert_eq!(band_map.get(&6).map(|s| s.as_str()), Some("b"));
+    assert_eq!(band_map.get(&2).map(|s| s.as_str()), Some("c"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_searched_case_when_string_condition() {
+    // CASE WHEN PAYLOAD_FIELD('role') = 'admin' THEN 'elevated' ELSE 'normal' END AS access
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://scws:a"),
+        br#"{"role":"admin","name":"alice"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://scws:b"),
+        br#"{"role":"user","name":"bob"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let mut rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('name'), \
+             CASE WHEN PAYLOAD_FIELD('role') = 'admin' THEN 'elevated' ELSE 'normal' END AS access \
+             FROM 'obs://scws'",
+        )
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].get("access").and_then(|v| v.as_str()),
+        Some("elevated")
+    );
+    assert_eq!(
+        rows[1].get("access").and_then(|v| v.as_str()),
+        Some("normal")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_searched_case_when_no_match_else_empty() {
+    // No ELSE clause → unmatched rows get empty string.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://scwne:a"), br#"{"v":2}"#.to_vec());
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .sql_project(
+            "SELECT CASE WHEN PAYLOAD_FIELD('v') > 5 THEN 'big' END AS label \
+             FROM 'obs://scwne'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // empty string is falsy but present when not null
+    let label = rows[0]
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("__absent__");
+    // empty string means label key absent (null pruned) or present as ""
+    assert!(label.is_empty() || label == "__absent__");
+    store.close().unwrap();
+}

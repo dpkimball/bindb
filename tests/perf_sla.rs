@@ -13,7 +13,10 @@
 ///   1. Add the target to docs/sla.md.
 ///   2. Write the test here with a matching threshold constant.
 ///   3. Use `#[ignore = "perf: ..."]` so it is excluded from the default test run.
-use bindb::{BinderStore, EdgeId, ObjectId, Transaction, VectorEntry, VectorFilter, VectorIndex};
+use bindb::{
+    BinderStore, EdgeId, GraphIrQuery, ObjectId, Transaction, VectorEntry, VectorFilter,
+    VectorIndex,
+};
 use std::collections::HashSet;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -41,6 +44,18 @@ const COMMIT_BUFFERED_50K_THROUGHPUT_MIN: u64 = 5_000; // commits/sec — 50 K b
 /// 500 K single-field observation import must complete in ≤ 90 s (OKR O2/KR2.3).
 /// Apple Health import scenario: one object per data point, 64-byte payload.
 const HEALTH_IMPORT_500K_S_MAX: f64 = 90.0;
+
+// ── graph_ir extended-RETURN threshold constants (1 K nodes, hub-and-spoke) ──
+const GRAPH_IR_ZERO_HOP_P99_MS_MAX: u64 = 10; // ms — zero-hop [*0..1] identity match
+const GRAPH_IR_ARITH_RETURN_P99_MS_MAX: u64 = 10; // ms — arithmetic b.x + b.y in RETURN
+const GRAPH_IR_TYPE_R_P99_MS_MAX: u64 = 10; // ms — RETURN type(r) at 1 K nodes depth 1
+const GRAPH_IR_DEPTH_P99_MS_MAX: u64 = 10; // ms — RETURN depth at 1 K nodes depth 1
+const GRAPH_IR_FIELD_INDEX_P99_MS_MAX: u64 = 10; // ms — RETURN b.field[n] at 1 K nodes depth 1
+
+// ── sql_project computed-column threshold constants (1 K JSON-payload rows) ──
+const SQL_PROJECT_ARITH_1K_P99_MS_MAX: u64 = 100; // ms — arithmetic (+,-,*,/) computed column
+const SQL_PROJECT_CONCAT_1K_P99_MS_MAX: u64 = 100; // ms — string-concat (||) computed column
+const SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX: u64 = 100; // ms — searched CASE WHEN column
 
 // ── sql_project CASE WHEN / NTH_VALUE threshold constants (1 K rows) ─────────
 const SQL_PROJECT_CASE_WHEN_1K_P99_MS_MAX: u64 = 100; // ms — simple CASE WHEN expression
@@ -1020,5 +1035,287 @@ fn sla_sql_project_nth_value_p99_lte_100ms_at_1k_rows() {
         "sql_project NTH_VALUE p99 {} ms > SLA maximum {} ms at 1 K rows",
         p99,
         SQL_PROJECT_NTH_VALUE_1K_P99_MS_MAX,
+    );
+}
+
+// ── graph_ir zero-hop / arithmetic / concat / CASE WHEN SLAs (issue #2) ─────
+
+fn build_graph_hub_1k(dir: &TempDir, spokes: usize) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        ObjectId::new("g://hub"),
+        br#"{"x":0,"y":0,"name":"hub","role":"root"}"#.to_vec(),
+    );
+    for i in 0..spokes {
+        let payload = format!(
+            r#"{{"x":{},"y":{},"name":"n{}","role":"leaf","first":"fn{}","last":"ln{}","tags":["alpha","beta","gamma"]}}"#,
+            i,
+            i + 1,
+            i,
+            i,
+            i
+        );
+        tx.put_object(
+            ObjectId::new(format!("g://n:{:04}", i)),
+            payload.into_bytes(),
+        );
+    }
+    store.commit_buffered(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for i in 0..spokes {
+        let label = if i % 2 == 0 { "KNOWS" } else { "FOLLOWS" };
+        tx2.put_edge(
+            EdgeId::new(format!("g://e:{:04}", i)),
+            ObjectId::new("g://hub"),
+            ObjectId::new(format!("g://n:{:04}", i)),
+            label,
+            None,
+        );
+    }
+    store.commit_buffered(tx2, "test", "").unwrap();
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_zero_hop_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_hub_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*0..1]->(b) WHERE id(a) = 'g://hub' \
+         AND id(b) = 'g://hub' RETURN b.name",
+    )
+    .unwrap();
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_ZERO_HOP_P99_MS_MAX,
+        "graph_ir zero-hop p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_ZERO_HOP_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_arith_return_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_hub_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'g://hub' \
+         RETURN b.x + b.y AS sum",
+    )
+    .unwrap();
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_ARITH_RETURN_P99_MS_MAX,
+        "graph_ir arithmetic RETURN p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_ARITH_RETURN_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_return_type_r_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_hub_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'g://hub' \
+         RETURN b.name, type(r)",
+    )
+    .unwrap();
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_TYPE_R_P99_MS_MAX,
+        "graph_ir RETURN type(r) p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_TYPE_R_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_return_depth_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_hub_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'g://hub' \
+         RETURN b.name, depth",
+    )
+    .unwrap();
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_DEPTH_P99_MS_MAX,
+        "graph_ir RETURN depth p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_DEPTH_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_return_field_index_p99_lte_10ms_at_1k_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_graph_hub_1k(&dir, 1_000);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:KNOWS|FOLLOWS*1..1]->(b) WHERE id(a) = 'g://hub' \
+         RETURN b.tags[0]",
+    )
+    .unwrap();
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_FIELD_INDEX_P99_MS_MAX,
+        "graph_ir RETURN b.field[n] p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_FIELD_INDEX_P99_MS_MAX,
+    );
+}
+
+// ── sql_project computed-column SLAs (issue #5) ──────────────────────────────
+
+fn build_arith_store_1k(dir: &TempDir) -> BinderStore {
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    for i in 0..1_000usize {
+        let payload = format!(
+            r#"{{"a":{},"b":{},"score":{},"first":"fn{}","last":"ln{}"}}"#,
+            i,
+            i + 1,
+            i % 10,
+            i,
+            i
+        );
+        tx.put_object(
+            ObjectId::new(format!("obs://sla_arith:{:04}", i)),
+            payload.into_bytes(),
+        );
+    }
+    store.commit_buffered(tx, "test", "").unwrap();
+    store.flush().unwrap();
+    store
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_arith_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT PAYLOAD_FIELD('a') + PAYLOAD_FIELD('b') AS total \
+                 FROM 'obs://sla_arith'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_ARITH_1K_P99_MS_MAX,
+        "sql_project arith p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_ARITH_1K_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_concat_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT PAYLOAD_FIELD('first') || ' ' || PAYLOAD_FIELD('last') AS full_name \
+                 FROM 'obs://sla_arith'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_CONCAT_1K_P99_MS_MAX,
+        "sql_project concat p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_CONCAT_1K_P99_MS_MAX,
+    );
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_project_searched_case_when_p99_lte_100ms_at_1k_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    let iterations = 200usize;
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let rows = store
+            .sql_project(
+                "SELECT CASE WHEN PAYLOAD_FIELD('score') > 5 THEN 'hi' \
+                           WHEN PAYLOAD_FIELD('score') > 2 THEN 'mid' \
+                           ELSE 'lo' END AS tier \
+                 FROM 'obs://sla_arith'",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX,
+        "sql_project searched CASE WHEN p99 {} ms > SLA maximum {} ms at 1 K rows",
+        p99,
+        SQL_PROJECT_SEARCHED_CASE_1K_P99_MS_MAX,
     );
 }

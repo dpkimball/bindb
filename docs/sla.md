@@ -132,6 +132,36 @@ CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner a
 
 ---
 
+## graph_ir extended-RETURN SLAs (issue #2)
+
+These SLAs cover the new graph_ir RETURN capabilities: zero-hop matches, arithmetic
+expressions, string concatenation, edge label projection (`type(r)`), traversal depth,
+and JSON array element indexing (`b.field[n]`).  Scale is 1 K nodes, hub-and-spoke
+topology, depth-1 traversal.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| Zero-hop match (`[*0..1]` start-node predicate) | 1 K nodes | ≤ 10 ms |
+| Arithmetic RETURN (`b.x + b.y AS sum`) | 1 K nodes, depth 1 | ≤ 10 ms |
+| `RETURN type(r)` — edge label projection | 1 K nodes, depth 1 | ≤ 10 ms |
+| `RETURN depth` — traversal depth | 1 K nodes, depth 1 | ≤ 10 ms |
+| `RETURN b.field[n]` — JSON array element | 1 K nodes, depth 1 | ≤ 10 ms |
+
+---
+
+## sql_project computed-column SLAs (issue #5)
+
+These SLAs apply when the SELECT list includes arithmetic, string concat, or searched
+CASE WHEN computed columns.  Scale is 1 K JSON-payload objects.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| Arithmetic (`+`, `-`, `*`, `/`) | 1 K rows | ≤ 100 ms |
+| String concat (`\|\|`) | 1 K rows | ≤ 100 ms |
+| Searched CASE WHEN | 1 K rows | ≤ 100 ms |
+
+---
+
 ## sql_project CASE WHEN / NTH_VALUE SLAs (issue #5)
 
 These SLAs apply when the SELECT list contains a CASE WHEN expression or an NTH_VALUE

@@ -442,6 +442,13 @@ fn apply_return_transform(val: serde_json::Value, t: &ReturnTransform) -> serde_
             }
             serde_json::Value::String(else_val.clone())
         }
+        ReturnTransform::Index(n) => {
+            if let serde_json::Value::Array(arr) = val {
+                arr.into_iter().nth(*n).unwrap_or(serde_json::Value::Null)
+            } else {
+                val
+            }
+        }
     }
 }
 
@@ -758,6 +765,94 @@ fn apply_order_limit_matches(matches: &mut Vec<GraphQueryMatch>, q: &GraphIrQuer
     }
 }
 
+// ── Computed RETURN helpers ───────────────────────────────────────────────────
+
+/// Get a numeric (f64) value from a JSON payload by field name.
+fn get_f64_from_json(payload: Option<&[u8]>, field: &str) -> Option<f64> {
+    let bytes = payload?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.get(field)?.as_f64()
+}
+
+/// Get a string value from a JSON payload by field name.
+fn get_str_from_json(payload: Option<&[u8]>, field: &str) -> Option<String> {
+    let bytes = payload?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.get(field)?.as_str().map(|s| s.to_string())
+}
+
+/// Compute `l OP r`; returns `None` for division / modulo by zero.
+fn compute_num_bin_op(op: &NumBinOp, l: f64, r: f64) -> Option<f64> {
+    match op {
+        NumBinOp::Add => Some(l + r),
+        NumBinOp::Sub => Some(l - r),
+        NumBinOp::Mul => Some(l * r),
+        NumBinOp::Div => {
+            if r == 0.0 {
+                None
+            } else {
+                Some(l / r)
+            }
+        }
+        NumBinOp::Rem => {
+            if r == 0.0 {
+                None
+            } else {
+                Some(l % r)
+            }
+        }
+    }
+}
+
+/// Project a single `ComputedReturnField` against a node's payload.
+fn project_computed_field(payload: Option<&[u8]>, cf: &ComputedReturnField) -> serde_json::Value {
+    match &cf.expr {
+        ReturnComputedExpr::NumBin(expr) => {
+            let lhs_val = match &expr.lhs {
+                NumArg::Field(f) => get_f64_from_json(payload, f),
+                NumArg::Literal(v) => Some(*v),
+            };
+            let rhs_val = match &expr.rhs {
+                NumArg::Field(f) => get_f64_from_json(payload, f),
+                NumArg::Literal(v) => Some(*v),
+            };
+            match (lhs_val, rhs_val) {
+                (Some(l), Some(r)) => compute_num_bin_op(&expr.op, l, r)
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            }
+        }
+        ReturnComputedExpr::StrConcat(expr) => {
+            let mut result = String::new();
+            for part in &expr.parts {
+                match part {
+                    StrPart::Field(f) => {
+                        // Missing field contributes empty string
+                        if let Some(s) = get_str_from_json(payload, f) {
+                            result.push_str(&s);
+                        }
+                    }
+                    StrPart::Literal(lit) => result.push_str(lit),
+                }
+            }
+            serde_json::Value::String(result)
+        }
+        ReturnComputedExpr::SearchedCase { branches, else_val } => {
+            for branch in branches {
+                let payload_bytes = payload.unwrap_or(&[]);
+                if apply_payload_pred(payload_bytes, &branch.pred) {
+                    return serde_json::Value::String(branch.output.clone());
+                }
+            }
+            serde_json::Value::String(else_val.clone())
+        }
+    }
+}
+
 impl BinderStore {
     /// Execute a restricted MATCH / WHERE / RETURN graph IR string (issue #2).
     pub fn graph_ir(&self, query: &str) -> Result<Vec<GraphQueryMatch>, StoreError> {
@@ -886,6 +981,49 @@ impl BinderStore {
             (ms, HashMap::new(), HashMap::new())
         };
 
+        // Zero-hop: prepend a synthetic depth-0 match for the start node itself when
+        // min_depth == 0. The start node must exist in the store and pass end_pred and
+        // payload_preds. We look it up via a simple object fetch.
+        if q.min_depth == 0 {
+            // Try to fetch the start node's object from the store.
+            if let Ok(Some(start_obj)) = self.get(&q.start) {
+                // Check end_pred
+                let end_pred_ok = match &q.end_pred {
+                    NodeIdPred::Any => true,
+                    NodeIdPred::StartsWith(pfx) => q.start.0.starts_with(pfx.as_str()),
+                    NodeIdPred::EndsWith(sfx) => q.start.0.ends_with(sfx.as_str()),
+                    NodeIdPred::Contains(sub) => q.start.0.contains(sub.as_str()),
+                    NodeIdPred::Equals(id) => q.start.0 == *id,
+                    NodeIdPred::InList(ids) => ids.contains(&q.start.0),
+                    NodeIdPred::NotInList(ids) => ids.iter().all(|id| *id != q.start.0),
+                };
+                // Check payload_preds
+                let payload_ok = if q.payload_preds.is_empty() {
+                    true
+                } else {
+                    let payload = start_obj.payload.as_deref().unwrap_or(&[]);
+                    match q.pred_combinator {
+                        PayloadPredCombinator::And => q
+                            .payload_preds
+                            .iter()
+                            .all(|pred| apply_payload_pred(payload, pred)),
+                        PayloadPredCombinator::Or => q
+                            .payload_preds
+                            .iter()
+                            .any(|pred| apply_payload_pred(payload, pred)),
+                    }
+                };
+                if end_pred_ok && payload_ok {
+                    let synthetic = GraphQueryMatch {
+                        object: start_obj,
+                        depth: 0,
+                        via_edge: None,
+                    };
+                    matches.insert(0, synthetic);
+                }
+            }
+        }
+
         // Pre-expansion ordering: WITH clause controls mandatory results.
         // When no WITH clause, q.order_by/limit/skip apply pre-expansion (backward compat).
         if let Some(wc) = &q.with_clause {
@@ -898,10 +1036,11 @@ impl BinderStore {
         let mut rows: Vec<GraphIrRow> = Vec::with_capacity(matches.len());
 
         for m in matches {
+            let payload = m.object.payload.as_deref();
             let mut b_fields = HashMap::new();
             if q.return_all_fields {
-                if let Some(payload) = m.object.payload.as_deref() {
-                    if let Ok(text) = std::str::from_utf8(payload) {
+                if let Some(payload_bytes) = payload {
+                    if let Ok(text) = std::str::from_utf8(payload_bytes) {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
                             if let Some(obj) = v.as_object() {
                                 for (key, val) in obj {
@@ -912,8 +1051,8 @@ impl BinderStore {
                     }
                 }
             } else if !q.return_fields.is_empty() {
-                if let Some(payload) = m.object.payload.as_deref() {
-                    if let Ok(text) = std::str::from_utf8(payload) {
+                if let Some(payload_bytes) = payload {
+                    if let Ok(text) = std::str::from_utf8(payload_bytes) {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
                             for key in &q.return_fields {
                                 let raw_val =
@@ -946,6 +1085,18 @@ impl BinderStore {
                     serde_json::Value::String(m.object.object_id.0.clone()),
                 );
             }
+            if q.return_depth {
+                b_fields.insert(
+                    "depth".to_string(),
+                    serde_json::Value::Number(m.depth.into()),
+                );
+            }
+
+            // Project computed RETURN fields (arithmetic, concat, searched CASE WHEN).
+            for cf in &q.return_computed {
+                let val = project_computed_field(payload, cf);
+                b_fields.insert(cf.alias.clone(), val);
+            }
 
             let mut r_fields = HashMap::new();
             if !q.edge_return_fields.is_empty() {
@@ -963,6 +1114,15 @@ impl BinderStore {
                         .unwrap_or(serde_json::Value::Null);
                     r_fields.insert(key.clone(), val);
                 }
+            }
+            if q.return_edge_type {
+                let label = m
+                    .via_edge
+                    .as_ref()
+                    .and_then(|e| e.relationship_type.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                r_fields.insert("type(r)".to_string(), serde_json::Value::String(label));
             }
 
             let (path, edge_path) = if q.return_path {

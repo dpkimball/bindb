@@ -1471,6 +1471,65 @@ pub struct SqlWindowColumn {
     pub alias: String,
 }
 
+/// Operand for an arithmetic computed column in SELECT.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlNumArg {
+    Field(String),
+    Literal(f64),
+}
+
+/// Binary arithmetic operator for a computed SELECT column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlNumBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+/// One part of a string-concatenation computed column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlStrPart {
+    /// Value comes from a JSON payload field.
+    Field(String),
+    /// A string literal.
+    Lit(String),
+}
+
+/// One `WHEN … THEN …` branch of a searched CASE WHEN expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlSearchedCaseBranch {
+    pub filter: SqlPayloadFilter,
+    pub output: String,
+}
+
+/// A computed SELECT column whose value is derived from an expression.
+///
+/// Computed columns are evaluated after regular `PAYLOAD_FIELD` projections and written
+/// into the row under the `alias` key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlComputedColumn {
+    /// `PAYLOAD_FIELD('a') + PAYLOAD_FIELD('b') AS total` — binary arithmetic on two operands.
+    NumBin {
+        op: SqlNumBinOp,
+        left: SqlNumArg,
+        right: SqlNumArg,
+        alias: String,
+    },
+    /// `PAYLOAD_FIELD('f1') || 'sep' || PAYLOAD_FIELD('f2') AS name` — string concat chain.
+    StrConcat {
+        parts: Vec<SqlStrPart>,
+        alias: String,
+    },
+    /// `CASE WHEN PAYLOAD_FIELD('f') > 5 THEN 'hi' ELSE 'lo' END AS tier` — searched CASE WHEN.
+    SearchedCase {
+        branches: Vec<SqlSearchedCaseBranch>,
+        else_val: String,
+        alias: String,
+    },
+}
+
 /// A parsed `SELECT PAYLOAD_FIELD(…) [, …] FROM … [WHERE …] [ORDER BY …] [LIMIT n]` query.
 ///
 /// Returns one row per matching observation; each row holds the projected field
@@ -1511,6 +1570,8 @@ pub struct SqlProjectQuery {
     /// Window function columns (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` OVER clauses).
     /// Computed against the full filtered result set before OFFSET/LIMIT.
     pub window_columns: Vec<SqlWindowColumn>,
+    /// Arithmetic, string-concat, and searched-CASE-WHEN columns computed after regular projection.
+    pub computed_cols: Vec<SqlComputedColumn>,
 }
 
 impl SqlProjectQuery {
@@ -1541,6 +1602,7 @@ impl SqlProjectQuery {
             std::collections::HashMap::new();
         let mut return_id = false;
         let mut window_columns: Vec<SqlWindowColumn> = Vec::new();
+        let mut computed_cols: Vec<SqlComputedColumn> = Vec::new();
         loop {
             s = s.trim_start();
             if starts_with_keyword(s, "FROM") {
@@ -2354,6 +2416,222 @@ impl SqlProjectQuery {
                 }
                 continue;
             }
+            // ── Computed columns ─────────────────────────────────────────────
+            let su = s.to_ascii_uppercase();
+
+            // Searched CASE WHEN PAYLOAD_FIELD('f') OP value THEN 'out' … END AS alias
+            if su.starts_with("CASE WHEN PAYLOAD_FIELD(") {
+                let mut case_rest = skip_keyword(s, "CASE").trim_start();
+                let mut branches: Vec<SqlSearchedCaseBranch> = Vec::new();
+                let mut else_val = String::new();
+                loop {
+                    case_rest = case_rest.trim_start();
+                    let cu = case_rest.to_ascii_uppercase();
+                    if starts_with_keyword(case_rest, "WHEN") {
+                        case_rest = skip_keyword(case_rest, "WHEN").trim_start();
+                        let (filter, after_filter) = parse_payload_filter(case_rest)?;
+                        case_rest = after_filter.trim_start();
+                        if !starts_with_keyword(case_rest, "THEN") {
+                            return Err(SqlAggError::Unsupported(
+                                "expected THEN after WHEN condition in CASE WHEN".into(),
+                            ));
+                        }
+                        case_rest = skip_keyword(case_rest, "THEN").trim_start();
+                        let (output, after_out) = parse_quoted_sql(case_rest)?;
+                        case_rest = after_out.trim_start();
+                        branches.push(SqlSearchedCaseBranch { filter, output });
+                    } else if starts_with_keyword(case_rest, "ELSE") {
+                        case_rest = skip_keyword(case_rest, "ELSE").trim_start();
+                        let (ev, after_ev) = parse_quoted_sql(case_rest)?;
+                        else_val = ev;
+                        case_rest = after_ev.trim_start();
+                    } else if cu.starts_with("END") {
+                        case_rest = case_rest[3..].trim_start();
+                        break;
+                    } else {
+                        return Err(SqlAggError::Unsupported(
+                            "expected WHEN, ELSE, or END in CASE WHEN".into(),
+                        ));
+                    }
+                }
+                if branches.is_empty() {
+                    return Err(SqlAggError::Unsupported(
+                        "CASE WHEN requires at least one WHEN branch".into(),
+                    ));
+                }
+                if !starts_with_keyword(case_rest, "AS") {
+                    return Err(SqlAggError::Unsupported(
+                        "CASE WHEN expression requires AS alias".into(),
+                    ));
+                }
+                let after_as = skip_keyword(case_rest, "AS").trim_start();
+                let alias_end = after_as
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(after_as.len());
+                if alias_end == 0 {
+                    return Err(SqlAggError::Unsupported(
+                        "empty alias after CASE WHEN … AS".into(),
+                    ));
+                }
+                let alias = after_as[..alias_end].to_string();
+                s = after_as[alias_end..].trim_start();
+                computed_cols.push(SqlComputedColumn::SearchedCase {
+                    branches,
+                    else_val,
+                    alias,
+                });
+                if s.starts_with(',') {
+                    s = &s[1..];
+                }
+                continue;
+            }
+
+            // PAYLOAD_FIELD('f') op … AS alias — arithmetic (+,-,*,/,%) or concat (||)
+            if su.starts_with("PAYLOAD_FIELD(") {
+                let after_pf0 = &s["PAYLOAD_FIELD(".len()..];
+                if let Ok((first_field, after_close0)) = parse_quoted_sql(after_pf0) {
+                    if let Some(after_rparen0) = after_close0.trim_start().strip_prefix(')') {
+                        let peek = after_rparen0.trim_start();
+
+                        // String concat: PAYLOAD_FIELD('f') || ...
+                        if peek.starts_with("||") {
+                            let mut parts = vec![SqlStrPart::Field(first_field)];
+                            let mut cur = peek.strip_prefix("||").unwrap_or_default().trim_start();
+                            loop {
+                                let cu = cur.to_ascii_uppercase();
+                                if cu.starts_with("PAYLOAD_FIELD(") {
+                                    let inner = &cur["PAYLOAD_FIELD(".len()..];
+                                    let (f, rest2) = parse_quoted_sql(inner)?;
+                                    let rest2 =
+                                        rest2.trim_start().strip_prefix(')').ok_or_else(|| {
+                                            SqlAggError::Unsupported(
+                                                "expected ')' after PAYLOAD_FIELD in ||".into(),
+                                            )
+                                        })?;
+                                    parts.push(SqlStrPart::Field(f));
+                                    cur = rest2.trim_start();
+                                } else if cur.starts_with('\'') {
+                                    let end = cur[1..].find('\'').ok_or_else(|| {
+                                        SqlAggError::Unsupported(
+                                            "unclosed string literal in || concat".into(),
+                                        )
+                                    })?;
+                                    let lit = cur[1..1 + end].to_string();
+                                    parts.push(SqlStrPart::Lit(lit));
+                                    cur = cur[1 + end + 1..].trim_start();
+                                } else {
+                                    break;
+                                }
+                                if cur.starts_with("||") {
+                                    cur = cur[2..].trim_start();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !starts_with_keyword(cur, "AS") {
+                                return Err(SqlAggError::Unsupported(
+                                    "|| string concat requires AS alias".into(),
+                                ));
+                            }
+                            let after_as = skip_keyword(cur, "AS").trim_start();
+                            let alias_end = after_as
+                                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .unwrap_or(after_as.len());
+                            if alias_end == 0 {
+                                return Err(SqlAggError::Unsupported(
+                                    "empty alias after || concat AS".into(),
+                                ));
+                            }
+                            let alias = after_as[..alias_end].to_string();
+                            s = after_as[alias_end..].trim_start();
+                            computed_cols.push(SqlComputedColumn::StrConcat { parts, alias });
+                            if s.starts_with(',') {
+                                s = &s[1..];
+                            }
+                            continue;
+                        }
+
+                        // Arithmetic: PAYLOAD_FIELD('f') +/-/*//%  rhs AS alias
+                        let op_opt: Option<(SqlNumBinOp, usize)> =
+                            if peek.starts_with('+') && !peek.starts_with("||") {
+                                Some((SqlNumBinOp::Add, 1))
+                            } else if peek.starts_with('-') {
+                                Some((SqlNumBinOp::Sub, 1))
+                            } else if peek.starts_with('*') {
+                                Some((SqlNumBinOp::Mul, 1))
+                            } else if peek.starts_with('/') {
+                                Some((SqlNumBinOp::Div, 1))
+                            } else if peek.starts_with('%') {
+                                Some((SqlNumBinOp::Rem, 1))
+                            } else {
+                                None
+                            };
+
+                        if let Some((op, op_len)) = op_opt {
+                            let left = SqlNumArg::Field(first_field);
+                            let after_op = peek[op_len..].trim_start();
+                            let aou = after_op.to_ascii_uppercase();
+                            let (right, after_right): (SqlNumArg, &str) = if aou
+                                .starts_with("PAYLOAD_FIELD(")
+                            {
+                                let inner = &after_op["PAYLOAD_FIELD(".len()..];
+                                let (f, rest2) = parse_quoted_sql(inner)?;
+                                let rest2 =
+                                    rest2.trim_start().strip_prefix(')').ok_or_else(|| {
+                                        SqlAggError::Unsupported(
+                                            "expected ')' after PAYLOAD_FIELD in arithmetic".into(),
+                                        )
+                                    })?;
+                                (SqlNumArg::Field(f), rest2.trim_start())
+                            } else {
+                                let lit_end = after_op
+                                    .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+                                    .unwrap_or(after_op.len());
+                                if lit_end == 0 {
+                                    return Err(SqlAggError::Unsupported(
+                                        "expected PAYLOAD_FIELD or number literal in arithmetic"
+                                            .into(),
+                                    ));
+                                }
+                                let n: f64 = after_op[..lit_end].parse().map_err(|_| {
+                                    SqlAggError::Unsupported(
+                                        "invalid number in arithmetic expression".into(),
+                                    )
+                                })?;
+                                (SqlNumArg::Literal(n), after_op[lit_end..].trim_start())
+                            };
+                            if !starts_with_keyword(after_right, "AS") {
+                                return Err(SqlAggError::Unsupported(
+                                    "arithmetic expression requires AS alias".into(),
+                                ));
+                            }
+                            let after_as = skip_keyword(after_right, "AS").trim_start();
+                            let alias_end = after_as
+                                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .unwrap_or(after_as.len());
+                            if alias_end == 0 {
+                                return Err(SqlAggError::Unsupported(
+                                    "empty alias after arithmetic AS".into(),
+                                ));
+                            }
+                            let alias = after_as[..alias_end].to_string();
+                            s = after_as[alias_end..].trim_start();
+                            computed_cols.push(SqlComputedColumn::NumBin {
+                                op,
+                                left,
+                                right,
+                                alias,
+                            });
+                            if s.starts_with(',') {
+                                s = &s[1..];
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Fall through to regular PAYLOAD_FIELD handling below.
+            }
+
             // Detect UPPER/LOWER/TRIM/ABS/ROUND/CEIL/FLOOR/LENGTH(PAYLOAD_FIELD('f')) wrappers
             let su = s.to_ascii_uppercase();
             let transform_prefixes: &[(&str, SqlFieldTransform)] = &[
@@ -2435,7 +2713,8 @@ impl SqlProjectQuery {
             }
         }
 
-        if fields.is_empty() && !return_id {
+        if fields.is_empty() && !return_id && window_columns.is_empty() && computed_cols.is_empty()
+        {
             return Err(SqlAggError::Unsupported(
                 "SELECT list must have at least one id or PAYLOAD_FIELD expression".into(),
             ));
@@ -2584,6 +2863,7 @@ impl SqlProjectQuery {
             offset,
             limit,
             window_columns,
+            computed_cols,
         })
     }
 }
@@ -3477,6 +3757,108 @@ impl BinderStore {
                 }
                 for wf in &window_extra_fields {
                     row.insert(wf.clone(), project_payload_field(v.payload.as_deref(), wf));
+                }
+                // Computed columns: arithmetic, string concat, searched CASE WHEN.
+                for cc in &q.computed_cols {
+                    let val = match cc {
+                        SqlComputedColumn::NumBin {
+                            op,
+                            left,
+                            right,
+                            alias: _,
+                        } => {
+                            let lv = match left {
+                                SqlNumArg::Field(f) => {
+                                    project_payload_field(v.payload.as_deref(), f)
+                                }
+                                SqlNumArg::Literal(n) => serde_json::Number::from_f64(*n)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null),
+                            };
+                            let rv = match right {
+                                SqlNumArg::Field(f) => {
+                                    project_payload_field(v.payload.as_deref(), f)
+                                }
+                                SqlNumArg::Literal(n) => serde_json::Number::from_f64(*n)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null),
+                            };
+                            if let (Some(l), Some(r)) = (
+                                lv.as_f64().or_else(|| lv.as_i64().map(|i| i as f64)),
+                                rv.as_f64().or_else(|| rv.as_i64().map(|i| i as f64)),
+                            ) {
+                                let result = match op {
+                                    SqlNumBinOp::Add => l + r,
+                                    SqlNumBinOp::Sub => l - r,
+                                    SqlNumBinOp::Mul => l * r,
+                                    SqlNumBinOp::Div => {
+                                        if r == 0.0 {
+                                            f64::NAN
+                                        } else {
+                                            l / r
+                                        }
+                                    }
+                                    SqlNumBinOp::Rem => {
+                                        if r == 0.0 {
+                                            f64::NAN
+                                        } else {
+                                            l % r
+                                        }
+                                    }
+                                };
+                                serde_json::Number::from_f64(result)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null)
+                            } else {
+                                serde_json::Value::Null
+                            }
+                        }
+                        SqlComputedColumn::StrConcat { parts, alias: _ } => {
+                            let mut out = String::new();
+                            for part in parts {
+                                match part {
+                                    SqlStrPart::Field(f) => {
+                                        let fv = project_payload_field(v.payload.as_deref(), f);
+                                        match &fv {
+                                            serde_json::Value::String(s) => out.push_str(s),
+                                            serde_json::Value::Number(n) => {
+                                                out.push_str(&n.to_string())
+                                            }
+                                            serde_json::Value::Bool(b) => {
+                                                out.push_str(&b.to_string())
+                                            }
+                                            serde_json::Value::Null => {}
+                                            _ => {}
+                                        }
+                                    }
+                                    SqlStrPart::Lit(lit) => out.push_str(lit),
+                                }
+                            }
+                            serde_json::Value::String(out)
+                        }
+                        SqlComputedColumn::SearchedCase {
+                            branches,
+                            else_val,
+                            alias: _,
+                        } => {
+                            let mut found: Option<String> = None;
+                            for branch in branches {
+                                if apply_payload_filter(&branch.filter, v.payload.as_deref()) {
+                                    found = Some(branch.output.clone());
+                                    break;
+                                }
+                            }
+                            serde_json::Value::String(found.unwrap_or_else(|| else_val.clone()))
+                        }
+                    };
+                    let alias = match cc {
+                        SqlComputedColumn::NumBin { alias, .. }
+                        | SqlComputedColumn::StrConcat { alias, .. }
+                        | SqlComputedColumn::SearchedCase { alias, .. } => alias.clone(),
+                    };
+                    if !val.is_null() {
+                        row.insert(alias, val);
+                    }
                 }
                 row
             })

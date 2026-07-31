@@ -171,6 +171,9 @@ pub enum ReturnTransform {
         branches: Vec<(String, String)>,
         else_val: String,
     },
+    /// `RETURN b.field[n]` — extract the nth element (0-based) from a JSON array field.
+    /// Non-array values pass through unchanged; out-of-bounds returns null.
+    Index(usize),
 }
 
 /// How `payload_preds` are combined during BFS node filtering.
@@ -191,6 +194,78 @@ pub struct PayloadPred {
     pub value: CmpValue,
     /// When `true`, the predicate result is inverted (`NOT`).
     pub negated: bool,
+}
+
+// ── Computed RETURN expressions ───────────────────────────────────────────────
+
+/// One operand in a binary numeric expression in RETURN.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NumArg {
+    /// A field from the node payload: `b.fieldname`.
+    Field(String),
+    /// A numeric literal.
+    Literal(f64),
+}
+
+/// Binary arithmetic operator for computed return fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+/// A binary numeric expression `lhs OP rhs` used in RETURN computed fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumBinExpr {
+    pub lhs: NumArg,
+    pub op: NumBinOp,
+    pub rhs: NumArg,
+}
+
+/// One part of a string concatenation: either a field reference or a literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrPart {
+    /// A field from the node payload: `b.fieldname`.
+    Field(String),
+    /// A single-quoted string literal.
+    Literal(String),
+}
+
+/// A string concatenation expression `part1 || part2 || …`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrConcatExpr {
+    pub parts: Vec<StrPart>,
+}
+
+/// One branch of a searched CASE WHEN expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchedCaseBranch {
+    pub pred: PayloadPred,
+    pub output: String,
+}
+
+/// The expression for a computed RETURN field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReturnComputedExpr {
+    /// `b.lhs OP b.rhs AS alias` or `b.lhs OP literal AS alias`.
+    NumBin(NumBinExpr),
+    /// `b.f1 || 'sep' || b.f2 AS alias`.
+    StrConcat(StrConcatExpr),
+    /// `CASE WHEN b.field OP val THEN 'out' … ELSE 'default' END AS alias`.
+    SearchedCase {
+        branches: Vec<SearchedCaseBranch>,
+        else_val: String,
+    },
+}
+
+/// A computed field in a RETURN clause (arithmetic, concat, or CASE WHEN).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedReturnField {
+    pub alias: String,
+    pub expr: ReturnComputedExpr,
 }
 
 /// The `OPTIONAL MATCH` clause in a two-clause query.
@@ -370,6 +445,12 @@ pub struct GraphIrQuery {
     pub return_id: bool,
     /// When true, all JSON fields from matched node payload are returned (`RETURN b.*`).
     pub return_all_fields: bool,
+    /// When true, the edge type/label of the via-edge is included in `GraphIrRow::edge_fields`
+    /// under the key `"type(r)"`.
+    pub return_edge_type: bool,
+    /// When true, the traversal hop depth is included in `GraphIrRow::fields` under the key
+    /// `"depth"`.
+    pub return_depth: bool,
     /// When true, duplicate rows (same `object_id`) are removed before ORDER BY.
     pub distinct: bool,
     /// ORDER BY sort keys (multi-key, evaluated left to right). Empty = no sort.
@@ -393,6 +474,9 @@ pub struct GraphIrQuery {
     /// Named path variable from `MATCH p = (a)-[r]->(b)`. When set, `RETURN p`
     /// is equivalent to `RETURN path` and `GraphIrRow::path` is populated.
     pub path_var: Option<String>,
+    /// Computed fields generated from arithmetic expressions, string concatenations,
+    /// or searched CASE WHEN clauses in the RETURN clause.
+    pub return_computed: Vec<ComputedReturnField>,
 }
 
 /// A `MATCH … RETURN … UNION [ALL] MATCH … RETURN …` query.
