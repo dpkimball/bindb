@@ -1,4 +1,6 @@
-use bindb::{BinderStore, ObjectId, SqlGroupBy, SqlProjectQuery, Transaction};
+use bindb::{
+    BinderStore, ObjectId, SqlGroupBy, SqlProjectQuery, SqlProjectUnionQuery, Transaction,
+};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -5594,5 +5596,115 @@ fn sql_project_searched_case_when_no_match_else_empty() {
         .unwrap_or("__absent__");
     // empty string means label key absent (null pruned) or present as ""
     assert!(label.is_empty() || label == "__absent__");
+    store.close().unwrap();
+}
+
+// ── SqlProjectUnionQuery ────────────────────────────────────────────────────
+
+fn build_union_store(dir: &std::path::Path) -> BinderStore {
+    let store = BinderStore::open(dir).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        oid("obs://users:alice"),
+        br#"{"name":"Alice","role":"admin"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://users:bob"),
+        br#"{"name":"Bob","role":"user"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://guests:carol"),
+        br#"{"name":"Carol","role":"guest"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://guests:dave"),
+        br#"{"name":"Dave","role":"guest"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "union_store").unwrap();
+    store
+}
+
+#[test]
+fn sql_union_all_combines_branches() {
+    let dir = tmp();
+    let store = build_union_store(dir.path());
+    let rows = store
+        .sql_project_union(
+            "SELECT PAYLOAD_FIELD('name') FROM 'obs://users' \
+             UNION ALL \
+             SELECT PAYLOAD_FIELD('name') FROM 'obs://guests'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Bob"));
+    assert!(names.contains(&"Carol"));
+    assert!(names.contains(&"Dave"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_union_deduplicates() {
+    let dir = tmp();
+    // Two branches both see the same rows — plain UNION should deduplicate.
+    let store = build_union_store(dir.path());
+    let rows = store
+        .sql_project_union(
+            "SELECT PAYLOAD_FIELD('role') FROM 'obs://guests' \
+             UNION \
+             SELECT PAYLOAD_FIELD('role') FROM 'obs://guests'",
+        )
+        .unwrap();
+    // Both guests have role=guest → only 1 unique row after UNION.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("role").and_then(|v| v.as_str()), Some("guest"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_union_all_preserves_duplicates() {
+    let dir = tmp();
+    let store = build_union_store(dir.path());
+    let rows = store
+        .sql_project_union(
+            "SELECT PAYLOAD_FIELD('role') FROM 'obs://guests' \
+             UNION ALL \
+             SELECT PAYLOAD_FIELD('role') FROM 'obs://guests'",
+        )
+        .unwrap();
+    // 2 guests × 2 branches = 4 rows with UNION ALL.
+    assert_eq!(rows.len(), 4);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_union_parse_requires_two_branches() {
+    let err = SqlProjectUnionQuery::parse("SELECT PAYLOAD_FIELD('name') FROM 'obs://users'");
+    assert!(err.is_err());
+}
+
+#[test]
+fn sql_union_cross_namespace() {
+    let dir = tmp();
+    let store = build_union_store(dir.path());
+    let rows = store
+        .sql_project_union(
+            "SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('role') FROM 'obs://users' \
+             UNION ALL \
+             SELECT PAYLOAD_FIELD('name'), PAYLOAD_FIELD('role') FROM 'obs://guests'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    let roles: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("role").and_then(|v| v.as_str()))
+        .collect();
+    assert!(roles.contains(&"admin"));
+    assert!(roles.contains(&"user"));
+    assert!(roles.contains(&"guest"));
     store.close().unwrap();
 }

@@ -945,6 +945,165 @@ impl BinderStore {
         Ok(all_rows)
     }
 
+    /// Parse and execute a scan-based MATCH query (no traversal — namespace scan + filter).
+    pub fn graph_ir_scan(&self, query: &str) -> Result<Vec<GraphIrRow>, StoreError> {
+        let q = GraphIrScanQuery::parse(query).map_err(|e| StoreError::InvalidArgument {
+            message: e.to_string(),
+        })?;
+        self.graph_ir_scan_projected(&q)
+    }
+
+    /// Execute a pre-parsed scan query.
+    ///
+    /// Iterates all live objects under `q.namespace_prefix`, filters by `end_pred` and
+    /// `payload_preds`, projects requested fields, then applies DISTINCT / ORDER BY / SKIP / LIMIT.
+    pub fn graph_ir_scan_projected(
+        &self,
+        q: &GraphIrScanQuery,
+    ) -> Result<Vec<GraphIrRow>, StoreError> {
+        let objects = self.list(&q.namespace_prefix)?;
+        let mut rows: Vec<GraphIrRow> = Vec::with_capacity(objects.len());
+
+        for obj in objects {
+            // id-level filter (beyond the prefix match that list() already applies)
+            let id_ok = match &q.end_pred {
+                NodeIdPred::Any => true,
+                NodeIdPred::StartsWith(pfx) => obj.object_id.0.starts_with(pfx.as_str()),
+                NodeIdPred::EndsWith(sfx) => obj.object_id.0.ends_with(sfx.as_str()),
+                NodeIdPred::Contains(sub) => obj.object_id.0.contains(sub.as_str()),
+                NodeIdPred::Equals(id) => obj.object_id.0 == *id,
+                NodeIdPred::InList(ids) => ids.contains(&obj.object_id.0),
+                NodeIdPred::NotInList(ids) => !ids.contains(&obj.object_id.0),
+            };
+            if !id_ok {
+                continue;
+            }
+
+            // Payload filter
+            let payload_bytes = obj.payload.as_deref().unwrap_or(&[]);
+            if !q.payload_preds.is_empty() {
+                let pass = match q.pred_combinator {
+                    PayloadPredCombinator::And => q
+                        .payload_preds
+                        .iter()
+                        .all(|p| apply_payload_pred(payload_bytes, p)),
+                    PayloadPredCombinator::Or => q
+                        .payload_preds
+                        .iter()
+                        .any(|p| apply_payload_pred(payload_bytes, p)),
+                };
+                if !pass {
+                    continue;
+                }
+            }
+
+            // Project fields
+            let payload = obj.payload.as_deref();
+            let mut fields = HashMap::new();
+            if q.return_all_fields {
+                if let Some(bytes) = payload {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                            if let Some(map) = v.as_object() {
+                                for (k, val) in map {
+                                    fields.insert(k.clone(), val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if !q.return_fields.is_empty() {
+                if let Some(bytes) = payload {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                            for key in &q.return_fields {
+                                let raw_val =
+                                    v.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                                let has_transform = q.return_field_transforms.contains_key(key);
+                                if raw_val.is_null() && !has_transform {
+                                    continue;
+                                }
+                                let out_key = q
+                                    .return_field_aliases
+                                    .get(key)
+                                    .cloned()
+                                    .unwrap_or_else(|| key.clone());
+                                let val = if let Some(t) = q.return_field_transforms.get(key) {
+                                    apply_return_transform(raw_val, t)
+                                } else {
+                                    raw_val
+                                };
+                                if !val.is_null() {
+                                    fields.insert(out_key, val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if q.return_id {
+                fields.insert(
+                    "id(b)".to_string(),
+                    serde_json::Value::String(obj.object_id.0.clone()),
+                );
+            }
+            for cf in &q.return_computed {
+                let val = project_computed_field(payload, cf);
+                fields.insert(cf.alias.clone(), val);
+            }
+
+            rows.push(GraphIrRow {
+                object_id: obj.object_id,
+                depth: 0,
+                fields,
+                edge_fields: HashMap::new(),
+                path: vec![],
+                edge_path: vec![],
+                optional: None,
+            });
+        }
+
+        // DISTINCT
+        if q.distinct {
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|r| seen.insert(r.object_id.clone()));
+        }
+
+        // ORDER BY / SKIP / LIMIT
+        if !q.order_by.is_empty() {
+            rows.sort_by(|a, b| {
+                for ob in &q.order_by {
+                    let ord = match &ob.field {
+                        OrderByField::ObjectId => a.object_id.0.cmp(&b.object_id.0),
+                        OrderByField::Depth => std::cmp::Ordering::Equal,
+                        OrderByField::PayloadField(field) => {
+                            let ak = sort_key_from_value(a.fields.get(field));
+                            let bk = sort_key_from_value(b.fields.get(field));
+                            ak.partial_cmp(&bk).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                    };
+                    let ord = if ob.direction == OrderDirection::Desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if let Some(n) = q.skip.filter(|&n| n > 0) {
+            rows.drain(..n.min(rows.len()));
+        }
+        if let Some(limit) = q.limit {
+            rows.truncate(limit);
+        }
+
+        Ok(rows)
+    }
+
     /// Execute a pre-parsed restricted graph IR query.
     pub fn graph_ir_parsed(&self, q: &GraphIrQuery) -> Result<Vec<GraphQueryMatch>, StoreError> {
         let mut matches = build_graph_query(self, q).execute()?;

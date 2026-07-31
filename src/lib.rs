@@ -27,9 +27,10 @@ pub use engine::BinderStore;
 pub use error::StoreError;
 pub use graph_ir::{
     AggFunc, CmpOp, CmpValue, GraphIrChainedQuery, GraphIrError, GraphIrOptionalClause,
-    GraphIrOptionalMatch, GraphIrOrderBy, GraphIrQuery, GraphIrRow, GraphIrUnionQuery,
-    GraphIrWithClause, GraphIrWrite, GraphIrWriteError, NodeIdPred, OrderByField, OrderDirection,
-    PayloadPred, PayloadPredCombinator, ReturnTransform, WithAggregation, WriteOp,
+    GraphIrOptionalMatch, GraphIrOrderBy, GraphIrQuery, GraphIrRow, GraphIrScanQuery,
+    GraphIrUnionQuery, GraphIrWithClause, GraphIrWrite, GraphIrWriteError, NodeIdPred,
+    OrderByField, OrderDirection, PayloadPred, PayloadPredCombinator, ReturnTransform,
+    WithAggregation, WriteOp,
 };
 pub use graph_query::{Direction, GraphQuery, GraphQueryMatch};
 pub use namespace::NamespaceRegistry;
@@ -39,7 +40,7 @@ pub use sql_agg::{
     AggOrderBy, AggOrderByField, AggOrderDirection, HavingAggregate, HavingClause, HavingOp,
     SqlAggError, SqlAggregateQuery, SqlFieldTransform, SqlFilterCombinator, SqlGroupBy,
     SqlIdFilter, SqlPayloadFilter, SqlPayloadOp, SqlPayloadValue, SqlProjectOrderBy,
-    SqlProjectQuery,
+    SqlProjectQuery, SqlProjectUnionQuery,
 };
 pub use transaction::Transaction;
 pub use types::{CommitId, EdgeId, ObjectId};
