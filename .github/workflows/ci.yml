@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   test:
-    uses: dpkimball/dpk-ci/.github/workflows/rust-library-ci.yml@feat/rust-library-ci
+    uses: dpkimball/dpk-ci/.github/workflows/rust-library-ci.yml@master
     with:
       project_name: bindb
     secrets: inherit
