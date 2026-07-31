@@ -5349,7 +5349,7 @@ fn sql_project_arith_division_by_zero_null() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     // null means the key is absent from the row.
-    assert!(rows[0].get("q").is_none());
+    assert!(!rows[0].contains_key("q"));
     store.close().unwrap();
 }
 
@@ -5593,6 +5593,6 @@ fn sql_project_searched_case_when_no_match_else_empty() {
         .and_then(|v| v.as_str())
         .unwrap_or("__absent__");
     // empty string means label key absent (null pruned) or present as ""
-    assert!(label == "" || label == "__absent__");
+    assert!(label.is_empty() || label == "__absent__");
     store.close().unwrap();
 }

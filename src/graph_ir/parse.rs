@@ -1784,10 +1784,9 @@ fn parse_num_bin_expr_part(p: &str) -> Option<ComputedReturnField> {
         (NumBinOp::Mul, r.trim_start())
     } else if let Some(r) = after_lhs.strip_prefix("/ ") {
         (NumBinOp::Div, r.trim_start())
-    } else if let Some(r) = after_lhs.strip_prefix("% ") {
-        (NumBinOp::Rem, r.trim_start())
     } else {
-        return None;
+        let r = after_lhs.strip_prefix("% ")?;
+        (NumBinOp::Rem, r.trim_start())
     };
 
     // Parse RHS: either b.field or a numeric literal

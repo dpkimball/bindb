@@ -9316,7 +9316,7 @@ fn return_type_r_no_type_on_edge_empty_string() {
         .and_then(|v| v.as_str())
         .unwrap_or("__missing__");
     // Empty string or the stored empty type is acceptable.
-    assert!(label == "" || label == "__missing__" || label.is_empty());
+    assert!(label.is_empty() || label == "__missing__");
     store.close().unwrap();
 }
 
@@ -9544,7 +9544,7 @@ fn return_field_index_out_of_bounds() {
     let rows = store.graph_ir_projected(&q).unwrap();
     assert_eq!(rows.len(), 1);
     // null value means the key is absent from the row (projection loop omits null).
-    assert!(rows[0].fields.get("items").is_none());
+    assert!(!rows[0].fields.contains_key("items"));
     store.close().unwrap();
 }
 

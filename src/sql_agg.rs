@@ -2446,7 +2446,7 @@ impl SqlProjectQuery {
                         else_val = ev;
                         case_rest = after_ev.trim_start();
                     } else if cu.starts_with("END") {
-                        case_rest = &case_rest[3..].trim_start();
+                        case_rest = case_rest[3..].trim_start();
                         break;
                     } else {
                         return Err(SqlAggError::Unsupported(
@@ -2496,7 +2496,7 @@ impl SqlProjectQuery {
                         // String concat: PAYLOAD_FIELD('f') || ...
                         if peek.starts_with("||") {
                             let mut parts = vec![SqlStrPart::Field(first_field)];
-                            let mut cur = peek["||".len()..].trim_start();
+                            let mut cur = peek.strip_prefix("||").unwrap_or_default().trim_start();
                             loop {
                                 let cu = cur.to_ascii_uppercase();
                                 if cu.starts_with("PAYLOAD_FIELD(") {
