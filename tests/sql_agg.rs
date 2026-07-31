@@ -5298,9 +5298,7 @@ fn sql_project_arith_add_two_fields() {
     store.commit(tx, "test", "").unwrap();
 
     let rows = store
-        .sql_project(
-            "SELECT PAYLOAD_FIELD('a') + PAYLOAD_FIELD('b') AS total FROM 'obs://arith'",
-        )
+        .sql_project("SELECT PAYLOAD_FIELD('a') + PAYLOAD_FIELD('b') AS total FROM 'obs://arith'")
         .unwrap();
     let eps = 1e-9;
     let mut totals: Vec<f64> = rows
@@ -5324,9 +5322,7 @@ fn sql_project_arith_multiply_field_literal() {
     store.commit(tx, "test", "").unwrap();
 
     let rows = store
-        .sql_project(
-            "SELECT PAYLOAD_FIELD('price') * 2 AS doubled FROM 'obs://mul'",
-        )
+        .sql_project("SELECT PAYLOAD_FIELD('price') * 2 AS doubled FROM 'obs://mul'")
         .unwrap();
     let eps = 1e-9;
     let mut vals: Vec<f64> = rows
@@ -5349,9 +5345,7 @@ fn sql_project_arith_division_by_zero_null() {
     store.commit(tx, "test", "").unwrap();
 
     let rows = store
-        .sql_project(
-            "SELECT PAYLOAD_FIELD('v') / 0 AS q FROM 'obs://divz'",
-        )
+        .sql_project("SELECT PAYLOAD_FIELD('v') / 0 AS q FROM 'obs://divz'")
         .unwrap();
     assert_eq!(rows.len(), 1);
     // null means the key is absent from the row.
@@ -5369,9 +5363,7 @@ fn sql_project_arith_subtract() {
     store.commit(tx, "test", "").unwrap();
 
     let rows = store
-        .sql_project(
-            "SELECT PAYLOAD_FIELD('a') - PAYLOAD_FIELD('b') AS diff FROM 'obs://sub'",
-        )
+        .sql_project("SELECT PAYLOAD_FIELD('a') - PAYLOAD_FIELD('b') AS diff FROM 'obs://sub'")
         .unwrap();
     assert_eq!(rows.len(), 1);
     let diff = rows[0].get("diff").and_then(|v| v.as_f64()).unwrap_or(-1.0);
@@ -5387,8 +5379,14 @@ fn sql_project_concat_field_literal_field() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();
     let mut tx = Transaction::new();
-    tx.put_object(oid("obs://cat:a"), br#"{"first":"Alice","last":"Smith"}"#.to_vec());
-    tx.put_object(oid("obs://cat:b"), br#"{"first":"Bob","last":"Jones"}"#.to_vec());
+    tx.put_object(
+        oid("obs://cat:a"),
+        br#"{"first":"Alice","last":"Smith"}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://cat:b"),
+        br#"{"first":"Bob","last":"Jones"}"#.to_vec(),
+    );
     store.commit(tx, "test", "").unwrap();
 
     let mut rows = store
@@ -5421,10 +5419,7 @@ fn sql_project_concat_two_fields() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();
     let mut tx = Transaction::new();
-    tx.put_object(
-        oid("obs://cat2:a"),
-        br#"{"ns":"user","key":"42"}"#.to_vec(),
-    );
+    tx.put_object(oid("obs://cat2:a"), br#"{"ns":"user","key":"42"}"#.to_vec());
     store.commit(tx, "test", "").unwrap();
 
     let rows = store
@@ -5457,10 +5452,7 @@ fn sql_project_concat_missing_field_empty() {
         )
         .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].get("name").and_then(|v| v.as_str()),
-        Some("Alice ")
-    );
+    assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("Alice "));
     store.close().unwrap();
 }
 
@@ -5472,7 +5464,10 @@ fn sql_project_searched_case_when_basic() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();
     let mut tx = Transaction::new();
-    tx.put_object(oid("obs://scw:a"), br#"{"score":8,"name":"alice"}"#.to_vec());
+    tx.put_object(
+        oid("obs://scw:a"),
+        br#"{"score":8,"name":"alice"}"#.to_vec(),
+    );
     tx.put_object(oid("obs://scw:b"), br#"{"score":3,"name":"bob"}"#.to_vec());
     store.commit(tx, "test", "").unwrap();
 
@@ -5483,7 +5478,12 @@ fn sql_project_searched_case_when_basic() {
              FROM 'obs://scw'",
         )
         .unwrap();
-    rows.sort_by_key(|r| r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string());
+    rows.sort_by_key(|r| {
+        r.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get("tier").and_then(|v| v.as_str()), Some("hi"));
     assert_eq!(rows[1].get("tier").and_then(|v| v.as_str()), Some("lo"));
@@ -5517,7 +5517,11 @@ fn sql_project_searched_case_when_multi_branch() {
     let mut band_map: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     for r in &rows {
         let v = r.get("v").and_then(|v| v.as_i64()).unwrap_or(-1);
-        let band = r.get("band").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let band = r
+            .get("band")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         band_map.insert(v, band);
     }
     assert_eq!(band_map.get(&9).map(|s| s.as_str()), Some("a"));
@@ -5549,10 +5553,21 @@ fn sql_project_searched_case_when_string_condition() {
              FROM 'obs://scws'",
         )
         .unwrap();
-    rows.sort_by_key(|r| r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string());
+    rows.sort_by_key(|r| {
+        r.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].get("access").and_then(|v| v.as_str()), Some("elevated"));
-    assert_eq!(rows[1].get("access").and_then(|v| v.as_str()), Some("normal"));
+    assert_eq!(
+        rows[0].get("access").and_then(|v| v.as_str()),
+        Some("elevated")
+    );
+    assert_eq!(
+        rows[1].get("access").and_then(|v| v.as_str()),
+        Some("normal")
+    );
     store.close().unwrap();
 }
 

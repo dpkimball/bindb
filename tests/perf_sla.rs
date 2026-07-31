@@ -1048,8 +1048,18 @@ fn build_graph_hub_1k(dir: &TempDir, spokes: usize) -> BinderStore {
         br#"{"x":0,"y":0,"name":"hub","role":"root"}"#.to_vec(),
     );
     for i in 0..spokes {
-        let payload = format!(r#"{{"x":{},"y":{},"name":"n{}","role":"leaf","first":"fn{}","last":"ln{}","tags":["alpha","beta","gamma"]}}"#, i, i + 1, i, i, i);
-        tx.put_object(ObjectId::new(format!("g://n:{:04}", i)), payload.into_bytes());
+        let payload = format!(
+            r#"{{"x":{},"y":{},"name":"n{}","role":"leaf","first":"fn{}","last":"ln{}","tags":["alpha","beta","gamma"]}}"#,
+            i,
+            i + 1,
+            i,
+            i,
+            i
+        );
+        tx.put_object(
+            ObjectId::new(format!("g://n:{:04}", i)),
+            payload.into_bytes(),
+        );
     }
     store.commit_buffered(tx, "test", "").unwrap();
     let mut tx2 = Transaction::new();
@@ -1211,7 +1221,11 @@ fn build_arith_store_1k(dir: &TempDir) -> BinderStore {
     for i in 0..1_000usize {
         let payload = format!(
             r#"{{"a":{},"b":{},"score":{},"first":"fn{}","last":"ln{}"}}"#,
-            i, i + 1, i % 10, i, i
+            i,
+            i + 1,
+            i % 10,
+            i,
+            i
         );
         tx.put_object(
             ObjectId::new(format!("obs://sla_arith:{:04}", i)),

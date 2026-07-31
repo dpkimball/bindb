@@ -9274,7 +9274,10 @@ fn return_type_r_combined_with_fields() {
     .unwrap();
     let rows = store.graph_ir_projected(&q).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].fields.get("score").and_then(|v| v.as_i64()), Some(42));
+    assert_eq!(
+        rows[0].fields.get("score").and_then(|v| v.as_i64()),
+        Some(42)
+    );
     assert_eq!(
         rows[0].edge_fields.get("type(r)").and_then(|v| v.as_str()),
         Some("RATED")
@@ -9302,10 +9305,9 @@ fn return_type_r_no_type_on_edge_empty_string() {
     );
     store.commit(tx2, "test", "").unwrap();
 
-    let q = GraphIrQuery::parse(
-        "MATCH (a)-[*1..1]->(b) WHERE id(a) = 'obs://rtne:hub' RETURN type(r)",
-    )
-    .unwrap();
+    let q =
+        GraphIrQuery::parse("MATCH (a)-[*1..1]->(b) WHERE id(a) = 'obs://rtne:hub' RETURN type(r)")
+            .unwrap();
     let rows = store.graph_ir_projected(&q).unwrap();
     assert_eq!(rows.len(), 1);
     let label = rows[0]
@@ -9345,7 +9347,10 @@ fn return_depth_single_hop() {
     .unwrap();
     let rows = store.graph_ir_projected(&q).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].fields.get("depth").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        rows[0].fields.get("depth").and_then(|v| v.as_u64()),
+        Some(1)
+    );
     store.close().unwrap();
 }
 
@@ -9383,8 +9388,14 @@ fn return_depth_multi_hop_values() {
     let mut rows = store.graph_ir_projected(&q).unwrap();
     rows.sort_by_key(|r| r.fields.get("depth").and_then(|v| v.as_u64()).unwrap_or(0));
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].fields.get("depth").and_then(|v| v.as_u64()), Some(1));
-    assert_eq!(rows[1].fields.get("depth").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(
+        rows[0].fields.get("depth").and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        rows[1].fields.get("depth").and_then(|v| v.as_u64()),
+        Some(2)
+    );
     store.close().unwrap();
 }
 
@@ -9400,9 +9411,27 @@ fn return_depth_with_order_by() {
     tx.put_object(obj("obs://rdd:c"), br#"{}"#.to_vec());
     store.commit(tx, "test", "").unwrap();
     let mut tx2 = Transaction::new();
-    tx2.put_edge(eid("e://rdd:1"), obj("obs://rdd:root"), obj("obs://rdd:a"), "L", None);
-    tx2.put_edge(eid("e://rdd:2"), obj("obs://rdd:a"), obj("obs://rdd:b"), "L", None);
-    tx2.put_edge(eid("e://rdd:3"), obj("obs://rdd:b"), obj("obs://rdd:c"), "L", None);
+    tx2.put_edge(
+        eid("e://rdd:1"),
+        obj("obs://rdd:root"),
+        obj("obs://rdd:a"),
+        "L",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://rdd:2"),
+        obj("obs://rdd:a"),
+        obj("obs://rdd:b"),
+        "L",
+        None,
+    );
+    tx2.put_edge(
+        eid("e://rdd:3"),
+        obj("obs://rdd:b"),
+        obj("obs://rdd:c"),
+        "L",
+        None,
+    );
     store.commit(tx2, "test", "").unwrap();
 
     let q = GraphIrQuery::parse(
@@ -9435,7 +9464,13 @@ fn return_field_index_basic() {
     );
     store.commit(tx, "test", "").unwrap();
     let mut tx2 = Transaction::new();
-    tx2.put_edge(eid("e://rfi:a"), obj("obs://rfi:hub"), obj("obs://rfi:a"), "LINK", None);
+    tx2.put_edge(
+        eid("e://rfi:a"),
+        obj("obs://rfi:hub"),
+        obj("obs://rfi:a"),
+        "LINK",
+        None,
+    );
     store.commit(tx2, "test", "").unwrap();
 
     let q = GraphIrQuery::parse(
@@ -9458,13 +9493,16 @@ fn return_field_index_second_element() {
     let store = BinderStore::open(dir.path()).unwrap();
     let mut tx = Transaction::new();
     tx.put_object(obj("obs://rfis:hub"), br#"{}"#.to_vec());
-    tx.put_object(
-        obj("obs://rfis:a"),
-        br#"{"scores":[10,20,30]}"#.to_vec(),
-    );
+    tx.put_object(obj("obs://rfis:a"), br#"{"scores":[10,20,30]}"#.to_vec());
     store.commit(tx, "test", "").unwrap();
     let mut tx2 = Transaction::new();
-    tx2.put_edge(eid("e://rfis:a"), obj("obs://rfis:hub"), obj("obs://rfis:a"), "L", None);
+    tx2.put_edge(
+        eid("e://rfis:a"),
+        obj("obs://rfis:hub"),
+        obj("obs://rfis:a"),
+        "L",
+        None,
+    );
     store.commit(tx2, "test", "").unwrap();
 
     let q = GraphIrQuery::parse(
@@ -9490,7 +9528,13 @@ fn return_field_index_out_of_bounds() {
     tx.put_object(obj("obs://rfio:a"), br#"{"items":["x"]}"#.to_vec());
     store.commit(tx, "test", "").unwrap();
     let mut tx2 = Transaction::new();
-    tx2.put_edge(eid("e://rfio:a"), obj("obs://rfio:hub"), obj("obs://rfio:a"), "L", None);
+    tx2.put_edge(
+        eid("e://rfio:a"),
+        obj("obs://rfio:hub"),
+        obj("obs://rfio:a"),
+        "L",
+        None,
+    );
     store.commit(tx2, "test", "").unwrap();
 
     let q = GraphIrQuery::parse(
@@ -9514,7 +9558,13 @@ fn return_field_index_with_alias() {
     tx.put_object(obj("obs://rfa:a"), br#"{"cats":["alpha","beta"]}"#.to_vec());
     store.commit(tx, "test", "").unwrap();
     let mut tx2 = Transaction::new();
-    tx2.put_edge(eid("e://rfa:a"), obj("obs://rfa:hub"), obj("obs://rfa:a"), "L", None);
+    tx2.put_edge(
+        eid("e://rfa:a"),
+        obj("obs://rfa:hub"),
+        obj("obs://rfa:a"),
+        "L",
+        None,
+    );
     store.commit(tx2, "test", "").unwrap();
 
     let q = GraphIrQuery::parse(
@@ -9524,10 +9574,7 @@ fn return_field_index_with_alias() {
     let rows = store.graph_ir_projected(&q).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        rows[0]
-            .fields
-            .get("first_cat")
-            .and_then(|v| v.as_str()),
+        rows[0].fields.get("first_cat").and_then(|v| v.as_str()),
         Some("alpha")
     );
     store.close().unwrap();

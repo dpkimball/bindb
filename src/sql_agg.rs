@@ -2502,11 +2502,12 @@ impl SqlProjectQuery {
                                 if cu.starts_with("PAYLOAD_FIELD(") {
                                     let inner = &cur["PAYLOAD_FIELD(".len()..];
                                     let (f, rest2) = parse_quoted_sql(inner)?;
-                                    let rest2 = rest2.trim_start().strip_prefix(')').ok_or_else(|| {
-                                        SqlAggError::Unsupported(
-                                            "expected ')' after PAYLOAD_FIELD in ||".into(),
-                                        )
-                                    })?;
+                                    let rest2 =
+                                        rest2.trim_start().strip_prefix(')').ok_or_else(|| {
+                                            SqlAggError::Unsupported(
+                                                "expected ')' after PAYLOAD_FIELD in ||".into(),
+                                            )
+                                        })?;
                                     parts.push(SqlStrPart::Field(f));
                                     cur = rest2.trim_start();
                                 } else if cur.starts_with('\'') {
@@ -2570,37 +2571,35 @@ impl SqlProjectQuery {
                             let left = SqlNumArg::Field(first_field);
                             let after_op = peek[op_len..].trim_start();
                             let aou = after_op.to_ascii_uppercase();
-                            let (right, after_right): (SqlNumArg, &str) =
-                                if aou.starts_with("PAYLOAD_FIELD(") {
-                                    let inner = &after_op["PAYLOAD_FIELD(".len()..];
-                                    let (f, rest2) = parse_quoted_sql(inner)?;
-                                    let rest2 =
-                                        rest2.trim_start().strip_prefix(')').ok_or_else(|| {
-                                            SqlAggError::Unsupported(
-                                                "expected ')' after PAYLOAD_FIELD in arithmetic"
-                                                    .into(),
-                                            )
-                                        })?;
-                                    (SqlNumArg::Field(f), rest2.trim_start())
-                                } else {
-                                    let lit_end = after_op
-                                        .find(|c: char| {
-                                            !c.is_ascii_digit() && c != '.' && c != '-'
-                                        })
-                                        .unwrap_or(after_op.len());
-                                    if lit_end == 0 {
-                                        return Err(SqlAggError::Unsupported(
-                                            "expected PAYLOAD_FIELD or number literal in arithmetic"
-                                                .into(),
-                                        ));
-                                    }
-                                    let n: f64 = after_op[..lit_end].parse().map_err(|_| {
+                            let (right, after_right): (SqlNumArg, &str) = if aou
+                                .starts_with("PAYLOAD_FIELD(")
+                            {
+                                let inner = &after_op["PAYLOAD_FIELD(".len()..];
+                                let (f, rest2) = parse_quoted_sql(inner)?;
+                                let rest2 =
+                                    rest2.trim_start().strip_prefix(')').ok_or_else(|| {
                                         SqlAggError::Unsupported(
-                                            "invalid number in arithmetic expression".into(),
+                                            "expected ')' after PAYLOAD_FIELD in arithmetic".into(),
                                         )
                                     })?;
-                                    (SqlNumArg::Literal(n), after_op[lit_end..].trim_start())
-                                };
+                                (SqlNumArg::Field(f), rest2.trim_start())
+                            } else {
+                                let lit_end = after_op
+                                    .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+                                    .unwrap_or(after_op.len());
+                                if lit_end == 0 {
+                                    return Err(SqlAggError::Unsupported(
+                                        "expected PAYLOAD_FIELD or number literal in arithmetic"
+                                            .into(),
+                                    ));
+                                }
+                                let n: f64 = after_op[..lit_end].parse().map_err(|_| {
+                                    SqlAggError::Unsupported(
+                                        "invalid number in arithmetic expression".into(),
+                                    )
+                                })?;
+                                (SqlNumArg::Literal(n), after_op[lit_end..].trim_start())
+                            };
                             if !starts_with_keyword(after_right, "AS") {
                                 return Err(SqlAggError::Unsupported(
                                     "arithmetic expression requires AS alias".into(),
@@ -2714,7 +2713,8 @@ impl SqlProjectQuery {
             }
         }
 
-        if fields.is_empty() && !return_id && window_columns.is_empty() && computed_cols.is_empty() {
+        if fields.is_empty() && !return_id && window_columns.is_empty() && computed_cols.is_empty()
+        {
             return Err(SqlAggError::Unsupported(
                 "SELECT list must have at least one id or PAYLOAD_FIELD expression".into(),
             ));
@@ -3761,15 +3761,24 @@ impl BinderStore {
                 // Computed columns: arithmetic, string concat, searched CASE WHEN.
                 for cc in &q.computed_cols {
                     let val = match cc {
-                        SqlComputedColumn::NumBin { op, left, right, alias: _ } => {
+                        SqlComputedColumn::NumBin {
+                            op,
+                            left,
+                            right,
+                            alias: _,
+                        } => {
                             let lv = match left {
-                                SqlNumArg::Field(f) => project_payload_field(v.payload.as_deref(), f),
+                                SqlNumArg::Field(f) => {
+                                    project_payload_field(v.payload.as_deref(), f)
+                                }
                                 SqlNumArg::Literal(n) => serde_json::Number::from_f64(*n)
                                     .map(serde_json::Value::Number)
                                     .unwrap_or(serde_json::Value::Null),
                             };
                             let rv = match right {
-                                SqlNumArg::Field(f) => project_payload_field(v.payload.as_deref(), f),
+                                SqlNumArg::Field(f) => {
+                                    project_payload_field(v.payload.as_deref(), f)
+                                }
                                 SqlNumArg::Literal(n) => serde_json::Number::from_f64(*n)
                                     .map(serde_json::Value::Number)
                                     .unwrap_or(serde_json::Value::Null),
@@ -3783,10 +3792,18 @@ impl BinderStore {
                                     SqlNumBinOp::Sub => l - r,
                                     SqlNumBinOp::Mul => l * r,
                                     SqlNumBinOp::Div => {
-                                        if r == 0.0 { f64::NAN } else { l / r }
+                                        if r == 0.0 {
+                                            f64::NAN
+                                        } else {
+                                            l / r
+                                        }
                                     }
                                     SqlNumBinOp::Rem => {
-                                        if r == 0.0 { f64::NAN } else { l % r }
+                                        if r == 0.0 {
+                                            f64::NAN
+                                        } else {
+                                            l % r
+                                        }
                                     }
                                 };
                                 serde_json::Number::from_f64(result)
@@ -3819,7 +3836,11 @@ impl BinderStore {
                             }
                             serde_json::Value::String(out)
                         }
-                        SqlComputedColumn::SearchedCase { branches, else_val, alias: _ } => {
+                        SqlComputedColumn::SearchedCase {
+                            branches,
+                            else_val,
+                            alias: _,
+                        } => {
                             let mut found: Option<String> = None;
                             for branch in branches {
                                 if apply_payload_filter(&branch.filter, v.payload.as_deref()) {

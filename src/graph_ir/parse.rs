@@ -2031,7 +2031,9 @@ pub(super) fn parse_return_spec(s: &str, path_var: Option<&str>) -> ReturnSpec {
             return_id = true;
         } else if selector.eq_ignore_ascii_case("b.*") {
             return_all_fields = true;
-        } else if selector.eq_ignore_ascii_case("type(r)") || selector.eq_ignore_ascii_case("type(a)") {
+        } else if selector.eq_ignore_ascii_case("type(r)")
+            || selector.eq_ignore_ascii_case("type(a)")
+        {
             return_edge_type = true;
         } else if selector.eq_ignore_ascii_case("depth") {
             return_depth = true;
