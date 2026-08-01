@@ -1,4 +1,4 @@
-#[allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports)]
 pub use bindb::{
     BinderStore, ObjectId, SqlAggregateQuery, SqlGroupBy, SqlProjectQuery, SqlProjectUnionQuery,
     Transaction,

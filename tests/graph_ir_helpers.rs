@@ -1,4 +1,4 @@
-#[allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports)]
 pub use bindb::{
     AggFunc, BinderStore, CmpOp, CmpValue, EdgeId, GraphIrChainedQuery, GraphIrQuery,
     GraphIrScanQuery, GraphIrUnionQuery, GraphIrWrite, GraphIrWriteError, NodeIdPred, ObjectId,
