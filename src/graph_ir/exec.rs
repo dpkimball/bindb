@@ -1644,6 +1644,26 @@ fn extract_numeric_field(payload: Option<&[u8]>, field: &str) -> Option<f64> {
     v.get(field)?.as_f64()
 }
 
+fn percentile_sorted(values: &mut [f64], p: f64) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((p / 100.0) * (values.len() - 1) as f64).round() as usize;
+    values[idx.min(values.len() - 1)]
+}
+
+fn pop_stddev(values: &[f64], variance: bool) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    let var = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    if variance {
+        var
+    } else {
+        var.sqrt()
+    }
+}
+
 /// Compute a single aggregation over the matched nodes.
 fn compute_aggregation(matches: &[GraphQueryMatch], agg: &WithAggregation) -> serde_json::Value {
     match &agg.func {
@@ -1685,6 +1705,46 @@ fn compute_aggregation(matches: &[GraphQueryMatch], agg: &WithAggregation) -> se
                 .reduce(f64::max)
                 .map(|v| serde_json::json!(v))
                 .unwrap_or(serde_json::Value::Null)
+        }
+        AggFunc::P50 => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let mut values: Vec<f64> = matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            if values.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(percentile_sorted(&mut values, 50.0))
+            }
+        }
+        AggFunc::P99 => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let mut values: Vec<f64> = matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            if values.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(percentile_sorted(&mut values, 99.0))
+            }
+        }
+        AggFunc::Stddev => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let values: Vec<f64> = matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            serde_json::json!(pop_stddev(&values, false))
+        }
+        AggFunc::Variance => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let values: Vec<f64> = matches
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            serde_json::json!(pop_stddev(&values, true))
         }
         AggFunc::Collect => {
             let vals: Vec<serde_json::Value> = if let Some(field) = &agg.field {
@@ -1791,6 +1851,46 @@ fn compute_aggregation_slice(
                 .reduce(f64::max)
                 .map(|v| serde_json::json!(v))
                 .unwrap_or(serde_json::Value::Null)
+        }
+        AggFunc::P50 => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let mut values: Vec<f64> = group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            if values.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(percentile_sorted(&mut values, 50.0))
+            }
+        }
+        AggFunc::P99 => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let mut values: Vec<f64> = group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            if values.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(percentile_sorted(&mut values, 99.0))
+            }
+        }
+        AggFunc::Stddev => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let values: Vec<f64> = group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            serde_json::json!(pop_stddev(&values, false))
+        }
+        AggFunc::Variance => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let values: Vec<f64> = group
+                .iter()
+                .filter_map(|m| extract_numeric_field(m.object.payload.as_deref(), field))
+                .collect();
+            serde_json::json!(pop_stddev(&values, true))
         }
         AggFunc::Collect => {
             let vals: Vec<serde_json::Value> = if let Some(field) = &agg.field {

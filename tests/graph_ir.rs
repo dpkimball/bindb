@@ -10023,3 +10023,122 @@ fn return_array_length_non_array_passes_through() {
     }
     store.close().unwrap();
 }
+
+// ── P50 / P99 / STDDEV / VARIANCE WITH aggregations ──────────────────────────
+
+#[test]
+fn agg_p50_returns_median() {
+    // scores: 5, 10, 20 → sorted [5, 10, 20] → idx = round(0.50 * 2) = 1 → 10
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+    let result = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+             WITH p50(b.score) AS med RETURN med",
+        )
+        .unwrap();
+    let v = result[0]
+        .get("med")
+        .and_then(|v| v.as_f64())
+        .expect("med must be a number");
+    assert!((v - 10.0).abs() < 1e-9, "expected 10.0 (median), got {v}");
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_p99_returns_near_max() {
+    // scores: 5, 10, 20 → sorted [5, 10, 20] → idx = round(0.99 * 2) = 2 → 20
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+    let result = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+             WITH p99(b.score) AS hi RETURN hi",
+        )
+        .unwrap();
+    let v = result[0]
+        .get("hi")
+        .and_then(|v| v.as_f64())
+        .expect("hi must be a number");
+    assert!((v - 20.0).abs() < 1e-9, "expected 20.0 (p99), got {v}");
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_stddev_population() {
+    // scores: [5, 10, 20], mean=35/3, variance=350/9, stddev=sqrt(350/9)
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+    let result = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+             WITH stddev(b.score) AS sd RETURN sd",
+        )
+        .unwrap();
+    let v = result[0]
+        .get("sd")
+        .and_then(|v| v.as_f64())
+        .expect("sd must be a number");
+    let expected = (350.0f64 / 9.0).sqrt();
+    assert!((v - expected).abs() < 1e-9, "expected {expected}, got {v}");
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_variance_population() {
+    // scores: [5, 10, 20], variance = 350/9
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+    let result = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+             WITH variance(b.score) AS vr RETURN vr",
+        )
+        .unwrap();
+    let v = result[0]
+        .get("vr")
+        .and_then(|v| v.as_f64())
+        .expect("vr must be a number");
+    let expected = 350.0f64 / 9.0;
+    assert!((v - expected).abs() < 1e-9, "expected {expected}, got {v}");
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_stddev_empty_group_returns_zero() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+    let result = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'nobody://x' \
+             WITH stddev(b.score) AS sd RETURN sd",
+        )
+        .unwrap();
+    let v = result[0].get("sd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    assert!((v - 0.0).abs() < 1e-9, "empty group stddev should be 0");
+    store.close().unwrap();
+}
+
+#[test]
+fn agg_parse_case_insensitive() {
+    // P50/STDDEV/VARIANCE parsing must be case-insensitive.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_optional_graph(&store);
+    let result = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'person://alice' \
+             WITH P50(b.score) AS med, STDDEV(b.score) AS sd, VARIANCE(b.score) AS vr \
+             RETURN med, sd, vr",
+        )
+        .unwrap();
+    assert!(result[0].get("med").and_then(|v| v.as_f64()).is_some());
+    assert!(result[0].get("sd").and_then(|v| v.as_f64()).is_some());
+    assert!(result[0].get("vr").and_then(|v| v.as_f64()).is_some());
+    store.close().unwrap();
+}

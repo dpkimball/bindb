@@ -232,6 +232,43 @@ Scale is 1 K nodes in a hub-and-spoke topology, depth-1 traversal.
 
 ---
 
+## graph_ir P50 / P99 / STDDEV / VARIANCE WITH aggregation SLAs (issue #2)
+
+Applies when a `WITH` aggregating clause uses `p50(b.field)`, `p99(b.field)`,
+`stddev(b.field)`, or `variance(b.field)`.  Scale is 1 K nodes, hub-and-spoke,
+depth-1 traversal; measures full `graph_ir_aggregated` call including traversal.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| `WITH p50(b.field) AS m` — median aggregation | 1 K nodes, depth 1 | ≤ 10 ms |
+| `WITH stddev(b.field) AS s` — population std-dev | 1 K nodes, depth 1 | ≤ 10 ms |
+
+---
+
+## sql STDDEV / VARIANCE aggregate SLAs (issue #5)
+
+Applies when `SELECT STDDEV(VALUE)` or `SELECT VARIANCE(VALUE)` aggregates
+binary-encoded float observations.  Scale is 1 K observations.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| `STDDEV(VALUE)` — population std-dev | 1 K observations | ≤ 50 ms |
+
+---
+
+## sql_project HAS / Index SLAs (issue #5)
+
+Applies when `WHERE PAYLOAD_FIELD('f') HAS 'val'` checks JSON array containment,
+or `PAYLOAD_FIELD('f')[n]` selects the nth element of an array field in SELECT.
+Scale is 1 K JSON-payload objects.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| `WHERE PAYLOAD_FIELD('f') HAS 'val'` — array containment filter | 1 K rows | ≤ 10 ms |
+| `PAYLOAD_FIELD('f')[n]` — array element index in SELECT | 1 K rows | ≤ 10 ms |
+
+---
+
 ## Vector search SLAs (ANN / HNSW)
 
 Applies when the `VectorIndex` has ≥ 1 K live vectors per model (below this threshold the

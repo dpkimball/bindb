@@ -5949,3 +5949,197 @@ fn sql_project_array_length_non_array_passes_through() {
     }
     store.close().unwrap();
 }
+
+// ── STDDEV / VARIANCE aggregate (issue #5) ───────────────────────────────────
+
+#[test]
+fn sql_stddev_population() {
+    // sleep values: [6.0, 7.0, 8.0] — mean=7, variance=2/3, stddev=sqrt(2/3)
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_sleep_store(&store);
+    let results = store
+        .sql_aggregate("SELECT STDDEV(VALUE) FROM 'obs://health.sleep'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let expected = (2.0f64 / 3.0).sqrt();
+    assert!(
+        (results[0].value - expected).abs() < 1e-9,
+        "expected {expected}, got {}",
+        results[0].value
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_variance_population() {
+    // sleep values: [6.0, 7.0, 8.0] — variance = 2/3
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_sleep_store(&store);
+    let results = store
+        .sql_aggregate("SELECT VARIANCE(VALUE) FROM 'obs://health.sleep'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let expected = 2.0f64 / 3.0;
+    assert!(
+        (results[0].value - expected).abs() < 1e-9,
+        "expected {expected}, got {}",
+        results[0].value
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_stddev_single_element_returns_zero() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(oid("obs://single:one"), encode(5.0));
+    store.commit(tx, "test", "seed").unwrap();
+    let results = store
+        .sql_aggregate("SELECT STDDEV(VALUE) FROM 'obs://single'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    // single-element population stddev is 0
+    assert!((results[0].value).abs() < 1e-9);
+    store.close().unwrap();
+}
+
+// ── WHERE PAYLOAD_FIELD HAS — array containment filter (issue #5) ────────────
+
+#[test]
+fn project_payload_filter_has_element() {
+    // HAS 'perf' → only obs://arr:one has that tag
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('tags') FROM 'obs://arr' WHERE PAYLOAD_FIELD('tags') HAS 'perf'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let tags = rows[0]["tags"].as_array().expect("tags must be an array");
+    assert!(tags.iter().any(|v| v.as_str() == Some("perf")));
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_has_no_match() {
+    // HAS 'missing' → no rows match
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('tags') FROM 'obs://arr' WHERE PAYLOAD_FIELD('tags') HAS 'missing'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 0);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_has_empty_array() {
+    // The empty-tags row should not match any HAS predicate
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('tags') FROM 'obs://arr' WHERE PAYLOAD_FIELD('tags') HAS 'graph'",
+        )
+        .unwrap();
+    // obs://arr:two has 'graph'; obs://arr:three has empty tags — only one match
+    assert_eq!(rows.len(), 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_filter_has_non_array_field_no_match() {
+    // 'score' is a number, not an array — HAS always returns false
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let rows = store
+        .sql_project(
+            "SELECT PAYLOAD_FIELD('score') FROM 'obs://arr' WHERE PAYLOAD_FIELD('score') HAS '1'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 0);
+    store.close().unwrap();
+}
+
+// ── PAYLOAD_FIELD('f')[n] — array element index in SELECT (issue #5) ─────────
+
+#[test]
+fn project_payload_field_index_first_element() {
+    // tags[0] for each row
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let mut rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('tags')[0] AS first_tag FROM 'obs://arr'")
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("first_tag")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    });
+    // obs://arr:one → "rust", obs://arr:two → "graph", obs://arr:three → null (empty)
+    assert_eq!(rows.len(), 3);
+    let first: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            r.get("first_tag")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+    assert!(
+        first.iter().any(|v| v.as_str() == Some("rust")),
+        "expected 'rust' as first tag of obs://arr:one"
+    );
+    assert!(
+        first.iter().any(|v| v.as_str() == Some("graph")),
+        "expected 'graph' as first tag of obs://arr:two"
+    );
+    assert!(
+        first.iter().any(|v| v.is_null()),
+        "empty array index should be null"
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_field_index_out_of_bounds_is_null() {
+    // tags[99] → null for all rows
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('tags')[99] AS t FROM 'obs://arr'")
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert!(
+            row.get("t").map(|v| v.is_null()).unwrap_or(true),
+            "out-of-bounds index must be null"
+        );
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn project_payload_field_index_non_array_is_null() {
+    // score is a number — index access returns null
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let rows = store
+        .sql_project("SELECT PAYLOAD_FIELD('score')[0] AS s FROM 'obs://arr'")
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert!(
+            row.get("s").map(|v| v.is_null()).unwrap_or(true),
+            "non-array index must be null"
+        );
+    }
+    store.close().unwrap();
+}

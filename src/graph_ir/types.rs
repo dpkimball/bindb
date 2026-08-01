@@ -316,6 +316,14 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `p50(b.field)` — 50th-percentile (median) of the field across matched nodes.
+    P50,
+    /// `p99(b.field)` — 99th-percentile of the field across matched nodes.
+    P99,
+    /// `stddev(b.field)` — population standard deviation.
+    Stddev,
+    /// `variance(b.field)` — population variance.
+    Variance,
     /// `collect(b)` / `collect(b.field)` — builds a JSON array of node IDs or field values.
     Collect,
 }
