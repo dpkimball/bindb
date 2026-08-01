@@ -60,6 +60,8 @@ pub enum CmpOp {
     Like,
     /// `b.field ILIKE 'pat%tern'` — case-insensitive SQL wildcard
     ILike,
+    /// `b.field HAS 'val'` — JSON array field contains a string element equal to `val`
+    HasElement,
 }
 
 /// Right-hand side of a payload predicate.
@@ -174,6 +176,9 @@ pub enum ReturnTransform {
     /// `RETURN b.field[n]` — extract the nth element (0-based) from a JSON array field.
     /// Non-array values pass through unchanged; out-of-bounds returns null.
     Index(usize),
+    /// `RETURN ARRAY_LENGTH(b.field)` — number of elements in a JSON array field.
+    /// Non-array values pass through unchanged.
+    ArrayLength,
 }
 
 /// How `payload_preds` are combined during BFS node filtering.

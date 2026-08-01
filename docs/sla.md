@@ -206,14 +206,29 @@ merges results.  Scale is 2 hubs × 500 spokes each (1 K total result rows).
 
 ---
 
-## sql COLLECT aggregate SLAs (issue #5)
+## sql COLLECT / STRING_AGG aggregate SLAs (issue #5)
 
-Applies when `COLLECT(PAYLOAD_FIELD('field'))` builds JSON arrays per group.
-Scale is 1 K observations grouped into 10 buckets (100 items per array).
+Applies when `COLLECT(PAYLOAD_FIELD('field'))` builds JSON arrays per group, or
+`STRING_AGG(PAYLOAD_FIELD('field'), 'sep')` concatenates string values per group.
+Scale is 1 K observations grouped into 10 buckets (100 items per group).
 
 | Feature | Scale | p99 |
 |---------|-------|-----|
 | COLLECT with GROUP BY (10 groups × 100 items) | 1 K observations | ≤ 50 ms |
+| STRING_AGG with GROUP BY (10 groups × 100 items) | 1 K observations | ≤ 50 ms |
+
+---
+
+## graph_ir HAS / ARRAY_LENGTH SLAs (issue #2)
+
+Applies when `WHERE b.field HAS 'val'` checks JSON array element containment, or
+`RETURN ARRAY_LENGTH(b.field)` projects the element count of a JSON array field.
+Scale is 1 K nodes in a hub-and-spoke topology, depth-1 traversal.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| `WHERE b.field HAS 'val'` — array containment filter | 1 K nodes, depth 1 | ≤ 10 ms |
+| `RETURN ARRAY_LENGTH(b.field)` — array element count | 1 K nodes, depth 1 | ≤ 10 ms |
 
 ---
 

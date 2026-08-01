@@ -9857,3 +9857,169 @@ fn multi_start_parse_error_empty_list() {
     let err = GraphIrQuery::parse("MATCH (a)-[:FOLLOWS*1]->(b) WHERE id(a) IN [] RETURN b.name");
     assert!(err.is_err());
 }
+
+// ── HAS element predicate ────────────────────────────────────────────────────
+
+fn build_tagged_graph(store: &BinderStore) {
+    let mut tx = Transaction::new();
+    // hub
+    tx.put_object(obj("hub://root"), br#"{"name":"root"}"#.to_vec());
+    // spokes with tags arrays
+    tx.put_object(
+        obj("node://rust"),
+        br#"{"name":"rust","tags":["systems","performance","safe"]}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://graph"),
+        br#"{"name":"graph","tags":["data","graph"]}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://perf"),
+        br#"{"name":"perf","tags":["performance","latency"]}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("node://empty"),
+        br#"{"name":"empty","tags":[]}"#.to_vec(),
+    );
+    // edges hub → spokes
+    for target in &["node://rust", "node://graph", "node://perf", "node://empty"] {
+        tx.put_edge(
+            EdgeId::new(format!("e-{target}")),
+            obj("hub://root"),
+            obj(target),
+            "LINKS",
+            None,
+        );
+    }
+    store.commit(tx, "test", "tagged").unwrap();
+}
+
+#[test]
+fn has_element_filters_to_matching_nodes() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_tagged_graph(&store);
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'hub://root' AND b.tags HAS 'performance' RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    // 'rust' and 'perf' have 'performance' tag
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"rust"));
+    assert!(names.contains(&"perf"));
+    store.close().unwrap();
+}
+
+#[test]
+fn has_element_negated_excludes_matching() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_tagged_graph(&store);
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'hub://root' AND NOT b.tags HAS 'performance' RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    // 'graph' and 'empty' do NOT have 'performance'
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"graph"));
+    assert!(names.contains(&"empty"));
+    store.close().unwrap();
+}
+
+#[test]
+fn has_element_on_empty_array_never_matches() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_tagged_graph(&store);
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'hub://root' AND b.tags HAS 'anything' RETURN b.name",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    // only 'rust' (systems/performance/safe), 'graph' (data/graph), 'perf' (performance/latency)
+    // 'empty' never matches HAS 'anything' regardless
+    for r in &rows {
+        assert_ne!(r.fields.get("name").and_then(|v| v.as_str()), Some("empty"));
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn has_element_parse_error_unquoted_value() {
+    let err = GraphIrQuery::parse(
+        "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'hub://root' AND b.tags HAS performance RETURN b.name",
+    );
+    assert!(err.is_err());
+}
+
+// ── RETURN ARRAY_LENGTH(b.field) ─────────────────────────────────────────────
+
+#[test]
+fn return_array_length_projected() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_tagged_graph(&store);
+    let mut rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'hub://root' RETURN ARRAY_LENGTH(b.tags) AS tag_count",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.fields
+            .get("tag_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX)
+    });
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].fields["tag_count"].as_u64(), Some(0)); // empty
+    assert_eq!(rows[1].fields["tag_count"].as_u64(), Some(2)); // graph or perf
+    assert_eq!(rows[2].fields["tag_count"].as_u64(), Some(2)); // graph or perf
+    assert_eq!(rows[3].fields["tag_count"].as_u64(), Some(3)); // rust
+    store.close().unwrap();
+}
+
+#[test]
+fn return_array_length_non_array_passes_through() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_tagged_graph(&store);
+    // 'name' is a string, not an array — pass through unchanged
+    let rows = store
+        .graph_ir_projected(
+            &GraphIrQuery::parse(
+                "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'hub://root' RETURN ARRAY_LENGTH(b.name) AS n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for r in &rows {
+        assert!(
+            r.fields["n"].is_string(),
+            "string field should pass through"
+        );
+    }
+    store.close().unwrap();
+}

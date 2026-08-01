@@ -5811,3 +5811,141 @@ fn sql_collect_parse_rejects_bad_form() {
     let err2 = SqlAggregateQuery::parse("SELECT COLLECT(PAYLOAD_FIELD('f') FROM 'obs://ns'");
     assert!(err2.is_err());
 }
+
+// ── STRING_AGG ──────────────────────────────────────────────────────────────
+
+#[test]
+fn sql_string_agg_basic_concat() {
+    let dir = tmp();
+    let store = build_collect_store(dir.path());
+    let results = store
+        .sql_aggregate("SELECT STRING_AGG(PAYLOAD_FIELD('name'), ', ') FROM 'obs://team'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].count, 3);
+    let joined = results[0]
+        .collected
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .expect("collected should be a string");
+    // Order is iteration order; just verify all names appear separated by ", "
+    let parts: Vec<&str> = joined.split(", ").collect();
+    assert_eq!(parts.len(), 3);
+    assert!(parts.contains(&"Alice"));
+    assert!(parts.contains(&"Bob"));
+    assert!(parts.contains(&"Carol"));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_string_agg_grouped_by_role() {
+    let dir = tmp();
+    let store = build_collect_store(dir.path());
+    let results = store
+        .sql_aggregate(
+            "SELECT STRING_AGG(PAYLOAD_FIELD('name'), '|') FROM 'obs://team' GROUP BY PAYLOAD_FIELD('role')",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let admin = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some("admin"))
+        .expect("admin group");
+    let admin_str = admin
+        .collected
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .expect("admin string");
+    // Alice and Carol are admins
+    let admin_parts: Vec<&str> = admin_str.split('|').collect();
+    assert_eq!(admin_parts.len(), 2);
+    assert!(admin_parts.contains(&"Alice"));
+    assert!(admin_parts.contains(&"Carol"));
+
+    let user = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some("user"))
+        .expect("user group");
+    assert_eq!(
+        user.collected.as_ref().and_then(|v| v.as_str()),
+        Some("Bob")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_string_agg_non_string_field_skipped() {
+    // 'score' is a number — STRING_AGG skips it; result is empty string
+    let dir = tmp();
+    let store = build_collect_store(dir.path());
+    let results = store
+        .sql_aggregate("SELECT STRING_AGG(PAYLOAD_FIELD('score'), ',') FROM 'obs://team'")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].collected.as_ref().and_then(|v| v.as_str()),
+        Some("")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_string_agg_parse_error_missing_sep() {
+    let err =
+        SqlAggregateQuery::parse("SELECT STRING_AGG(PAYLOAD_FIELD('name')) FROM 'obs://team'");
+    assert!(err.is_err());
+}
+
+// ── ARRAY_LENGTH in sql_project ──────────────────────────────────────────────
+
+fn build_array_store(dir: &std::path::Path) -> bindb::BinderStore {
+    let store = bindb::BinderStore::open(dir).unwrap();
+    let mut tx = bindb::Transaction::new();
+    tx.put_object(
+        oid("obs://arr:one"),
+        br#"{"tags":["rust","perf","db"],"score":3}"#.to_vec(),
+    );
+    tx.put_object(
+        oid("obs://arr:two"),
+        br#"{"tags":["graph"],"score":1}"#.to_vec(),
+    );
+    tx.put_object(oid("obs://arr:three"), br#"{"tags":[],"score":0}"#.to_vec());
+    store.commit(tx, "test", "array_store").unwrap();
+    store
+}
+
+#[test]
+fn sql_project_array_length_basic() {
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    let mut rows = store
+        .sql_project("SELECT ARRAY_LENGTH(PAYLOAD_FIELD('tags')) AS tag_count FROM 'obs://arr'")
+        .unwrap();
+    rows.sort_by_key(|r| {
+        r.get("tag_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX)
+    });
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["tag_count"].as_u64(), Some(0));
+    assert_eq!(rows[1]["tag_count"].as_u64(), Some(1));
+    assert_eq!(rows[2]["tag_count"].as_u64(), Some(3));
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_project_array_length_non_array_passes_through() {
+    let dir = tmp();
+    let store = build_array_store(dir.path());
+    // 'score' is a number, not an array — ARRAY_LENGTH passes through unchanged
+    let rows = store
+        .sql_project("SELECT ARRAY_LENGTH(PAYLOAD_FIELD('score')) AS len FROM 'obs://arr'")
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        // score is a number — passes through (not an array)
+        let v = &row["len"];
+        assert!(v.is_number(), "expected number pass-through, got {v:?}");
+    }
+    store.close().unwrap();
+}

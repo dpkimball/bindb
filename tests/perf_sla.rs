@@ -65,9 +65,12 @@ const SQL_PROJECT_NTH_VALUE_1K_P99_MS_MAX: u64 = 100; // ms — NTH_VALUE window
 const GRAPH_IR_SCAN_1K_P99_MS_MAX: u64 = 10; // ms — scan MATCH at 1 K nodes with payload filter
 const SQL_PROJECT_UNION_1K_P99_MS_MAX: u64 = 100; // ms — UNION ALL of two 500-row branches
 
-// ── multi-start fan-out / COLLECT threshold constants ─────────────────────────
+// ── multi-start fan-out / COLLECT / STRING_AGG / array threshold constants ────
 const GRAPH_IR_MULTISTART_1K_P99_MS_MAX: u64 = 20; // ms — 2 hubs × 500 spokes each
 const SQL_COLLECT_1K_P99_MS_MAX: u64 = 50; // ms — COLLECT over 1 K observations
+const SQL_STRING_AGG_1K_P99_MS_MAX: u64 = 50; // ms — STRING_AGG over 1 K observations
+const GRAPH_IR_HAS_1K_P99_MS_MAX: u64 = 10; // ms — HAS predicate at 1 K nodes
+const GRAPH_IR_ARRAY_LENGTH_1K_P99_MS_MAX: u64 = 10; // ms — ARRAY_LENGTH at 1 K nodes
 
 // ── vector / ANN threshold constants ─────────────────────────────────────────
 const HNSW_RECALL_100K_PMIN: f64 = 90.0; // % — recall@10 at 100 K vectors (OKR O3/KR3.2)
@@ -1484,5 +1487,122 @@ fn sla_sql_collect_1k() {
         "sql COLLECT p99 {} ms > SLA maximum {} ms at 1 K observations",
         p99,
         SQL_COLLECT_1K_P99_MS_MAX,
+    );
+}
+
+// ── STRING_AGG SLA ────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_sql_string_agg_1k() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_arith_store_1k(&dir);
+    const N: usize = 50;
+    let mut timings = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let results = store
+            .sql_aggregate(
+                "SELECT STRING_AGG(PAYLOAD_FIELD('first'), ',') FROM 'obs://sla_arith' \
+                 GROUP BY PAYLOAD_FIELD('score')",
+            )
+            .unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        // score cycles 0..10 → 10 groups × 100 items each
+        assert_eq!(results.len(), 10);
+        assert!(results[0].collected.is_some());
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= SQL_STRING_AGG_1K_P99_MS_MAX,
+        "sql STRING_AGG p99 {} ms > SLA maximum {} ms at 1 K observations",
+        p99,
+        SQL_STRING_AGG_1K_P99_MS_MAX,
+    );
+}
+
+// ── HAS predicate SLA ─────────────────────────────────────────────────────────
+
+fn build_array_hub_1k(dir: &TempDir) -> (BinderStore, GraphIrQuery) {
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(ObjectId::new("ah://hub"), br#"{"name":"hub"}"#.to_vec());
+    for i in 0..1_000usize {
+        // half the nodes have tag "hot", the other half "cold"
+        let tag = if i % 2 == 0 { "hot" } else { "cold" };
+        let payload = format!(r#"{{"name":"n{i}","tags":["{tag}","common"]}}"#);
+        tx.put_object(
+            ObjectId::new(format!("ah://n{:04}", i)),
+            payload.into_bytes(),
+        );
+    }
+    store.commit_buffered(tx, "test", "").unwrap();
+    let mut tx2 = Transaction::new();
+    for i in 0..1_000usize {
+        tx2.put_edge(
+            EdgeId::new(format!("ah://e{i}")),
+            ObjectId::new("ah://hub"),
+            ObjectId::new(format!("ah://n{:04}", i)),
+            "LINKS",
+            None,
+        );
+    }
+    store.commit_buffered(tx2, "test", "").unwrap();
+    store.flush().unwrap();
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'ah://hub' AND b.tags HAS 'hot' RETURN b.name",
+    )
+    .unwrap();
+    (store, q)
+}
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_has_1k() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, q) = build_array_hub_1k(&dir);
+    const N: usize = 50;
+    let mut timings = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 500); // half the nodes have 'hot'
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_HAS_1K_P99_MS_MAX,
+        "graph_ir HAS p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_HAS_1K_P99_MS_MAX,
+    );
+}
+
+// ── ARRAY_LENGTH SLA ──────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "perf: cargo test --release -- --ignored --test-threads=1"]
+fn sla_graph_ir_array_length_1k() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = build_array_hub_1k(&dir);
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[:LINKS*1]->(b) WHERE id(a) = 'ah://hub' RETURN ARRAY_LENGTH(b.tags) AS tag_count",
+    )
+    .unwrap();
+    const N: usize = 50;
+    let mut timings = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let rows = store.graph_ir_projected(&q).unwrap();
+        timings.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), 1_000);
+        assert_eq!(rows[0].fields["tag_count"].as_u64(), Some(2));
+    }
+    let p99 = percentile(&mut timings, 99.0) / 1_000_000;
+    assert!(
+        p99 <= GRAPH_IR_ARRAY_LENGTH_1K_P99_MS_MAX,
+        "graph_ir ARRAY_LENGTH p99 {} ms > SLA maximum {} ms at 1 K nodes",
+        p99,
+        GRAPH_IR_ARRAY_LENGTH_1K_P99_MS_MAX,
     );
 }
