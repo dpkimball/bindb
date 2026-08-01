@@ -9884,7 +9884,7 @@ fn build_tagged_graph(store: &BinderStore) {
     // edges hub → spokes
     for target in &["node://rust", "node://graph", "node://perf", "node://empty"] {
         tx.put_edge(
-            EdgeId::new(&format!("e-{target}")),
+            EdgeId::new(format!("e-{target}")),
             obj("hub://root"),
             obj(target),
             "LINKS",
