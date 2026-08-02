@@ -33,7 +33,7 @@ pub struct JoinRow {
 }
 
 /// Aggregate function applied across each group of extracted values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Aggregate {
     /// Number of observations in each group.
     Count,
@@ -60,6 +60,13 @@ pub enum Aggregate {
     /// `STRING_AGG(PAYLOAD_FIELD('fieldname'), 'sep')` — result in `AggregateResult::collected`
     /// as a `Value::String`. Non-string field values are skipped.
     StringAgg { field: String, sep: String },
+    /// Count distinct non-null values of a named JSON payload field in each group.
+    /// `COUNT(DISTINCT PAYLOAD_FIELD('fieldname'))` — result in `AggregateResult::value`.
+    CountDistinct(String),
+    /// p-th percentile (p in 0.0–1.0) of a named JSON payload field's numeric values.
+    /// `PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('fieldname'))`.
+    /// Result in `AggregateResult::value`. Uses nearest-rank (disc) method.
+    PercentileDisc { p: f64, field: String },
 }
 
 /// A single row returned by an aggregation query.
@@ -156,6 +163,9 @@ pub(crate) fn run_aggregation(
     let mut counts: HashMap<Option<String>, usize> = HashMap::new();
     let mut collect_groups: HashMap<Option<String>, Vec<serde_json::Value>> = HashMap::new();
     let mut string_agg_groups: HashMap<Option<String>, Vec<String>> = HashMap::new();
+    let mut distinct_groups: HashMap<Option<String>, std::collections::HashSet<String>> =
+        HashMap::new();
+    let mut pdisc_groups: HashMap<Option<String>, Vec<f64>> = HashMap::new();
 
     let collect_field = if let Aggregate::Collect(ref f) = q.aggregate {
         Some(f.clone())
@@ -164,6 +174,16 @@ pub(crate) fn run_aggregation(
     };
     let string_agg_params = if let Aggregate::StringAgg { ref field, ref sep } = q.aggregate {
         Some((field.clone(), sep.clone()))
+    } else {
+        None
+    };
+    let count_distinct_field = if let Aggregate::CountDistinct(ref f) = q.aggregate {
+        Some(f.clone())
+    } else {
+        None
+    };
+    let percentile_disc_field = if let Aggregate::PercentileDisc { ref field, .. } = q.aggregate {
+        Some(field.clone())
     } else {
         None
     };
@@ -208,6 +228,33 @@ pub(crate) fn run_aggregation(
                 string_agg_groups.entry(key.clone()).or_default();
             }
             groups.entry(key).or_default();
+        } else if let Some(ref field) = count_distinct_field {
+            let val_str = v
+                .payload
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .and_then(|jv| jv.get(field.as_str()).cloned())
+                .map(|jv| jv.to_string());
+            if let Some(s) = val_str {
+                distinct_groups.entry(key.clone()).or_default().insert(s);
+            } else {
+                distinct_groups.entry(key.clone()).or_default();
+            }
+            groups.entry(key).or_default();
+        } else if let Some(ref field) = percentile_disc_field {
+            let val = v
+                .payload
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .and_then(|jv| jv.get(field.as_str()).and_then(|v| v.as_f64()));
+            if let Some(n) = val {
+                pdisc_groups.entry(key.clone()).or_default().push(n);
+            } else {
+                pdisc_groups.entry(key.clone()).or_default();
+            }
+            groups.entry(key).or_default();
         } else {
             let numeric = v
                 .payload
@@ -225,6 +272,8 @@ pub(crate) fn run_aggregation(
     let agg = q.aggregate;
     let is_collect = collect_field.is_some();
     let is_string_agg = string_agg_params.is_some();
+    let is_count_distinct = count_distinct_field.is_some();
+    let is_pdisc = percentile_disc_field.is_some();
     let string_agg_sep = string_agg_params.map(|(_, sep)| sep).unwrap_or_default();
     let mut results: Vec<AggregateResult> = groups
         .into_iter()
@@ -239,6 +288,18 @@ pub(crate) fn run_aggregation(
                     .unwrap_or_default()
                     .join(&string_agg_sep);
                 (0.0, Some(serde_json::Value::String(joined)))
+            } else if is_count_distinct {
+                let distinct_count = distinct_groups.remove(&key).map(|s| s.len()).unwrap_or(0);
+                (distinct_count as f64, None)
+            } else if is_pdisc {
+                let p = if let Aggregate::PercentileDisc { p, .. } = &agg {
+                    *p
+                } else {
+                    0.5
+                };
+                let mut vals = pdisc_groups.remove(&key).unwrap_or_default();
+                let v = percentile(&mut vals, p * 100.0);
+                (v, None)
             } else {
                 let v = match &agg {
                     Aggregate::Count => count as f64,
@@ -256,7 +317,10 @@ pub(crate) fn run_aggregation(
                     Aggregate::P99 => percentile(&mut values, 99.0),
                     Aggregate::Stddev => stddev_of(&values, false),
                     Aggregate::Variance => stddev_of(&values, true),
-                    Aggregate::Collect(_) | Aggregate::StringAgg { .. } => unreachable!(),
+                    Aggregate::Collect(_)
+                    | Aggregate::StringAgg { .. }
+                    | Aggregate::CountDistinct(_)
+                    | Aggregate::PercentileDisc { .. } => unreachable!(),
                 };
                 (v, None)
             };

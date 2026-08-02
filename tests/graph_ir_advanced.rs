@@ -1938,3 +1938,142 @@ fn agg_parse_case_insensitive() {
     assert!(result[0].get("vr").and_then(|v| v.as_f64()).is_some());
     store.close().unwrap();
 }
+
+// ── UNWIND tests (Feature 1) ─────────────────────────────────────────────────
+
+#[test]
+fn unwind_array_field_produces_one_row_per_element() {
+    let dir = tmp();
+    let store = build_arr_graph(dir.path());
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[r]->(b) WHERE id(a) = 'obs://arr:hub' UNWIND b.tags AS tag RETURN tag",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    // obs://arr:one → 3 rows ("rust","perf","db")
+    // obs://arr:two → 1 row ("graph")
+    // obs://arr:three → 0 rows (empty array)
+    assert_eq!(rows.len(), 4);
+    let tags: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|r| r.fields["tag"].as_str().unwrap().to_string())
+        .collect();
+    assert!(tags.contains("rust"));
+    assert!(tags.contains("perf"));
+    assert!(tags.contains("db"));
+    assert!(tags.contains("graph"));
+    store.close().unwrap();
+}
+
+#[test]
+fn unwind_empty_array_produces_zero_rows() {
+    let dir = tmp();
+    let store = build_arr_graph(dir.path());
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[r]->(b) WHERE id(a) = 'obs://arr:hub' AND b.score = 0 UNWIND b.tags AS tag RETURN tag",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    // Only obs://arr:three matches (score=0), has empty tags → 0 rows
+    assert_eq!(rows.len(), 0);
+    store.close().unwrap();
+}
+
+#[test]
+fn unwind_combined_with_other_return_fields() {
+    let dir = tmp();
+    let store = build_arr_graph(dir.path());
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[r]->(b) WHERE id(a) = 'obs://arr:hub' AND b.score = 1 UNWIND b.tags AS tag RETURN b.score, tag",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fields["tag"].as_str().unwrap(), "graph");
+    assert_eq!(rows[0].fields["score"].as_f64().unwrap(), 1.0);
+    store.close().unwrap();
+}
+
+#[test]
+fn unwind_non_array_field_produces_single_row_with_value() {
+    let dir = tmp();
+    let store = build_arr_graph(dir.path());
+    let q = GraphIrQuery::parse(
+        "MATCH (a)-[r]->(b) WHERE id(a) = 'obs://arr:hub' AND b.score = 1 UNWIND b.score AS val RETURN val",
+    )
+    .unwrap();
+    let rows = store.graph_ir_projected(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fields["val"].as_f64().unwrap(), 1.0);
+    store.close().unwrap();
+}
+
+// ── HAVING tests (Feature 2) ──────────────────────────────────────────────────
+
+#[test]
+fn with_aggregation_having_filters_groups() {
+    let dir = tmp();
+    let store = build_arr_graph(dir.path());
+    // 3 nodes match (score 3, 1, 0 from hub) — ungrouped count = 3
+    // HAVING cnt > 2 → 3 > 2 → passes
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[r]->(b) WHERE id(a) = 'obs://arr:hub' WITH count(b) AS cnt HAVING cnt > 2 RETURN cnt",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["cnt"].as_f64().unwrap(), 3.0);
+    store.close().unwrap();
+}
+
+#[test]
+fn with_aggregation_having_excludes_all_when_threshold_too_high() {
+    let dir = tmp();
+    let store = build_arr_graph(dir.path());
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[r]->(b) WHERE id(a) = 'obs://arr:hub' WITH count(b) AS cnt HAVING cnt > 10 RETURN cnt",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 0);
+    store.close().unwrap();
+}
+
+#[test]
+fn with_aggregation_having_lte() {
+    let dir = tmp();
+    let store = build_arr_graph(dir.path());
+    // count = 3; HAVING cnt <= 2 → 3 <= 2 → false → 0 rows
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[r]->(b) WHERE id(a) = 'obs://arr:hub' WITH count(b) AS cnt HAVING cnt <= 2 RETURN cnt",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 0);
+    store.close().unwrap();
+}
+
+#[test]
+fn with_aggregation_having_grouped() {
+    // Use build_grouped_graph: hub → 5 nodes across 3 categories
+    // animal: 2 nodes, plant: 2 nodes, other: 1 node
+    // WITH count(b) AS cnt GROUP BY b.type HAVING cnt >= 2
+    // → animal (2) and plant (2) survive; other (1) is filtered out
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_grouped_graph(&store);
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[r]->(b) WHERE id(a) = 'h://root' WITH count(b) AS cnt GROUP BY b.type HAVING cnt >= 2 RETURN b.type, cnt",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let types: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|r| r["type"].as_str().unwrap().to_string())
+        .collect();
+    assert!(types.contains("animal"));
+    assert!(types.contains("plant"));
+    assert!(!types.contains("other"));
+    store.close().unwrap();
+}

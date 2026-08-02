@@ -101,6 +101,9 @@ impl GraphIrQuery {
             if is_agg_func_start(after_with_kw) {
                 // Aggregating: WITH count(b) AS cnt [, …] [GROUP BY b.f1 [, b.f2 …]]
                 let (aggs, group_by_fields, after_aggs) = parse_with_aggregations(after_with_kw)?;
+                let after_aggs = after_aggs.trim_start();
+                // Optional HAVING clause on aggregation aliases
+                let (having, after_having) = parse_agg_having(after_aggs)?;
                 let wc = GraphIrWithClause {
                     end_pred: NodeIdPred::Any,
                     payload_preds: vec![],
@@ -110,8 +113,9 @@ impl GraphIrQuery {
                     aggregations: aggs,
                     group_by_fields,
                     distinct: false,
+                    having,
                 };
-                (Some(wc), after_aggs.trim_start())
+                (Some(wc), after_having.trim_start())
             } else {
                 // Pass-through: WITH [DISTINCT] b [WHERE …] [ORDER BY …] [SKIP n] [LIMIT n]
                 let (wc_distinct, after_with_kw) = if starts_with_keyword(after_with_kw, "DISTINCT")
@@ -139,6 +143,7 @@ impl GraphIrQuery {
                     aggregations: vec![],
                     group_by_fields: vec![],
                     distinct: wc_distinct,
+                    having: vec![],
                 };
                 (Some(wc), after_wc_ordering.trim_start())
             }
@@ -173,10 +178,50 @@ impl GraphIrQuery {
             (None, after_with)
         };
 
-        if !starts_with_keyword(after_preds3, "RETURN") {
+        // Optional UNWIND clause: UNWIND b.FIELD AS alias
+        let (unwind_spec, after_unwind) = if starts_with_keyword(after_preds3, "UNWIND") {
+            let after_kw = skip_keyword(after_preds3, "UNWIND").trim_start();
+            // expect `b.FIELDNAME`
+            let after_kw = if after_kw.starts_with("b.") || after_kw.starts_with("B.") {
+                &after_kw[2..]
+            } else {
+                return Err(GraphIrError::Unsupported(
+                    "UNWIND must reference b.field".into(),
+                ));
+            };
+            // read field name (alphanumeric + underscore)
+            let field_end = after_kw
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_kw.len());
+            if field_end == 0 {
+                return Err(GraphIrError::Unsupported(
+                    "UNWIND field name is empty".into(),
+                ));
+            }
+            let field = after_kw[..field_end].to_string();
+            let rest = after_kw[field_end..].trim_start();
+            // expect `AS alias`
+            if !starts_with_keyword(rest, "AS") {
+                return Err(GraphIrError::Unsupported("UNWIND expected AS alias".into()));
+            }
+            let rest = skip_keyword(rest, "AS").trim_start();
+            let alias_end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if alias_end == 0 {
+                return Err(GraphIrError::Unsupported("UNWIND alias is empty".into()));
+            }
+            let alias = rest[..alias_end].to_string();
+            let rest = rest[alias_end..].trim_start();
+            (Some(UnwindSpec { field, alias }), rest)
+        } else {
+            (None, after_preds3)
+        };
+
+        if !starts_with_keyword(after_unwind, "RETURN") {
             return Err(GraphIrError::Unsupported("expected RETURN".into()));
         }
-        let after_return = skip_keyword(after_preds3, "RETURN");
+        let after_return = skip_keyword(after_unwind, "RETURN");
         let (distinct, after_return) = if starts_with_keyword(after_return, "DISTINCT") {
             (true, skip_keyword(after_return, "DISTINCT"))
         } else {
@@ -231,6 +276,7 @@ impl GraphIrQuery {
             with_clause,
             path_var,
             return_computed,
+            unwind: unwind_spec,
         })
     }
 }
@@ -884,6 +930,60 @@ pub(super) fn is_agg_func_start(s: &str) -> bool {
         }
     }
     false
+}
+
+/// Parse zero or more `HAVING alias OP threshold` conditions.
+/// Returns `(Vec<AggHavingSpec>, remaining)`.
+fn parse_agg_having(s: &str) -> Result<(Vec<AggHavingSpec>, &str), GraphIrError> {
+    let mut specs = Vec::new();
+    let mut rest = s;
+    while starts_with_keyword(rest, "HAVING") {
+        let after_kw = skip_keyword(rest, "HAVING").trim_start();
+        // read alias name
+        let alias_end = after_kw
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after_kw.len());
+        if alias_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "HAVING alias name is empty".into(),
+            ));
+        }
+        let alias = after_kw[..alias_end].to_string();
+        let after_alias = after_kw[alias_end..].trim_start();
+        // parse operator: >=, <=, !=, >, <, =
+        let (op, after_op) = if let Some(r) = after_alias.strip_prefix(">=") {
+            (CmpOp::Gte, r)
+        } else if let Some(r) = after_alias.strip_prefix("<=") {
+            (CmpOp::Lte, r)
+        } else if let Some(r) = after_alias.strip_prefix("!=") {
+            (CmpOp::Ne, r)
+        } else if let Some(r) = after_alias.strip_prefix('>') {
+            (CmpOp::Gt, r)
+        } else if let Some(r) = after_alias.strip_prefix('<') {
+            (CmpOp::Lt, r)
+        } else if let Some(r) = after_alias.strip_prefix('=') {
+            (CmpOp::Eq, r)
+        } else {
+            return Err(GraphIrError::Unsupported(
+                "HAVING operator must be >, <, >=, <=, =, or !=".into(),
+            ));
+        };
+        let after_op = after_op.trim_start();
+        // parse threshold value
+        let num_end = after_op
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(after_op.len());
+        let threshold: f64 = after_op[..num_end]
+            .parse()
+            .map_err(|_| GraphIrError::Unsupported("HAVING threshold must be a number".into()))?;
+        specs.push(AggHavingSpec {
+            alias,
+            op,
+            threshold,
+        });
+        rest = after_op[num_end..].trim_start();
+    }
+    Ok((specs, rest))
 }
 
 /// Parse a comma-separated list of aggregation items plus an optional GROUP BY clause:

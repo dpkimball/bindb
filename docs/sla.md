@@ -285,6 +285,31 @@ must return results within a single UI round-trip budget.  90% recall ensures fe
 
 ---
 
+## graph-ir UNWIND and aggregation HAVING SLAs (issue #2)
+
+Applies when `UNWIND b.field AS item` expands array fields into rows, or when `HAVING`
+filters aggregation results. Scale is 1 K nodes, hub-and-spoke topology.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| `UNWIND b.field AS item` — array field expansion | 1 K nodes, depth 1 | ≤ 10 ms |
+| `WITH count(b) AS cnt HAVING cnt > n` — post-aggregation filter | 1 K nodes, depth 1 | ≤ 10 ms |
+
+---
+
+## sql COUNT(DISTINCT) / PERCENTILE_DISC aggregate SLAs (issue #5)
+
+Applies when `COUNT(DISTINCT PAYLOAD_FIELD('f'))` counts unique field values per group,
+or `PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('f'))` computes an arbitrary
+percentile of a JSON field's numeric values. Scale is 1 K observations.
+
+| Feature | Scale | p99 |
+|---------|-------|-----|
+| `COUNT(DISTINCT PAYLOAD_FIELD('f'))` | 1 K observations | ≤ 50 ms |
+| `PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('f'))` | 1 K observations | ≤ 50 ms |
+
+---
+
 ## Enforcement
 
 ### CI SLA gate (`perf` job)
