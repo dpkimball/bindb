@@ -342,9 +342,7 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
             SqlAggError::Unsupported("PERCENTILE_DISC: expected ')' after p value".into())
         })?;
         let p: f64 = after_open[..close].trim().parse().map_err(|_| {
-            SqlAggError::Unsupported(
-                "PERCENTILE_DISC: p must be a number between 0 and 1".into(),
-            )
+            SqlAggError::Unsupported("PERCENTILE_DISC: p must be a number between 0 and 1".into())
         })?;
         let rest = after_open[close + 1..].trim_start();
         // expect WITHIN
@@ -365,9 +363,12 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
                 "PERCENTILE_DISC: expected WITHIN GROUP".into(),
             ));
         };
-        let rest = rest.strip_prefix('(').ok_or_else(|| {
-            SqlAggError::Unsupported("PERCENTILE_DISC: expected '(' after GROUP".into())
-        })?.trim_start();
+        let rest = rest
+            .strip_prefix('(')
+            .ok_or_else(|| {
+                SqlAggError::Unsupported("PERCENTILE_DISC: expected '(' after GROUP".into())
+            })?
+            .trim_start();
         // expect ORDER BY
         let u_rest = rest.to_ascii_uppercase();
         let rest = if u_rest.starts_with("ORDER BY") {
@@ -398,11 +399,14 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
         };
         let (field, rest) = parse_quoted_sql(rest)?;
         let rest = rest.trim_start();
-        let rest = rest.strip_prefix(')').ok_or_else(|| {
-            SqlAggError::Unsupported(
-                "PERCENTILE_DISC: expected ')' closing PAYLOAD_FIELD".into(),
-            )
-        })?.trim_start();
+        let rest = rest
+            .strip_prefix(')')
+            .ok_or_else(|| {
+                SqlAggError::Unsupported(
+                    "PERCENTILE_DISC: expected ')' closing PAYLOAD_FIELD".into(),
+                )
+            })?
+            .trim_start();
         let rest = rest.strip_prefix(')').ok_or_else(|| {
             SqlAggError::Unsupported(
                 "PERCENTILE_DISC: expected ')' closing WITHIN GROUP (...)".into(),
@@ -416,9 +420,7 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
         let (field, rest) = parse_quoted_sql(after_pf)?;
         let rest = rest.trim_start();
         let rest = rest.strip_prefix(')').ok_or_else(|| {
-            SqlAggError::Unsupported(
-                "expected ')' after PAYLOAD_FIELD in COUNT(DISTINCT".into(),
-            )
+            SqlAggError::Unsupported("expected ')' after PAYLOAD_FIELD in COUNT(DISTINCT".into())
         })?;
         let rest = rest.trim_start();
         let rest = rest.strip_prefix(')').ok_or_else(|| {

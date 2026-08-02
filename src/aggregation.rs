@@ -289,8 +289,7 @@ pub(crate) fn run_aggregation(
                     .join(&string_agg_sep);
                 (0.0, Some(serde_json::Value::String(joined)))
             } else if is_count_distinct {
-                let distinct_count =
-                    distinct_groups.remove(&key).map(|s| s.len()).unwrap_or(0);
+                let distinct_count = distinct_groups.remove(&key).map(|s| s.len()).unwrap_or(0);
                 (distinct_count as f64, None)
             } else if is_pdisc {
                 let p = if let Aggregate::PercentileDisc { p, .. } = &agg {

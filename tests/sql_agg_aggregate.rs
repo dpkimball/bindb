@@ -451,9 +451,7 @@ fn sql_count_distinct_categories() {
     let store = BinderStore::open(dir.path()).unwrap();
     build_activity_store(&store);
     let results = store
-        .sql_aggregate(
-            "SELECT COUNT(DISTINCT PAYLOAD_FIELD('category')) FROM 'obs://activity'",
-        )
+        .sql_aggregate("SELECT COUNT(DISTINCT PAYLOAD_FIELD('category')) FROM 'obs://activity'")
         .unwrap();
     assert_eq!(results.len(), 1);
     // count_distinct stores string representation: "\"run\"", "\"bike\"", "\"swim\"" → 3 distinct
@@ -497,15 +495,10 @@ fn sql_count_distinct_single_observation() {
     let dir = tmp();
     let store = BinderStore::open(dir.path()).unwrap();
     let mut tx = bindb::Transaction::new();
-    tx.put_object(
-        oid("obs://single:x"),
-        br#"{"score":42}"#.to_vec(),
-    );
+    tx.put_object(oid("obs://single:x"), br#"{"score":42}"#.to_vec());
     store.commit(tx, "test", "seed").unwrap();
     let results = store
-        .sql_aggregate(
-            "SELECT COUNT(DISTINCT PAYLOAD_FIELD('score')) FROM 'obs://single'",
-        )
+        .sql_aggregate("SELECT COUNT(DISTINCT PAYLOAD_FIELD('score')) FROM 'obs://single'")
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].value as usize, 1);

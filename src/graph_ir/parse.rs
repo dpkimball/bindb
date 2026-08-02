@@ -194,7 +194,9 @@ impl GraphIrQuery {
                 .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .unwrap_or(after_kw.len());
             if field_end == 0 {
-                return Err(GraphIrError::Unsupported("UNWIND field name is empty".into()));
+                return Err(GraphIrError::Unsupported(
+                    "UNWIND field name is empty".into(),
+                ));
             }
             let field = after_kw[..field_end].to_string();
             let rest = after_kw[field_end..].trim_start();
@@ -942,7 +944,9 @@ fn parse_agg_having(s: &str) -> Result<(Vec<AggHavingSpec>, &str), GraphIrError>
             .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .unwrap_or(after_kw.len());
         if alias_end == 0 {
-            return Err(GraphIrError::Unsupported("HAVING alias name is empty".into()));
+            return Err(GraphIrError::Unsupported(
+                "HAVING alias name is empty".into(),
+            ));
         }
         let alias = after_kw[..alias_end].to_string();
         let after_alias = after_kw[alias_end..].trim_start();
@@ -972,7 +976,11 @@ fn parse_agg_having(s: &str) -> Result<(Vec<AggHavingSpec>, &str), GraphIrError>
         let threshold: f64 = after_op[..num_end]
             .parse()
             .map_err(|_| GraphIrError::Unsupported("HAVING threshold must be a number".into()))?;
-        specs.push(AggHavingSpec { alias, op, threshold });
+        specs.push(AggHavingSpec {
+            alias,
+            op,
+            threshold,
+        });
         rest = after_op[num_end..].trim_start();
     }
     Ok((specs, rest))

@@ -1263,14 +1263,12 @@ impl BinderStore {
                             .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
                             .and_then(|v| v.get(field.as_str()).cloned());
                         match arr {
-                            Some(serde_json::Value::Array(elems)) if !elems.is_empty() => {
-                                elems
-                                    .into_iter()
-                                    .map(|e| (m.clone(), Some(e)))
-                                    .collect::<Vec<_>>()
-                            }
+                            Some(serde_json::Value::Array(elems)) if !elems.is_empty() => elems
+                                .into_iter()
+                                .map(|e| (m.clone(), Some(e)))
+                                .collect::<Vec<_>>(),
                             Some(serde_json::Value::Array(_)) => vec![], // empty array → zero rows
-                            Some(other) => vec![(m, Some(other))], // non-array → single row
+                            Some(other) => vec![(m, Some(other))],       // non-array → single row
                             None => vec![(m, Some(serde_json::Value::Null))],
                         }
                     })
@@ -2057,10 +2055,7 @@ impl BinderStore {
         if !with_clause.having.is_empty() {
             result_rows.retain(|row| {
                 with_clause.having.iter().all(|h| {
-                    let lhs = row
-                        .get(&h.alias)
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
+                    let lhs = row.get(&h.alias).and_then(|v| v.as_f64()).unwrap_or(0.0);
                     match h.op {
                         CmpOp::Gt => lhs > h.threshold,
                         CmpOp::Lt => lhs < h.threshold,

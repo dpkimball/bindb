@@ -641,10 +641,7 @@ pub fn build_arr_graph(dir: &std::path::Path) -> BinderStore {
         obj("obs://arr:two"),
         br#"{"tags":["graph"],"score":1}"#.to_vec(),
     );
-    tx.put_object(
-        obj("obs://arr:three"),
-        br#"{"tags":[],"score":0}"#.to_vec(),
-    );
+    tx.put_object(obj("obs://arr:three"), br#"{"tags":[],"score":0}"#.to_vec());
     // Edges from hub
     tx.put_edge(
         eid("obs://arr:hub->one"),
