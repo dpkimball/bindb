@@ -337,6 +337,28 @@ pub struct WithAggregation {
     pub alias: String,
 }
 
+/// `UNWIND b.field AS alias` — expands a JSON array field into one row per element.
+/// Non-array values produce one row with a null element; empty arrays produce zero rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwindSpec {
+    /// Bare field name (after `b.`) containing the JSON array.
+    pub field: String,
+    /// Output alias for each expanded element.
+    pub alias: String,
+}
+
+/// A single HAVING condition on an aggregation alias in a WITH clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggHavingSpec {
+    /// The aggregation alias to compare (e.g. `"cnt"` in `HAVING cnt > 5`).
+    pub alias: String,
+    /// Comparison operator.  Only numeric variants (Gt/Lt/Gte/Lte/Eq/Ne) are
+    /// meaningful; others are accepted but will never match.
+    pub op: CmpOp,
+    /// Numeric threshold value.
+    pub threshold: f64,
+}
+
 /// The `WITH b` clause between a mandatory MATCH and a subsequent OPTIONAL MATCH
 /// or RETURN.
 ///
@@ -368,6 +390,9 @@ pub struct GraphIrWithClause {
     /// When true, duplicate `b` nodes (same `object_id`) are removed before
     /// ordering and paging.  Parsed from `WITH DISTINCT b …`.
     pub distinct: bool,
+    /// Post-aggregation filter conditions (`HAVING alias OP value`).
+    /// Only meaningful when `aggregations` is non-empty.
+    pub having: Vec<AggHavingSpec>,
 }
 
 /// One row returned by `graph_ir_projected`.
@@ -493,6 +518,8 @@ pub struct GraphIrQuery {
     /// Computed fields generated from arithmetic expressions, string concatenations,
     /// or searched CASE WHEN clauses in the RETURN clause.
     pub return_computed: Vec<ComputedReturnField>,
+    /// Optional UNWIND clause: expands `b.field` JSON array into individual rows.
+    pub unwind: Option<UnwindSpec>,
 }
 
 /// A `MATCH … RETURN … UNION [ALL] MATCH … RETURN …` query.

@@ -1247,10 +1247,42 @@ impl BinderStore {
             apply_order_limit_matches(&mut matches, q);
         }
 
-        let start = &q.start;
-        let mut rows: Vec<GraphIrRow> = Vec::with_capacity(matches.len());
+        // UNWIND expansion: expand each match into N rows (one per array element).
+        // Result: Vec<(GraphQueryMatch, Option<serde_json::Value>)>
+        let unwind_rows: Vec<(GraphQueryMatch, Option<serde_json::Value>)> =
+            if let Some(ref uw) = q.unwind {
+                let field = uw.field.clone();
+                matches
+                    .into_iter()
+                    .flat_map(|m| {
+                        let arr = m
+                            .object
+                            .payload
+                            .as_deref()
+                            .and_then(|b| std::str::from_utf8(b).ok())
+                            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                            .and_then(|v| v.get(field.as_str()).cloned());
+                        match arr {
+                            Some(serde_json::Value::Array(elems)) if !elems.is_empty() => {
+                                elems
+                                    .into_iter()
+                                    .map(|e| (m.clone(), Some(e)))
+                                    .collect::<Vec<_>>()
+                            }
+                            Some(serde_json::Value::Array(_)) => vec![], // empty array → zero rows
+                            Some(other) => vec![(m, Some(other))], // non-array → single row
+                            None => vec![(m, Some(serde_json::Value::Null))],
+                        }
+                    })
+                    .collect()
+            } else {
+                matches.into_iter().map(|m| (m, None)).collect()
+            };
 
-        for m in matches {
+        let start = &q.start;
+        let mut rows: Vec<GraphIrRow> = Vec::with_capacity(unwind_rows.len());
+
+        for (m, unwind_val) in unwind_rows {
             let payload = m.object.payload.as_deref();
             let mut b_fields = HashMap::new();
             if q.return_all_fields {
@@ -1311,6 +1343,11 @@ impl BinderStore {
             for cf in &q.return_computed {
                 let val = project_computed_field(payload, cf);
                 b_fields.insert(cf.alias.clone(), val);
+            }
+
+            // Insert UNWIND element into fields under its alias.
+            if let (Some(ref uw), Some(ref val)) = (&q.unwind, &unwind_val) {
+                b_fields.insert(uw.alias.clone(), val.clone());
             }
 
             let mut r_fields = HashMap::new();
@@ -1970,7 +2007,7 @@ impl BinderStore {
         }
         apply_with_clause_filter(&mut matches, with_clause);
 
-        if !with_clause.group_by_fields.is_empty() {
+        let mut result_rows = if !with_clause.group_by_fields.is_empty() {
             // Grouped: partition matches by the composite key of all GROUP BY fields,
             // preserving insertion order of unique key combinations.
             let fields = &with_clause.group_by_fields;
@@ -2006,14 +2043,37 @@ impl BinderStore {
                 }
                 rows.push(row);
             }
-            Ok(rows)
+            rows
         } else {
             // Ungrouped: single output row.
             let mut row = std::collections::HashMap::new();
             for agg in &with_clause.aggregations {
                 row.insert(agg.alias.clone(), compute_aggregation(&matches, agg));
             }
-            Ok(vec![row])
+            vec![row]
+        };
+
+        // Apply HAVING filter on aggregation result aliases.
+        if !with_clause.having.is_empty() {
+            result_rows.retain(|row| {
+                with_clause.having.iter().all(|h| {
+                    let lhs = row
+                        .get(&h.alias)
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    match h.op {
+                        CmpOp::Gt => lhs > h.threshold,
+                        CmpOp::Lt => lhs < h.threshold,
+                        CmpOp::Gte => lhs >= h.threshold,
+                        CmpOp::Lte => lhs <= h.threshold,
+                        CmpOp::Eq => (lhs - h.threshold).abs() < f64::EPSILON,
+                        CmpOp::Ne => (lhs - h.threshold).abs() >= f64::EPSILON,
+                        _ => false,
+                    }
+                })
+            });
         }
+
+        Ok(result_rows)
     }
 }

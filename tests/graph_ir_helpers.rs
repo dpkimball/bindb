@@ -627,6 +627,50 @@ pub fn build_multistart_store(dir: &std::path::Path) -> BinderStore {
     store
 }
 
+pub fn build_arr_graph(dir: &std::path::Path) -> BinderStore {
+    let store = BinderStore::open(dir).unwrap();
+    let mut tx = Transaction::new();
+    // Hub
+    tx.put_object(obj("obs://arr:hub"), b"{}".to_vec());
+    // Nodes with array tags
+    tx.put_object(
+        obj("obs://arr:one"),
+        br#"{"tags":["rust","perf","db"],"score":3}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("obs://arr:two"),
+        br#"{"tags":["graph"],"score":1}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("obs://arr:three"),
+        br#"{"tags":[],"score":0}"#.to_vec(),
+    );
+    // Edges from hub
+    tx.put_edge(
+        eid("obs://arr:hub->one"),
+        obj("obs://arr:hub"),
+        obj("obs://arr:one"),
+        "LINK",
+        None,
+    );
+    tx.put_edge(
+        eid("obs://arr:hub->two"),
+        obj("obs://arr:hub"),
+        obj("obs://arr:two"),
+        "LINK",
+        None,
+    );
+    tx.put_edge(
+        eid("obs://arr:hub->three"),
+        obj("obs://arr:hub"),
+        obj("obs://arr:three"),
+        "LINK",
+        None,
+    );
+    store.commit(tx, "test", "arr_graph").unwrap();
+    store
+}
+
 pub fn build_tagged_graph(store: &BinderStore) {
     let mut tx = Transaction::new();
     // hub

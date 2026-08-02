@@ -440,3 +440,146 @@ fn agg_offset_beyond_end_is_empty() {
     assert!(results.is_empty());
     store.close().unwrap();
 }
+
+// ── COUNT(DISTINCT PAYLOAD_FIELD('f')) tests (Feature 3) ──────────────────────
+
+#[test]
+fn sql_count_distinct_categories() {
+    // 3 distinct category values: run, bike, swim
+    // The no-category row (obs://activity:2024-01-05) contributes null — excluded from count.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_activity_store(&store);
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(DISTINCT PAYLOAD_FIELD('category')) FROM 'obs://activity'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    // count_distinct stores string representation: "\"run\"", "\"bike\"", "\"swim\"" → 3 distinct
+    assert_eq!(results[0].value as usize, 3);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_count_distinct_with_group_by() {
+    // When grouping by category, each group has its own distinct duration values.
+    // run: durations 30 and 45 → 2 distinct
+    // bike: duration 60 → 1 distinct
+    // swim: duration 25 → 1 distinct
+    // null (no category): duration 10 → 1 distinct
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_activity_store(&store);
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(DISTINCT PAYLOAD_FIELD('duration')) FROM 'obs://activity' GROUP BY PAYLOAD_FIELD('category')",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 4);
+    // Find the "run" group — json serialization wraps strings in quotes, so group key = "run"
+    let run_row = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some("run"))
+        .expect("run group");
+    assert_eq!(run_row.value as usize, 2); // 30 and 45 are distinct
+    let bike_row = results
+        .iter()
+        .find(|r| r.group_key.as_deref() == Some("bike"))
+        .expect("bike group");
+    assert_eq!(bike_row.value as usize, 1);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_count_distinct_single_observation() {
+    // One observation: count of distinct scores = 1.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = bindb::Transaction::new();
+    tx.put_object(
+        oid("obs://single:x"),
+        br#"{"score":42}"#.to_vec(),
+    );
+    store.commit(tx, "test", "seed").unwrap();
+    let results = store
+        .sql_aggregate(
+            "SELECT COUNT(DISTINCT PAYLOAD_FIELD('score')) FROM 'obs://single'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].value as usize, 1);
+    store.close().unwrap();
+}
+
+// ── PERCENTILE_DISC tests (Feature 4) ─────────────────────────────────────────
+
+#[test]
+fn sql_percentile_disc_median_matches_p50() {
+    let (store, _dir) = build_between_sql_store();
+    // Scores: [10, 20, 30, 40, 50] — median (p50) = 30
+    let results = store
+        .sql_aggregate(
+            "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('score')) FROM 'obs://scores'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].value as i64, 30);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_percentile_disc_p25() {
+    let (store, _dir) = build_between_sql_store();
+    // Scores: [10, 20, 30, 40, 50]; p=0.25, idx=round(0.25*4)=round(1.0)=1 → values[1]=20
+    let results = store
+        .sql_aggregate(
+            "SELECT PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('score')) FROM 'obs://scores'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].value as i64, 20);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_percentile_disc_p75() {
+    let (store, _dir) = build_between_sql_store();
+    // Scores: [10, 20, 30, 40, 50]; p=0.75, idx=round(0.75*4)=round(3.0)=3 → values[3]=40
+    let results = store
+        .sql_aggregate(
+            "SELECT PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('score')) FROM 'obs://scores'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].value as i64, 40);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_percentile_disc_p0_is_minimum() {
+    let (store, _dir) = build_between_sql_store();
+    // p=0.0 → index 0 → 10
+    let results = store
+        .sql_aggregate(
+            "SELECT PERCENTILE_DISC(0.0) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('score')) FROM 'obs://scores'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].value as i64, 10);
+    store.close().unwrap();
+}
+
+#[test]
+fn sql_percentile_disc_p1_is_maximum() {
+    let (store, _dir) = build_between_sql_store();
+    // p=1.0 → last element → 50
+    let results = store
+        .sql_aggregate(
+            "SELECT PERCENTILE_DISC(1.0) WITHIN GROUP (ORDER BY PAYLOAD_FIELD('score')) FROM 'obs://scores'",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].value as i64, 50);
+    store.close().unwrap();
+}
