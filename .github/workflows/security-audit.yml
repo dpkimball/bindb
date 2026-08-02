@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   security-audit:
-    uses: dpkimball/dpk-ci/.github/workflows/security-audit-dispatch.yml@fix/issue-211-ci-wait-orchestration-pool
+    uses: dpkimball/dpk-ci/.github/workflows/security-audit-dispatch.yml@master
     with:
       repository_name: bindb
       github_repository: dpkimball/bindb
