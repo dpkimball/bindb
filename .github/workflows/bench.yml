@@ -24,7 +24,7 @@ jobs:
   # posts (or updates) a PR comment via scripts/compare_perf.py.
   sla:
     name: SLA gate
-    runs-on: self-hosted
+    runs-on: product-ci
     timeout-minutes: 20
     permissions:
       contents: write      # fetch / push gh-pages baseline
@@ -158,7 +158,7 @@ jobs:
   # Baseline accumulates from pushes to master; PRs are compared against it.
   benchmark:
     name: Benchmark trends
-    runs-on: self-hosted
+    runs-on: product-ci
     timeout-minutes: 60
     permissions:
       contents: write
