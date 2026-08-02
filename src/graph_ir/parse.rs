@@ -867,7 +867,18 @@ fn parse_with_where(s: &str) -> Result<(NodeIdPred, Vec<PayloadPred>, &str), Gra
 /// Return true if `s` starts with a known aggregation function name followed by `(`.
 pub(super) fn is_agg_func_start(s: &str) -> bool {
     let s = s.trim_start();
-    for prefix in &["count(", "sum(", "avg(", "min(", "max(", "collect("] {
+    for prefix in &[
+        "count(",
+        "sum(",
+        "avg(",
+        "min(",
+        "max(",
+        "collect(",
+        "p50(",
+        "p99(",
+        "stddev(",
+        "variance(",
+    ] {
         if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
             return true;
         }
@@ -948,11 +959,19 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
         (AggFunc::Min, &s[4..])
     } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("max(") {
         (AggFunc::Max, &s[4..])
+    } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("p50(") {
+        (AggFunc::P50, &s[4..])
+    } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("p99(") {
+        (AggFunc::P99, &s[4..])
+    } else if s.len() >= 7 && s[..7].eq_ignore_ascii_case("stddev(") {
+        (AggFunc::Stddev, &s[7..])
+    } else if s.len() >= 9 && s[..9].eq_ignore_ascii_case("variance(") {
+        (AggFunc::Variance, &s[9..])
     } else if s.len() >= 8 && s[..8].eq_ignore_ascii_case("collect(") {
         (AggFunc::Collect, &s[8..])
     } else {
         return Err(GraphIrError::Unsupported(format!(
-            "expected aggregation function (count/sum/avg/min/max/collect) near: {}",
+            "expected aggregation function (count/sum/avg/min/max/p50/p99/stddev/variance/collect) near: {}",
             &s[..s.len().min(20)]
         )));
     };

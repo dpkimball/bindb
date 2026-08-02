@@ -49,6 +49,10 @@ pub enum Aggregate {
     P50,
     /// 99th-percentile of extracted values.
     P99,
+    /// Population standard deviation of extracted values.
+    Stddev,
+    /// Population variance of extracted values.
+    Variance,
     /// JSON array of a named payload field value from each observation in the group.
     /// `COLLECT(PAYLOAD_FIELD('fieldname'))` — result in `AggregateResult::collected`.
     Collect(String),
@@ -250,6 +254,8 @@ pub(crate) fn run_aggregation(
                     Aggregate::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                     Aggregate::P50 => percentile(&mut values, 50.0),
                     Aggregate::P99 => percentile(&mut values, 99.0),
+                    Aggregate::Stddev => stddev_of(&values, false),
+                    Aggregate::Variance => stddev_of(&values, true),
                     Aggregate::Collect(_) | Aggregate::StringAgg { .. } => unreachable!(),
                 };
                 (v, None)
@@ -265,6 +271,20 @@ pub(crate) fn run_aggregation(
 
     results.sort_by(|a, b| a.group_key.cmp(&b.group_key));
     results
+}
+
+fn stddev_of(values: &[f64], variance: bool) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    let var = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    if variance {
+        var
+    } else {
+        var.sqrt()
+    }
 }
 
 fn percentile(values: &mut [f64], p: f64) -> f64 {

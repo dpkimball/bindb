@@ -237,7 +237,9 @@ impl SqlAggregateQuery {
                     || su2.starts_with("MIN(")
                     || su2.starts_with("MAX(")
                     || su2.starts_with("P50(")
-                    || su2.starts_with("P99(");
+                    || su2.starts_with("P99(")
+                    || su2.starts_with("STDDEV(")
+                    || su2.starts_with("VARIANCE(");
                 if !is_having_expr {
                     break;
                 }
@@ -377,6 +379,8 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
         ("MAX(VALUE)", Aggregate::Max, true),
         ("P50(VALUE)", Aggregate::P50, true),
         ("P99(VALUE)", Aggregate::P99, true),
+        ("STDDEV(VALUE)", Aggregate::Stddev, true),
+        ("VARIANCE(VALUE)", Aggregate::Variance, true),
     ];
     for (pat, agg, needs) in patterns {
         if u.starts_with(pat) {
@@ -384,7 +388,7 @@ fn parse_aggregate(s: &str) -> Result<(Aggregate, bool, &str), SqlAggError> {
         }
     }
     Err(SqlAggError::Unsupported(
-        "aggregate must be COUNT(*), AVG/SUM/MIN/MAX/P50/P99(VALUE), COLLECT(PAYLOAD_FIELD('field')), or STRING_AGG(PAYLOAD_FIELD('field'), 'sep')".into(),
+        "aggregate must be COUNT(*), AVG/SUM/MIN/MAX/P50/P99/STDDEV/VARIANCE(VALUE), COLLECT(PAYLOAD_FIELD('field')), or STRING_AGG(PAYLOAD_FIELD('field'), 'sep')".into(),
     ))
 }
 
@@ -590,6 +594,8 @@ fn parse_having(s: &str) -> Result<(HavingClause, &str), SqlAggError> {
             ("MAX(VALUE)", true),
             ("P50(VALUE)", true),
             ("P99(VALUE)", true),
+            ("STDDEV(VALUE)", true),
+            ("VARIANCE(VALUE)", true),
         ];
         let mut found = None;
         for (pat, _) in agg_patterns {
@@ -782,6 +788,18 @@ fn parse_payload_filter(s: &str) -> Result<(SqlPayloadFilter, &str), SqlAggError
                 field,
                 op: SqlPayloadOp::In,
                 value: SqlPayloadValue::StrList(items),
+            },
+            rest2.trim_start(),
+        ));
+    } else if starts_with_keyword(after_close, "HAS") {
+        let after_has = skip_keyword(after_close, "HAS").trim_start();
+        let (elem, rest2) = parse_quoted(after_has)
+            .map_err(|_| SqlAggError::Unsupported("HAS requires a quoted element value".into()))?;
+        return Ok((
+            SqlPayloadFilter {
+                field,
+                op: SqlPayloadOp::HasElement,
+                value: SqlPayloadValue::Str(elem),
             },
             rest2.trim_start(),
         ));
@@ -987,6 +1005,23 @@ fn apply_payload_filter(filter: &SqlPayloadFilter, payload: Option<&[u8]>) -> bo
                 .and_then(|j| j.get(&filter.field))
                 .map(|f| !f.is_null())
                 .unwrap_or(false)
+        }
+        SqlPayloadOp::HasElement => {
+            let target = match &filter.value {
+                SqlPayloadValue::Str(s) => s.as_str(),
+                _ => return false,
+            };
+            let json = match get_json() {
+                Some(j) => j,
+                None => return false,
+            };
+            match json.get(&filter.field) {
+                Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| match v {
+                    serde_json::Value::String(s) => s.as_str() == target,
+                    _ => false,
+                }),
+                _ => false,
+            }
         }
         _ => {
             let json = match get_json() {
@@ -1319,6 +1354,8 @@ pub enum SqlPayloadOp {
     In,
     /// `NOT IN ('a', 'b', 'c')` — must not match any listed string value
     NotIn,
+    /// `HAS 'val'` — JSON array field contains the given string element
+    HasElement,
 }
 
 /// A value to compare against in a `WHERE PAYLOAD_FIELD` filter.
@@ -1443,6 +1480,9 @@ pub enum SqlFieldTransform {
     /// `ARRAY_LENGTH(PAYLOAD_FIELD('f'))` — number of elements in a JSON array field.
     /// Non-array values pass through unchanged.
     ArrayLength,
+    /// `PAYLOAD_FIELD('f')[n]` — nth element (0-based) of a JSON array field.
+    /// Out-of-bounds or non-array values produce `null`.
+    Index(usize),
     /// `CASE PAYLOAD_FIELD('f') WHEN 'v1' THEN 'out1' [WHEN …] [ELSE 'default'] END`
     /// — value-match conditional; returns first matching output or `else_val` (empty string if no ELSE).
     CaseWhen {
@@ -2736,7 +2776,24 @@ impl SqlProjectQuery {
                     s = after_outer.trim_start();
                 }
             }
-            if let Some(t) = transform {
+            // Optional `[n]` index access after PAYLOAD_FIELD('f') (no outer wrapper)
+            let effective_transform = if transform.is_none() && s.starts_with('[') {
+                let bracket_rest = &s[1..];
+                if let Some(close) = bracket_rest.find(']') {
+                    let idx_str = bracket_rest[..close].trim();
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        s = bracket_rest[close + 1..].trim_start();
+                        Some(SqlFieldTransform::Index(idx))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                transform
+            };
+            if let Some(t) = effective_transform {
                 field_transforms.insert(field.clone(), t);
             }
             // Optional `AS alias` after PAYLOAD_FIELD('f') or its wrapper
@@ -3704,6 +3761,13 @@ fn apply_sql_field_transform(val: serde_json::Value, t: &SqlFieldTransform) -> s
                 serde_json::Value::Number((arr.len() as u64).into())
             } else {
                 val
+            }
+        }
+        SqlFieldTransform::Index(idx) => {
+            if let serde_json::Value::Array(arr) = val {
+                arr.into_iter().nth(*idx).unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
             }
         }
         SqlFieldTransform::CaseWhen { branches, else_val } => {
