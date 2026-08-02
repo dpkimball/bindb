@@ -13,7 +13,10 @@ concurrency:
 
 jobs:
   test:
+    # Pin until dpk-ci #211 (product-ci / ci-wait pools) lands on master; then
+    # switch back to @master with runner: product-ci.
     uses: dpkimball/dpk-ci/.github/workflows/rust-library-ci.yml@master
     with:
       project_name: bindb
+      runner: product-ci
     secrets: inherit

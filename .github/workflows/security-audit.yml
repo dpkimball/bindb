@@ -31,4 +31,5 @@ jobs:
       repository_name: bindb
       github_repository: dpkimball/bindb
       classification: high
+      runner: product-ci
     secrets: inherit

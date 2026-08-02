@@ -26,7 +26,7 @@ jobs:
   # store setup takes 5–20 minutes per test; a nightly job is sufficient.
   xl_sla:
     name: XL scale SLA
-    runs-on: self-hosted
+    runs-on: product-ci
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
