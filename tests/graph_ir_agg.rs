@@ -662,9 +662,27 @@ fn string_agg_joins_field_values() {
     tx.put_object(obj("h://sa:a"), br#"{"name":"alice"}"#.to_vec());
     tx.put_object(obj("h://sa:b"), br#"{"name":"bob"}"#.to_vec());
     tx.put_object(obj("h://sa:c"), br#"{"name":"carol"}"#.to_vec());
-    tx.put_edge(eid("sa:e1"), obj("h://sa:root"), obj("h://sa:a"), "KNOWS", None);
-    tx.put_edge(eid("sa:e2"), obj("h://sa:root"), obj("h://sa:b"), "KNOWS", None);
-    tx.put_edge(eid("sa:e3"), obj("h://sa:root"), obj("h://sa:c"), "KNOWS", None);
+    tx.put_edge(
+        eid("sa:e1"),
+        obj("h://sa:root"),
+        obj("h://sa:a"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("sa:e2"),
+        obj("h://sa:root"),
+        obj("h://sa:b"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("sa:e3"),
+        obj("h://sa:root"),
+        obj("h://sa:c"),
+        "KNOWS",
+        None,
+    );
     store.commit(tx, "test", "").unwrap();
 
     let rows = store
@@ -690,9 +708,27 @@ fn string_agg_skips_null_fields() {
     tx.put_object(obj("h://san:a"), br#"{"name":"alice"}"#.to_vec());
     tx.put_object(obj("h://san:b"), b"{}".to_vec()); // no name field
     tx.put_object(obj("h://san:c"), br#"{"name":"carol"}"#.to_vec());
-    tx.put_edge(eid("san:e1"), obj("h://san:root"), obj("h://san:a"), "L", None);
-    tx.put_edge(eid("san:e2"), obj("h://san:root"), obj("h://san:b"), "L", None);
-    tx.put_edge(eid("san:e3"), obj("h://san:root"), obj("h://san:c"), "L", None);
+    tx.put_edge(
+        eid("san:e1"),
+        obj("h://san:root"),
+        obj("h://san:a"),
+        "L",
+        None,
+    );
+    tx.put_edge(
+        eid("san:e2"),
+        obj("h://san:root"),
+        obj("h://san:b"),
+        "L",
+        None,
+    );
+    tx.put_edge(
+        eid("san:e3"),
+        obj("h://san:root"),
+        obj("h://san:c"),
+        "L",
+        None,
+    );
     store.commit(tx, "test", "").unwrap();
 
     let rows = store

@@ -1107,9 +1107,9 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
             ));
         }
         let sep_rest = &after_comma[1..];
-        let sep_end = sep_rest
-            .find('\'')
-            .ok_or_else(|| GraphIrError::Unsupported("unclosed separator quote in string_agg".into()))?;
+        let sep_end = sep_rest.find('\'').ok_or_else(|| {
+            GraphIrError::Unsupported("unclosed separator quote in string_agg".into())
+        })?;
         let sep = sep_rest[..sep_end].to_string();
         let after_sep = sep_rest[sep_end + 1..].trim_start();
         if !after_sep.starts_with(')') {
