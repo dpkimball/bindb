@@ -3,5 +3,4 @@
 
 ## Test plan
 
-- [ ] `dpk-build` passes locally
-- [ ] `cargo test` — 0 failures
+- [ ] `make b` passes locally
