@@ -328,6 +328,8 @@ pub enum AggFunc {
     Collect,
     /// `count(distinct b.field)` — counts unique non-null values of a JSON field across matched nodes.
     CountDistinct,
+    /// `string_agg(b.field, 'sep')` — joins non-null field values into a single string, separated by `sep`.
+    StringAgg(String),
 }
 
 /// One aggregation item in a `WITH count(b) AS alias` clause.
