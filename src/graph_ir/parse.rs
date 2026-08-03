@@ -1050,7 +1050,13 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
     let s = s.trim_start();
     // Match function name + opening paren.
     let (func, after_paren) = if s.len() >= 6 && s[..6].eq_ignore_ascii_case("count(") {
-        (AggFunc::Count, &s[6..])
+        let rest = &s[6..];
+        let rest_t = rest.trim_start();
+        if rest_t.len() >= 9 && rest_t[..9].eq_ignore_ascii_case("distinct ") {
+            (AggFunc::CountDistinct, rest_t[9..].trim_start())
+        } else {
+            (AggFunc::Count, rest)
+        }
     } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("sum(") {
         (AggFunc::Sum, &s[4..])
     } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("avg(") {
@@ -1071,7 +1077,7 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
         (AggFunc::Collect, &s[8..])
     } else {
         return Err(GraphIrError::Unsupported(format!(
-            "expected aggregation function (count/sum/avg/min/max/p50/p99/stddev/variance/collect) near: {}",
+            "expected aggregation function (count/count(distinct/sum/avg/min/max/p50/p99/stddev/variance/collect) near: {}",
             &s[..s.len().min(20)]
         )));
     };
@@ -1106,14 +1112,14 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
     }
     let after_close = after_arg[1..].trim_start();
 
-    // Require field for sum/avg/min/max (collect accepts both b and b.field).
+    // Require field for sum/avg/min/max/count(distinct) (collect accepts both b and b.field).
     if matches!(
         func,
-        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
+        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max | AggFunc::CountDistinct
     ) && field.is_none()
     {
         return Err(GraphIrError::Unsupported(
-            "sum/avg/min/max require a field argument, e.g. sum(b.score)".into(),
+            "sum/avg/min/max/count(distinct) require a field argument, e.g. sum(b.score)".into(),
         ));
     }
 
@@ -2507,6 +2513,42 @@ impl GraphIrScanQuery {
             }
         }
 
+        // Optional UNWIND clause: UNWIND a.FIELD AS alias
+        let (unwind_spec, rest) = if starts_with_keyword(rest, "UNWIND") {
+            let after_kw = skip_keyword(rest, "UNWIND").trim_start();
+            if !after_kw.starts_with("a.") && !after_kw.starts_with("A.") {
+                return Err(GraphIrError::Unsupported(
+                    "UNWIND must reference a.field".into(),
+                ));
+            }
+            let after_dot = &after_kw[2..];
+            let field_end = after_dot
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_dot.len());
+            if field_end == 0 {
+                return Err(GraphIrError::Unsupported(
+                    "UNWIND field name is empty".into(),
+                ));
+            }
+            let field = after_dot[..field_end].to_string();
+            let after_field = after_dot[field_end..].trim_start();
+            if !starts_with_keyword(after_field, "AS") {
+                return Err(GraphIrError::Unsupported("UNWIND expected AS alias".into()));
+            }
+            let after_as = skip_keyword(after_field, "AS").trim_start();
+            let alias_end = after_as
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_as.len());
+            if alias_end == 0 {
+                return Err(GraphIrError::Unsupported("UNWIND alias is empty".into()));
+            }
+            let alias = after_as[..alias_end].to_string();
+            let after_alias = after_as[alias_end..].trim_start();
+            (Some(UnwindSpec { field, alias }), after_alias)
+        } else {
+            (None, rest)
+        };
+
         // RETURN
         if !starts_with_keyword(rest, "RETURN") {
             return Err(GraphIrError::Unsupported(
@@ -2553,6 +2595,7 @@ impl GraphIrScanQuery {
             limit,
             skip,
             return_computed,
+            unwind: unwind_spec,
         })
     }
 }
