@@ -332,31 +332,24 @@ documents.
 
 ## Where bindb does not win yet
 
-**No declarative query language.**  All queries are Rust API calls.  Complex graph
-patterns that Cypher expresses in a few lines require explicit BFS + application filtering
-in bindb.  A declarative query layer is on the roadmap.
+**No full-text search.**  There is no text index.  Callers must implement their own
+tokenization or use the vector index for semantic similarity.
 
-**No full-text search.**  Text indexing is a planned Phase 2 capability.  Today, callers
-must implement their own tokenization or use the vector index for semantic similarity.
-
-**Brute-force vector search.**  O(n) cosine similarity is correct and fast under 100 K
-vectors.  Beyond that, an ANN index (HNSW) is needed.  Planned for Phase 2.
-
-**WAL grows without compaction.**  The WAL is append-only and not compacted in V1.
-Long-lived stores accumulate unbounded WAL size.  Snapshot + trim compaction is planned
-for Phase 2.
+**ANN vector search has a floor.**  The vector index auto-switches from brute-force to
+HNSW at 1,000 vectors per model bucket.  Below that threshold, search is O(n).  There
+is no persistence for the HNSW graph — it is rebuilt in memory on each open.
 
 **Single-process only.**  One process holds the store at a time.  Multi-user concurrent
-access (e.g., a server with simultaneous client connections) requires a gRPC or HTTP layer
-in front of bindb.  This is the role of `dpk` as the Business Logic Layer.
+access requires a network layer (gRPC, HTTP) in front of bindb.
 
-**In-memory indexes.**  All indexes are held in RAM.  Stores that exceed available RAM
-are not yet supported.  Memory-mapped index structures are a future consideration.
+**Head index is capped, not unbounded.**  The live-object head cache holds up to 200,000
+entries by default; misses fall back to a mmap-backed version file (~1 µs read).
+Deployments with more than 200,000 distinct live objects pay a per-miss latency cost
+unless `open_with_head_cap` is used to raise or remove the cap.
 
-**Restricted SQL only.**  The built-in `sql_aggregate` and `sql_project` layers cover
-common GROUP BY aggregations and projections, but do not support joins, subqueries, or
-full SQL compatibility.  Non-Rust clients (dashboards, data scientists) requiring full SQL
-still need an external tool such as DuckDB.
+**Restricted SQL only.**  `sql_aggregate` and `sql_project` cover GROUP BY, window
+functions, and common aggregates over the in-memory observation store.  Joins,
+subqueries, and queries from non-Rust clients are not supported.
 
 ---
 
