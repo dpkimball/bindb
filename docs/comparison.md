@@ -75,7 +75,7 @@ It is the right choice for relational data with a stable schema.
 | Dimension | bindb | SQLite |
 |-----------|-------|--------|
 | Data model | Objects, edges, observations, vectors | Relational tables |
-| Query language | Rust API | SQL |
+| Query language | Rust API + graph-ir MATCH dialect + restricted SQL | SQL |
 | Graph traversal | BFS built-in | Recursive CTEs (workaround) |
 | Vector search | Cosine similarity built-in | Via sqlite-vss extension |
 | Version history | Every write versioned automatically | Manual audit tables |
@@ -125,8 +125,8 @@ workloads and increasingly popular as a local-first data science tool.
 writes.  Its columnar storage shines when scanning millions of rows with filters and
 aggregations — the opposite of bindb's workload of thousands of individual object commits
 per session.  Attempting to use DuckDB as an OLTP store (one `INSERT` per user action)
-produces poor performance; attempting to use bindb for ad-hoc analytical SQL is not
-possible today.
+produces poor performance; bindb's SQL layer covers application-scale analytics but not ad-hoc columnar queries
+over millions of rows.
 
 **The analytical gap:**  DuckDB's SQL engine handles millions of rows with vectorized
 columnar execution, JIT compilation, and native Parquet/S3 integration.  bindb's
@@ -166,7 +166,7 @@ MongoDB excels at flexible document storage at scale with a rich query language.
 | Version history | Every commit immutable, full history | Change streams (not queryable history) |
 | Point-in-time | `object_as_of(id, commit)` | Not available |
 | Provenance | Per-write provenance field | Not available |
-| Query language | Rust API | MQL / aggregation pipeline |
+| Query language | Rust API + graph-ir MATCH dialect + restricted SQL | MQL / aggregation pipeline |
 | Horizontal scaling | Single process | Sharding + replica sets |
 | Full-text search | Not available | Atlas Search / text indexes |
 
@@ -187,7 +187,7 @@ Neo4j is the leading native graph database with a first-class Cypher query langu
 | Deployment | Embedded library | Daemon (JVM) |
 | Memory footprint | Rust process memory only | JVM heap (typically 1–8 GB) |
 | Graph model | Directed edges with type + payload | Property graph (nodes + relationships) |
-| Graph query language | Rust API + BFS traversal | Cypher (expressive pattern matching) |
+| Graph query language | graph-ir MATCH dialect (BFS-backed) | Cypher (expressive pattern matching) |
 | Document storage | Objects with arbitrary byte payload | Node properties (limited types) |
 | Vector search | Built-in | Via vector index plugin |
 | Version history | Full WAL history on every write | Enterprise only (point-in-time recovery) |
@@ -195,10 +195,10 @@ Neo4j is the leading native graph database with a first-class Cypher query langu
 | Provenance | Built-in | Manual properties |
 | Horizontal scaling | Single process | Causal clustering (Enterprise) |
 
-**The Cypher gap:** Cypher pattern matching is significantly more expressive than bindb's
-BFS API.  Queries like "find all Memories connected to a Person within 3 hops where the
-edge type is RELATES_TO and the Memory has a sentiment score > 0.8" require application
-code in bindb today.  A declarative query layer is on the roadmap.
+**The Cypher gap:** bindb's graph-ir MATCH dialect covers depth-bounded BFS with payload
+predicates, projections, aggregations, UNION, OPTIONAL MATCH, and write operations
+(CREATE/MERGE/SET/DELETE).  Cypher is more expressive: subqueries, label patterns,
+variable-length path comprehension, and FOREACH are not supported.
 
 **Choose Neo4j when:** complex graph pattern matching is the primary use case, Cypher
 expertise exists on the team, or Enterprise features (clustering, point-in-time backup) are
@@ -217,9 +217,9 @@ Weaviate is a purpose-built vector database with semantic search as its primary 
 | Dimension | bindb | Weaviate |
 |-----------|-------|---------|
 | Deployment | Embedded library | Daemon (Docker / cloud) |
-| Vector search | Brute-force cosine | HNSW approximate nearest neighbor |
-| Search quality at scale | Exact (no approximation error) | Approximate (tunable recall) |
-| Search performance at scale | O(n) — degrades past ~100K vectors | O(log n) — scales to billions |
+| Vector search | HNSW (≥1K vectors/bucket); brute-force below threshold | HNSW approximate nearest neighbor |
+| Search quality at scale | Exact below threshold; approximate above | Approximate (tunable recall) |
+| Search performance at scale | O(log n) above 1K; O(n) below | O(log n) — scales to billions |
 | Object storage | Arbitrary byte payload | Schema-enforced properties |
 | Graph relationships | First-class edges + traversal | Cross-references (limited) |
 | Version history | Full WAL history | Not available |
@@ -227,10 +227,11 @@ Weaviate is a purpose-built vector database with semantic search as its primary 
 | Multi-modal | Objects + edges + observations | Objects + vectors |
 | Operational overhead | None | Significant |
 
-**The ANN gap:** bindb's vector search is brute-force cosine similarity — correct and
-simple, but O(n) in the number of indexed vectors.  At < 100 K vectors this is fast enough
-for most desktop applications (< 10 ms per query).  Beyond 100 K vectors, an ANN structure
-(HNSW, IVF) is needed.  This is a planned Phase 2 capability.
+**The scale gap:** bindb's vector index auto-switches to HNSW at 1,000 vectors per model
+bucket, so most desktop workloads get approximate nearest-neighbor performance.  The HNSW
+graph is not persisted — it is rebuilt in memory on each open.  At very large corpora
+(millions of vectors across many model buckets) Weaviate's purpose-built persistence and
+recall tuning are more appropriate.
 
 **Choose Weaviate when:** vector search is the dominant query pattern, the vector corpus
 exceeds 100 K entries, or approximate-but-fast search is acceptable.
@@ -251,7 +252,7 @@ ClickHouse is a columnar OLAP database optimized for time-series analytics at ma
 | Write model | Append-only WAL, one commit at a time | Columnar batch inserts |
 | Read model | In-memory row-oriented indexes | Column scans, vectorized execution |
 | Time-series | Observations stored as objects | MergeTree engine (purpose-built) |
-| Aggregations | Application-level only | SQL aggregations, window functions |
+| Aggregations | Restricted SQL (GROUP BY, window functions, common aggregates) | Full SQL aggregations, window functions |
 | Query speed on billions of rows | Not applicable (in-memory) | Sub-second |
 | Graph queries | First-class | Not available |
 | Version history | Full WAL history | Not available |
@@ -283,7 +284,7 @@ all-in-one alternative.
 | Point-in-time | `object_as_of(id, commit)` | Not available |
 | Provenance | Per-write provenance field | Manual columns |
 | Schema | Schema-free | Strict typing |
-| SQL | No | Yes — full SQL + extensions |
+| SQL | Restricted SQL dialect (no joins, no subqueries) | Yes — full SQL + extensions |
 | Multi-process | No | Yes |
 | Horizontal scaling | No | Via Citus / read replicas |
 | Zero ops | Yes | No |
