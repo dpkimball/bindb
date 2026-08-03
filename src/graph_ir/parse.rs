@@ -924,6 +924,7 @@ pub(super) fn is_agg_func_start(s: &str) -> bool {
         "p99(",
         "stddev(",
         "variance(",
+        "string_agg(",
     ] {
         if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
             return true;
@@ -1075,9 +1076,74 @@ fn parse_one_aggregation(s: &str) -> Result<(WithAggregation, &str), GraphIrErro
         (AggFunc::Variance, &s[9..])
     } else if s.len() >= 8 && s[..8].eq_ignore_ascii_case("collect(") {
         (AggFunc::Collect, &s[8..])
+    } else if s.len() >= 11 && s[..11].eq_ignore_ascii_case("string_agg(") {
+        // string_agg(b.field, 'sep') AS alias — parse entirely here and early-return.
+        let rest = s[11..].trim_start();
+        if !rest.starts_with("b.") && !rest.starts_with("B.") {
+            return Err(GraphIrError::Unsupported(
+                "string_agg requires b.field argument".into(),
+            ));
+        }
+        let after_dot = &rest[2..];
+        let field_end = after_dot
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after_dot.len());
+        if field_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "expected field name after b. in string_agg".into(),
+            ));
+        }
+        let field = after_dot[..field_end].to_string();
+        let after_field = after_dot[field_end..].trim_start();
+        if !after_field.starts_with(',') {
+            return Err(GraphIrError::Unsupported(
+                "string_agg requires a separator: string_agg(b.field, 'sep')".into(),
+            ));
+        }
+        let after_comma = after_field[1..].trim_start();
+        if !after_comma.starts_with('\'') {
+            return Err(GraphIrError::Unsupported(
+                "string_agg separator must be a single-quoted string".into(),
+            ));
+        }
+        let sep_rest = &after_comma[1..];
+        let sep_end = sep_rest.find('\'').ok_or_else(|| {
+            GraphIrError::Unsupported("unclosed separator quote in string_agg".into())
+        })?;
+        let sep = sep_rest[..sep_end].to_string();
+        let after_sep = sep_rest[sep_end + 1..].trim_start();
+        if !after_sep.starts_with(')') {
+            return Err(GraphIrError::Unsupported(
+                "expected ')' closing string_agg(...)".into(),
+            ));
+        }
+        let after_close = after_sep[1..].trim_start();
+        if !starts_with_keyword(after_close, "AS") {
+            return Err(GraphIrError::Unsupported(
+                "expected AS after string_agg(...)".into(),
+            ));
+        }
+        let after_as = skip_keyword(after_close, "AS").trim_start();
+        let alias_end = after_as
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after_as.len());
+        if alias_end == 0 {
+            return Err(GraphIrError::Unsupported(
+                "expected alias after AS in string_agg".into(),
+            ));
+        }
+        let alias = after_as[..alias_end].to_string();
+        return Ok((
+            WithAggregation {
+                func: AggFunc::StringAgg(sep),
+                field: Some(field),
+                alias,
+            },
+            &after_as[alias_end..],
+        ));
     } else {
         return Err(GraphIrError::Unsupported(format!(
-            "expected aggregation function (count/count(distinct/sum/avg/min/max/p50/p99/stddev/variance/collect) near: {}",
+            "expected aggregation function (count/count(distinct)/sum/avg/min/max/p50/p99/stddev/variance/collect/string_agg) near: {}",
             &s[..s.len().min(20)]
         )));
     };

@@ -1881,6 +1881,25 @@ fn compute_aggregation(matches: &[GraphQueryMatch], agg: &WithAggregation) -> se
             }
             serde_json::Value::Number(serde_json::Number::from(seen.len() as u64))
         }
+        AggFunc::StringAgg(sep) => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let parts: Vec<String> = matches
+                .iter()
+                .filter_map(|m| {
+                    let bytes = m.object.payload.as_deref().unwrap_or(b"");
+                    let text = std::str::from_utf8(bytes).unwrap_or("");
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| v.get(field).cloned())
+                        .filter(|v| !v.is_null())
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s,
+                            other => other.to_string(),
+                        })
+                })
+                .collect();
+            serde_json::Value::String(parts.join(sep.as_str()))
+        }
     }
 }
 
@@ -2044,6 +2063,25 @@ fn compute_aggregation_slice(
                 }
             }
             serde_json::Value::Number(serde_json::Number::from(seen.len() as u64))
+        }
+        AggFunc::StringAgg(sep) => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let parts: Vec<String> = group
+                .iter()
+                .filter_map(|m| {
+                    let bytes = m.object.payload.as_deref().unwrap_or(b"");
+                    let text = std::str::from_utf8(bytes).unwrap_or("");
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| v.get(field).cloned())
+                        .filter(|v| !v.is_null())
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s,
+                            other => other.to_string(),
+                        })
+                })
+                .collect();
+            serde_json::Value::String(parts.join(sep.as_str()))
         }
     }
 }

@@ -650,3 +650,145 @@ fn agg_multikey_both_fields_null_group() {
         .unwrap_or(false));
     store.close().unwrap();
 }
+
+// ── STRING_AGG ────────────────────────────────────────────────────────────────
+
+#[test]
+fn string_agg_joins_field_values() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("h://sa:root"), b"{}".to_vec());
+    tx.put_object(obj("h://sa:a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("h://sa:b"), br#"{"name":"bob"}"#.to_vec());
+    tx.put_object(obj("h://sa:c"), br#"{"name":"carol"}"#.to_vec());
+    tx.put_edge(
+        eid("sa:e1"),
+        obj("h://sa:root"),
+        obj("h://sa:a"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("sa:e2"),
+        obj("h://sa:root"),
+        obj("h://sa:b"),
+        "KNOWS",
+        None,
+    );
+    tx.put_edge(
+        eid("sa:e3"),
+        obj("h://sa:root"),
+        obj("h://sa:c"),
+        "KNOWS",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:KNOWS*1..1]->(b) WHERE id(a) = 'h://sa:root' \
+             WITH string_agg(b.name, ', ') AS names RETURN names",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let names = rows[0].get("names").and_then(|v| v.as_str()).unwrap();
+    let mut parts: Vec<&str> = names.split(", ").collect();
+    parts.sort();
+    assert_eq!(parts, vec!["alice", "bob", "carol"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn string_agg_skips_null_fields() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("h://san:root"), b"{}".to_vec());
+    tx.put_object(obj("h://san:a"), br#"{"name":"alice"}"#.to_vec());
+    tx.put_object(obj("h://san:b"), b"{}".to_vec()); // no name field
+    tx.put_object(obj("h://san:c"), br#"{"name":"carol"}"#.to_vec());
+    tx.put_edge(
+        eid("san:e1"),
+        obj("h://san:root"),
+        obj("h://san:a"),
+        "L",
+        None,
+    );
+    tx.put_edge(
+        eid("san:e2"),
+        obj("h://san:root"),
+        obj("h://san:b"),
+        "L",
+        None,
+    );
+    tx.put_edge(
+        eid("san:e3"),
+        obj("h://san:root"),
+        obj("h://san:c"),
+        "L",
+        None,
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:L*1..1]->(b) WHERE id(a) = 'h://san:root' \
+             WITH string_agg(b.name, '|') AS names RETURN names",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let names = rows[0].get("names").and_then(|v| v.as_str()).unwrap();
+    let mut parts: Vec<&str> = names.split('|').collect();
+    parts.sort();
+    assert_eq!(parts, vec!["alice", "carol"]);
+    store.close().unwrap();
+}
+
+#[test]
+fn string_agg_with_group_by() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_grouped_graph(&store);
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[:LINKS*1..1]->(b) WHERE id(a) = 'h://root' \
+             WITH string_agg(b.type, ',') AS types GROUP BY b.type \
+             RETURN b.type, types",
+        )
+        .unwrap();
+    // Each group's string_agg should just be the type value repeated once per member,
+    // but since all members in a group share the same type, count by group size.
+    assert_eq!(rows.len(), 3); // animal, plant, other
+    for row in &rows {
+        let group_type = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let types_str = row.get("types").and_then(|v| v.as_str()).unwrap_or("");
+        let count = types_str.split(',').count();
+        match group_type {
+            "animal" => assert_eq!(count, 2),
+            "plant" => assert_eq!(count, 2),
+            "other" => assert_eq!(count, 1),
+            _ => panic!("unexpected group: {group_type}"),
+        }
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn string_agg_parse_error_missing_sep() {
+    let result = GraphIrQuery::parse(
+        "MATCH (a)-[:L]->(b) WHERE id(a) = 'x' \
+         WITH string_agg(b.name) AS s RETURN s",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn string_agg_parse_error_bare_b() {
+    let result = GraphIrQuery::parse(
+        "MATCH (a)-[:L]->(b) WHERE id(a) = 'x' \
+         WITH string_agg(b, ',') AS s RETURN s",
+    );
+    assert!(result.is_err());
+}
