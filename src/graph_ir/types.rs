@@ -326,6 +326,8 @@ pub enum AggFunc {
     Variance,
     /// `collect(b)` / `collect(b.field)` — builds a JSON array of node IDs or field values.
     Collect,
+    /// `count(distinct b.field)` — counts unique non-null values of a JSON field across matched nodes.
+    CountDistinct,
 }
 
 /// One aggregation item in a `WITH count(b) AS alias` clause.
@@ -571,6 +573,8 @@ pub struct GraphIrScanQuery {
     pub limit: Option<usize>,
     pub skip: Option<usize>,
     pub return_computed: Vec<ComputedReturnField>,
+    /// Optional UNWIND clause: expands `a.field` JSON array into individual rows.
+    pub unwind: Option<UnwindSpec>,
 }
 
 /// A multi-hop chained MATCH query where each step's matched end node becomes the

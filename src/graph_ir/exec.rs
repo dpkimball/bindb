@@ -1074,6 +1074,24 @@ impl BinderStore {
                 fields.insert(cf.alias.clone(), val);
             }
 
+            // If UNWIND is set, ensure the source field is extracted even if not in return_fields.
+            if let Some(ref uw) = q.unwind {
+                if !q.return_all_fields
+                    && !q.return_fields.contains(&uw.field)
+                    && !fields.contains_key(&uw.field)
+                {
+                    if let Some(bytes) = payload {
+                        if let Ok(text) = std::str::from_utf8(bytes) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                                if let Some(val) = v.get(&uw.field).cloned() {
+                                    fields.insert(uw.field.clone(), val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             rows.push(GraphIrRow {
                 object_id: obj.object_id,
                 depth: 0,
@@ -1084,6 +1102,49 @@ impl BinderStore {
                 optional: None,
             });
         }
+
+        // UNWIND expansion: expand each row into N rows (one per array element).
+        let mut rows = if let Some(ref uw) = q.unwind {
+            let alias = uw.alias.clone();
+            let field = uw.field.clone();
+            rows.into_iter()
+                .flat_map(|mut row| {
+                    let arr_val = row.fields.remove(&field);
+                    match arr_val {
+                        Some(serde_json::Value::Array(elems)) if !elems.is_empty() => {
+                            let base_fields = row.fields.clone();
+                            elems
+                                .into_iter()
+                                .map(|e| {
+                                    let mut f = base_fields.clone();
+                                    f.insert(alias.clone(), e);
+                                    GraphIrRow {
+                                        object_id: row.object_id.clone(),
+                                        depth: 0,
+                                        fields: f,
+                                        edge_fields: HashMap::new(),
+                                        path: vec![],
+                                        edge_path: vec![],
+                                        optional: None,
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                        Some(serde_json::Value::Array(_)) => vec![], // empty array → zero rows
+                        Some(other) => {
+                            row.fields.insert(alias.clone(), other);
+                            vec![row]
+                        }
+                        None => {
+                            row.fields.insert(alias.clone(), serde_json::Value::Null);
+                            vec![row]
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            rows
+        };
 
         // DISTINCT
         if q.distinct {
@@ -1802,6 +1863,24 @@ fn compute_aggregation(matches: &[GraphQueryMatch], agg: &WithAggregation) -> se
             };
             serde_json::Value::Array(vals)
         }
+        AggFunc::CountDistinct => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let mut seen = std::collections::HashSet::new();
+            for m in matches {
+                if let Some(val) = {
+                    let bytes = m.object.payload.as_deref().unwrap_or(b"");
+                    let text = std::str::from_utf8(bytes).unwrap_or("");
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| v.get(field).cloned())
+                        .filter(|v| !v.is_null())
+                        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                } {
+                    seen.insert(val);
+                }
+            }
+            serde_json::Value::Number(serde_json::Number::from(seen.len() as u64))
+        }
     }
 }
 
@@ -1947,6 +2026,24 @@ fn compute_aggregation_slice(
                     .collect()
             };
             serde_json::Value::Array(vals)
+        }
+        AggFunc::CountDistinct => {
+            let field = agg.field.as_deref().unwrap_or("");
+            let mut seen = std::collections::HashSet::new();
+            for m in group {
+                if let Some(val) = {
+                    let bytes = m.object.payload.as_deref().unwrap_or(b"");
+                    let text = std::str::from_utf8(bytes).unwrap_or("");
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| v.get(field).cloned())
+                        .filter(|v| !v.is_null())
+                        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                } {
+                    seen.insert(val);
+                }
+            }
+            serde_json::Value::Number(serde_json::Number::from(seen.len() as u64))
         }
     }
 }

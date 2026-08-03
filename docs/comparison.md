@@ -50,13 +50,13 @@ bindb replaces this architecture with one embedded engine.
 | **Graph relationships** | ✅ | ❌ | ❌ | ❌ | ✅ | ⚠️ | ❌ | ❌ |
 | **Vector / semantic search** | ✅ | ❌ | ⚠️ | ❌ | ❌ | ✅ | ❌ | ⚠️ |
 | **Time-series / observations** | ✅ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ⚠️ |
-| **Analytical aggregations** | ❌ | ⚠️ | ✅ | ⚠️ | ❌ | ❌ | ✅ | ✅ |
+| **Analytical aggregations** | ⚠️ | ⚠️ | ✅ | ⚠️ | ❌ | ❌ | ✅ | ✅ |
 | **Full version history** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Point-in-time queries** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ | ❌ |
 | **Provenance on every write** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **WAL-first durability** | ✅ | ✅ | ⚠️ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
 | **ACID transactions** | ⚠️ | ✅ | ✅ | ✅ | ✅ | ❌ | ⚠️ | ✅ |
-| **SQL query language** | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **SQL query language** | ⚠️ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | **Full-text search** | ❌ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | **Schema enforcement** | ❌ | ⚠️ | ✅ | ❌ | ⚠️ | ✅ | ✅ | ✅ |
 | **Horizontal scaling** | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -108,7 +108,7 @@ workloads and increasingly popular as a local-first data science tool.
 | Storage model | Append-only WAL (row-oriented) | Columnar (PAX layout) |
 | Write throughput | ~120 durable commits/sec; ~5 K+ buffered/sec | Excellent for bulk inserts; slow for single-row OLTP |
 | Analytical read throughput | Not applicable (in-memory row indexes) | Sub-second over millions of rows via vectorized execution |
-| Query language | Rust API | SQL (highly compatible with PostgreSQL dialect) |
+| Query language | Rust API + restricted SQL dialect | SQL (fully PostgreSQL-compatible) |
 | Graph relationships | First-class BFS traversal | Not available |
 | Vector / semantic search | Cosine similarity built-in | Array distance functions (not ANN) |
 | Time-series / observations | Typed observation model | Via SQL window functions |
@@ -128,25 +128,18 @@ per session.  Attempting to use DuckDB as an OLTP store (one `INSERT` per user a
 produces poor performance; attempting to use bindb for ad-hoc analytical SQL is not
 possible today.
 
-**The analytical gap:**  DuckDB's SQL engine can answer questions like "what is the
-average sleep duration per month for the last 2 years, grouped by weekday" in milliseconds
-over millions of rows.  bindb has no aggregation layer — this query requires reading all
-observations into application memory and computing the result in Rust.  A SQL projection
-layer over bindb's WAL is on the long-term roadmap.
+**The analytical gap:**  DuckDB's SQL engine handles millions of rows with vectorized
+columnar execution, JIT compilation, and native Parquet/S3 integration.  bindb's
+`sql_aggregate` and `sql_project` layers cover GROUP BY, window functions, and common
+aggregates (COUNT/SUM/AVG/P50/P99/STDDEV) over the in-memory observation store — sufficient
+for application-scale analytics.  At data-science scale (tens of millions of rows, external
+data joins, pandas integration) DuckDB remains the better tool.
 
-**Complementary, not competing:**  bindb and DuckDB serve different phases of a data
-pipeline.  bindb is the live operational store — every user action commits to it with full
-provenance and version history.  DuckDB is a natural fit as an analytical projection layer
-— periodically export bindb's observation history to Parquet, query it with DuckDB SQL
-for dashboards and reports.
-
-```
-bindb (live store)  →  export observations as Parquet  →  DuckDB (analytics)
-       │                                                          │
-  semantic queries                                        SQL aggregations
-  graph traversal                                         window functions
-  version history                                         external data joins
-```
+**Complementary, not competing:**  bindb and DuckDB serve different workloads.  bindb is
+the live operational store — every user action commits with full provenance and version
+history, and application-scale analytical queries run via the built-in SQL dialect.
+DuckDB excels as a data-science projection layer when the workload grows to millions of
+rows, requires external data sources, or needs pandas/polars integration.
 
 **Choose DuckDB when:** the workload is primarily analytical (aggregations, window
 functions, large scans), SQL is required, external data sources (Parquet, CSV, S3) need
@@ -360,8 +353,10 @@ in front of bindb.  This is the role of `dpk` as the Business Logic Layer.
 **In-memory indexes.**  All indexes are held in RAM.  Stores that exceed available RAM
 are not yet supported.  Memory-mapped index structures are a future consideration.
 
-**No SQL.**  Applications that need ad-hoc analytical queries from non-Rust clients
-(dashboards, data scientists, ops tooling) cannot query bindb directly today.
+**Restricted SQL only.**  The built-in `sql_aggregate` and `sql_project` layers cover
+common GROUP BY aggregations and projections, but do not support joins, subqueries, or
+full SQL compatibility.  Non-Rust clients (dashboards, data scientists) requiring full SQL
+still need an external tool such as DuckDB.
 
 ---
 
@@ -377,10 +372,6 @@ Need ANN vector search at > 100 K vectors?                 → Weaviate
 Need unified objects + graph + vectors + observations
   in a single embedded store, with full version history
   and provenance, for a desktop or single-tenant app?      → bindb
-
-Running live operational writes in bindb AND need
-  analytical SQL over the historical record?               → bindb + DuckDB
-                                                             (export WAL → Parquet → query)
 ```
 
 bindb is the right choice when the application's **primary complexity is in the data

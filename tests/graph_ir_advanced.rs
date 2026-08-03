@@ -2077,3 +2077,166 @@ fn with_aggregation_having_grouped() {
     assert!(!types.contains("other"));
     store.close().unwrap();
 }
+
+// ── COUNT(DISTINCT …) aggregation ────────────────────────────────────────────
+
+#[test]
+fn count_distinct_field_values() {
+    // hub → 5 nodes: 3 with type="animal", 2 with type="plant"
+    // COUNT(DISTINCT b.type) should return 2.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("cd://hub"), b"{}".to_vec());
+    tx.put_object(obj("cd://n1"), br#"{"type":"animal"}"#.to_vec());
+    tx.put_object(obj("cd://n2"), br#"{"type":"animal"}"#.to_vec());
+    tx.put_object(obj("cd://n3"), br#"{"type":"animal"}"#.to_vec());
+    tx.put_object(obj("cd://n4"), br#"{"type":"plant"}"#.to_vec());
+    tx.put_object(obj("cd://n5"), br#"{"type":"plant"}"#.to_vec());
+    tx.put_edge(eid("cd:e1"), obj("cd://hub"), obj("cd://n1"), "HAS", None);
+    tx.put_edge(eid("cd:e2"), obj("cd://hub"), obj("cd://n2"), "HAS", None);
+    tx.put_edge(eid("cd:e3"), obj("cd://hub"), obj("cd://n3"), "HAS", None);
+    tx.put_edge(eid("cd:e4"), obj("cd://hub"), obj("cd://n4"), "HAS", None);
+    tx.put_edge(eid("cd:e5"), obj("cd://hub"), obj("cd://n5"), "HAS", None);
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[r]->(b) WHERE id(a) = 'cd://hub' \
+             WITH count(distinct b.type) AS dc RETURN dc",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["dc"].as_u64(), Some(2));
+    store.close().unwrap();
+}
+
+#[test]
+fn count_distinct_with_group_by() {
+    // build_multikey_graph: hub → 6 nodes
+    //   animal: cat (active), dog (active), wolf (retired) → 2 distinct statuses
+    //   plant:  rose (active), fern (retired)              → 2 distinct statuses
+    //   null:   rock (active)                              → 1 distinct status
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    build_multikey_graph(&store);
+
+    let rows = store
+        .graph_ir_aggregated(
+            "MATCH (a)-[r]->(b) WHERE id(a) = 'h://mk_root' \
+             WITH count(distinct b.status) AS dc GROUP BY b.type RETURN b.type, dc",
+        )
+        .unwrap();
+    // 3 groups: animal, plant, null
+    assert_eq!(rows.len(), 3);
+
+    // Find the animal group and verify 2 distinct statuses.
+    let animal_row = rows
+        .iter()
+        .find(|r| r.get("type").and_then(|v| v.as_str()) == Some("animal"))
+        .expect("animal group missing");
+    assert_eq!(animal_row["dc"].as_u64(), Some(2));
+
+    // Find the plant group and verify 2 distinct statuses.
+    let plant_row = rows
+        .iter()
+        .find(|r| r.get("type").and_then(|v| v.as_str()) == Some("plant"))
+        .expect("plant group missing");
+    assert_eq!(plant_row["dc"].as_u64(), Some(2));
+
+    store.close().unwrap();
+}
+
+// ── Scan UNWIND ──────────────────────────────────────────────────────────────
+
+#[test]
+fn scan_unwind_array_field() {
+    // Objects with a `tags` array field; UNWIND a.tags AS tag should produce one row per tag.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        obj("scan://alpha"),
+        br#"{"tags":["rust","embedded","db"]}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("scan://beta"),
+        br#"{"tags":["graph","query"]}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_scan(
+            "MATCH (a) WHERE id(a) STARTS WITH 'scan://' UNWIND a.tags AS tag RETURN tag",
+        )
+        .unwrap();
+    // alpha contributes 3 rows, beta contributes 2 rows → 5 total
+    assert_eq!(rows.len(), 5);
+    let tags: std::collections::HashSet<String> = rows
+        .iter()
+        .filter_map(|r| r.fields.get("tag").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect();
+    assert!(tags.contains("rust"));
+    assert!(tags.contains("embedded"));
+    assert!(tags.contains("db"));
+    assert!(tags.contains("graph"));
+    assert!(tags.contains("query"));
+    store.close().unwrap();
+}
+
+#[test]
+fn scan_unwind_empty_array() {
+    // Object with empty `tags: []`; UNWIND produces zero rows for that object.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        obj("scan://empty"),
+        br#"{"tags":[],"name":"empty"}"#.to_vec(),
+    );
+    tx.put_object(
+        obj("scan://nonempty"),
+        br#"{"tags":["x"],"name":"nonempty"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_scan(
+            "MATCH (a) WHERE id(a) STARTS WITH 'scan://' UNWIND a.tags AS tag RETURN tag",
+        )
+        .unwrap();
+    // empty object → 0 rows; nonempty → 1 row
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("tag").and_then(|v| v.as_str()),
+        Some("x")
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn scan_unwind_non_array() {
+    // Object where the UNWIND field is a string (not an array); should produce one row
+    // with the string as the alias value.
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(
+        obj("scan://scalar"),
+        br#"{"tags":"single","name":"scalar"}"#.to_vec(),
+    );
+    store.commit(tx, "test", "").unwrap();
+
+    let rows = store
+        .graph_ir_scan(
+            "MATCH (a) WHERE id(a) STARTS WITH 'scan://' UNWIND a.tags AS tag RETURN tag",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("tag").and_then(|v| v.as_str()),
+        Some("single")
+    );
+    store.close().unwrap();
+}
