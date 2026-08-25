@@ -21,11 +21,6 @@ case "$CARGO_REGISTRY" in
     ;;
 esac
 
-if [[ -z "${CARGO_REGISTRIES_DPK_TOKEN:-}" ]]; then
-  echo "CARGO_REGISTRIES_DPK_TOKEN is required" >&2
-  exit 1
-fi
-
 BUILD_ROOT="${BUILD_ROOT:-$(cd "$ROOT/../dpk-build" 2>/dev/null && pwd || true)}"
 if [[ -n "$BUILD_ROOT" && -x "$BUILD_ROOT/rust/build-crate.sh" ]] && grep -q 'cargo-publish-registry.sh' "$BUILD_ROOT/rust/build-crate.sh"; then
   exec "$BUILD_ROOT/rust/build-crate.sh"

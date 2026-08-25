@@ -6,6 +6,5 @@ if [ -z "${CI:-}" ]; then
   export PUBLISH_CRATE=true
   export CARGO_REGISTRY="${CARGO_REGISTRY:-dpk}"
   export CARGO_REGISTRIES_DPK_INDEX="${CARGO_REGISTRIES_DPK_INDEX:-sparse+http://127.0.0.1:31127/api/v1/crates/}"
-  # Homelab bootstrap token — same value as dpk-infra charts/kellnr values.yaml adminToken.
-  export CARGO_REGISTRIES_DPK_TOKEN="${CARGO_REGISTRIES_DPK_TOKEN:-1heqlaq4Dx502qYVjknOz9z9HazPudiM}"
 fi
+# Token is CARGO_REGISTRIES_DPK_TOKEN or ~/.cargo/credentials.toml — never commit it.
