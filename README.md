@@ -231,6 +231,28 @@ cargo test
 cargo bench --bench store_bench
 ```
 
+## Private Cargo registry (Kellnr)
+
+bindb publishes to the org Kellnr registry `dpk`, not crates.io — the same split as Python **binder-sdk** → private pypiserver (never public PyPI).
+
+| | binder-sdk (Python) | bindb (Rust) |
+|--|--|--|
+| Local `make b` | twine → `localhost:31126` | `cargo publish --registry dpk` → `localhost:31127` |
+| Push `master` | twine → QA `:32491` | `cargo publish --registry dpk` → QA `:32492` |
+| Pull requests | lint/test only | lint/test only (`CI=true make b`) |
+
+```bash
+make b   # lint, test, build, publish to DEV Kellnr
+```
+
+Consumers (after the crate exists on Kellnr):
+
+```toml
+bindb = { version = "0.1", registry = "dpk" }
+```
+
+Do not set Cargo `[registry] default`. Public crates stay on crates.io. Token: `CARGO_REGISTRIES_DPK_TOKEN`.
+
 ---
 
 ## Documentation

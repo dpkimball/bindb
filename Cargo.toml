@@ -8,6 +8,8 @@ license = "MIT"
 description = "Bindb — append-only WAL store for Binder domain objects, edges, and versions"
 repository = "https://github.com/dpkimball/bindb"
 readme = "README.md"
+# Private Kellnr registry only — never crates.io (binder-sdk's "Private :: Do Not Upload").
+publish = ["dpk"]
 
 [dependencies]
 ulid = { version = "1", features = ["serde"] }

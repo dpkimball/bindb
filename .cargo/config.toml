@@ -1,0 +1,8 @@
+# DEV Kellnr (dpk-infra charts/kellnr NodePort 31127).
+# CI / QA overrides via CARGO_REGISTRIES_DPK_INDEX
+# (sparse+http://192.168.86.47:32492/api/v1/crates/).
+# Do not set [registry] default — crates.io stays the public source.
+
+[registries.dpk]
+index = "sparse+http://127.0.0.1:31127/api/v1/crates/"
+credential-provider = ["cargo:token"]
