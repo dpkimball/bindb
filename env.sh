@@ -5,6 +5,6 @@
 if [ -z "${CI:-}" ]; then
   export PUBLISH_CRATE=true
   export CARGO_REGISTRY="${CARGO_REGISTRY:-dpk}"
-  export CARGO_REGISTRIES_DPK_INDEX="${CARGO_REGISTRIES_DPK_INDEX:-sparse+http://127.0.0.1:31127/api/v1/crates/}"
 fi
+# Index: dpk-build env.sh (localhost + CARGO_PORT). CI: secrets.PRIVATE_CARGO_URL.
 # Token is CARGO_REGISTRIES_DPK_TOKEN or ~/.cargo/credentials.toml — never commit it.

@@ -12,7 +12,7 @@ fi
 
 export PUBLISH_CRATE=true
 export CARGO_REGISTRY="${CARGO_REGISTRY:-dpk}"
-export CARGO_REGISTRIES_DPK_INDEX="${CARGO_REGISTRIES_DPK_INDEX:-sparse+http://127.0.0.1:31127/api/v1/crates/}"
+export CARGO_REGISTRIES_DPK_INDEX="${CARGO_REGISTRIES_DPK_INDEX:-sparse+http://${CARGO_HOST:-localhost}:${CARGO_PORT:-${KEEPSAKE_CARGO_PORT:-31127}}/api/v1/crates/}"
 
 case "$CARGO_REGISTRY" in
   crates-io|crates.io)

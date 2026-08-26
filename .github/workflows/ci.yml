@@ -34,7 +34,7 @@ jobs:
       - name: Publish crate to registry dpk
         env:
           CARGO_REGISTRY: dpk
-          CARGO_REGISTRIES_DPK_INDEX: sparse+http://192.168.86.47:32492/api/v1/crates/
+          PRIVATE_CARGO_URL: ${{ secrets.PRIVATE_CARGO_URL }}
           CARGO_REGISTRIES_DPK_TOKEN: ${{ secrets.CARGO_REGISTRIES_DPK_TOKEN }}
         run: |
           set -euo pipefail
@@ -42,9 +42,14 @@ jobs:
             echo "CARGO_REGISTRIES_DPK_TOKEN unset — skip Kellnr publish"
             exit 0
           fi
-          HEALTH_URL="http://192.168.86.47:32492/api/v1/health"
-          if ! curl -fsS -m 5 "$HEALTH_URL" | grep -q OK; then
-            echo "Kellnr not reachable at $HEALTH_URL — skip (QA chart may not be synced)"
+          if [ -z "${PRIVATE_CARGO_URL:-}" ]; then
+            echo "PRIVATE_CARGO_URL unset — skip Kellnr publish"
+            exit 0
+          fi
+          BASE="${PRIVATE_CARGO_URL%/}"
+          export CARGO_REGISTRIES_DPK_INDEX="sparse+${BASE}/api/v1/crates/"
+          if ! curl -fsS -m 5 "${BASE}/api/v1/health" | grep -q OK; then
+            echo "Kellnr not reachable at ${BASE}/api/v1/health — skip"
             exit 0
           fi
           chmod +x scripts/publish-kellnr.sh
