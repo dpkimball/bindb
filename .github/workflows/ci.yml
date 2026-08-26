@@ -12,40 +12,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    # Pin until dpk-ci #211 (product-ci / ci-wait pools) lands on master; then
-    # switch back to @master with runner: product-ci.
+  ci:
     uses: dpkimball/dpk-ci/.github/workflows/rust-library-ci.yml@master
     with:
       project_name: bindb
       runner: product-ci
     secrets: inherit
-
-  # binder-sdk analog: publish-private on push to master only (QA Kellnr, not crates.io).
-  publish-kellnr:
-    name: Publish to Kellnr
-    needs: [test]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: product-ci
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Publish crate to registry dpk
-        env:
-          CARGO_REGISTRY: dpk
-          CARGO_REGISTRIES_DPK_INDEX: sparse+http://192.168.86.47:32492/api/v1/crates/
-          CARGO_REGISTRIES_DPK_TOKEN: ${{ secrets.CARGO_REGISTRIES_DPK_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CARGO_REGISTRIES_DPK_TOKEN:-}" ]; then
-            echo "CARGO_REGISTRIES_DPK_TOKEN unset — skip Kellnr publish"
-            exit 0
-          fi
-          HEALTH_URL="http://192.168.86.47:32492/api/v1/health"
-          if ! curl -fsS -m 5 "$HEALTH_URL" | grep -q OK; then
-            echo "Kellnr not reachable at $HEALTH_URL — skip (QA chart may not be synced)"
-            exit 0
-          fi
-          chmod +x scripts/publish-kellnr.sh
-          ./scripts/publish-kellnr.sh
