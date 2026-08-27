@@ -1,7 +1,7 @@
 name: Nightly XL
 
 # Runs XL-scale (1 M objects) SLA tests on the self-hosted runner.
-# Failures are detected by nightly_watchdog.yml (02:45 UTC, ubuntu-latest)
+# Failures are detected by nightly_watchdog.yml (02:45 UTC, self-hosted)
 # which opens a GitHub issue if this job is still queued, failed, or absent.
 
 on:

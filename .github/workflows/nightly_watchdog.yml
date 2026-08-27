@@ -4,8 +4,7 @@ name: Nightly watchdog
 # nightly completed successfully.  If it failed or never started (runner
 # offline), opens a GitHub issue so the team knows within the hour.
 #
-# Runs on ubuntu-latest (GitHub-hosted) so it fires even when the self-hosted
-# runner is down — that is the whole point.
+# Always self-hosted. Never ubuntu-latest (org billing blocks GitHub-hosted jobs).
 
 on:
   schedule:
@@ -19,7 +18,7 @@ permissions:
 jobs:
   watchdog:
     name: Check nightly XL health
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 5
     steps:
       - name: Check last nightly run status
