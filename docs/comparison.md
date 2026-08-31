@@ -1,3 +1,9 @@
+---
+title: bindb — Database Comparison
+description: Feature and architectural comparison of bindb against SQLite, DuckDB, MongoDB, Neo4j, Weaviate, ClickHouse, and PostgreSQL.
+category: architecture
+---
+
 # bindb — Database Comparison
 
 bindb is not a general-purpose database.  It is purpose-built for semantic, graph, temporal,
@@ -13,7 +19,7 @@ This document compares bindb against the databases it replaces or complements.
 
 A typical semantic application stack requires:
 
-```
+```text
 ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
 │   MongoDB   │  │    Neo4j    │  │   Weaviate  │  │ ClickHouse  │  │    MySQL    │
 │  documents  │  │    graph    │  │   vectors   │  │  analytics  │  │  relations  │
@@ -356,7 +362,7 @@ subqueries, and queries from non-Rust clients are not supported.
 
 ## Decision guide
 
-```
+```text
 Need SQL + relational schema + multi-process?              → PostgreSQL or SQLite
 Need embedded SQL analytics + aggregations + Parquet/S3?   → DuckDB
 Need petabyte analytics + columnar SQL at daemon scale?    → ClickHouse

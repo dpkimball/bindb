@@ -1,3 +1,9 @@
+---
+title: bindb — Performance SLAs
+description: Performance contracts for bindb operations across scale tiers, enforced automatically by CI.
+category: architecture
+---
+
 # bindb — Performance SLAs
 
 This document defines the performance contracts for bindb operations.  SLAs are enforced

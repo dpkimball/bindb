@@ -1,3 +1,9 @@
+---
+title: bindb — Implementation Invariants
+description: The ten implementation invariants that must hold at every point in bindb's development.
+category: architecture
+---
+
 # bindb — Implementation Invariants
 
 These invariants must hold at every point in the implementation. They are not aspirational.
@@ -98,7 +104,7 @@ of commits that were successfully fsync'd before the crash.
 
 **Binary WAL entry format:**
 
-```
+```text
 [4 bytes]  magic: b"BNDR"
 [8 bytes]  entry_id: u64 little-endian
 [8 bytes]  data_len: u64 little-endian

@@ -76,7 +76,7 @@ rebuildable, replaceable, never authoritative on their own.
 
 The fundamental unit of storage.  Every object has a URI-style `ObjectId`:
 
-```
+```text
 scheme://path
   │         └── entity path within the namespace
   └── namespace owner (e.g. "memory", "obs", "story", "health")
@@ -98,7 +98,7 @@ A metric-typed data point attached to an object at a point in time.  Observation
 stored as objects in the `obs://` namespace and associated with a `MetricDefinition` that
 declares the unit, type, and schema.
 
-```
+```text
 MetricDefinition  →  "health.sleep_duration_h" (unit: hours, type: interval)
 Observation       →  obs://health.sleep_duration_h:withings  (value, valid_from, valid_to)
 ```
@@ -139,7 +139,7 @@ store.vector_search(&embedding, &filter, 10)  // cosine similarity
 
 Planned:
 
-```
+```rust
 store.query(ObservationQuery)        // metric-filtered observation scan
 store.graph_query(GraphQuery)        // pattern-matched subgraph
 store.temporal_query(TemporalQuery)  // time-windowed version scan

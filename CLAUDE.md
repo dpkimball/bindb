@@ -12,7 +12,7 @@ Do not add domain logic, application-level schemas, or business rules — those 
 
 ## Layout
 
-```
+```text
 src/
   wal.rs           # commit log — source of truth; all writes go through here
   transaction.rs   # Transaction builder; changes accumulated then committed atomically

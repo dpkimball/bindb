@@ -1,3 +1,9 @@
+---
+title: bindb OKRs (engineering)
+description: Engineering OKRs for the 90-day horizon, with key results, evidence sources, and operating rules.
+category: vision
+---
+
 # bindb OKRs (engineering)
 
 Horizon: **90 days** from 2026-07-23. Owner: bindb maintainers.
