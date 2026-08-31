@@ -1,3 +1,9 @@
+---
+title: bindb — Performance
+description: Operation complexity, durability modes, throughput characteristics, and scale context for bindb.
+category: architecture
+---
+
 # bindb — Performance
 
 ---

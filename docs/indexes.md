@@ -1,3 +1,9 @@
+---
+title: bindb — Index System
+description: Description of all in-memory index projections in bindb, their structure, rebuild contracts, and read-path routing.
+category: architecture
+---
+
 # bindb — Index System
 
 All indexes in bindb are **non-canonical projections** of the WAL commit log.
@@ -100,7 +106,7 @@ Same structure for edges.
 
 ### `head_objects: HeadObjectIndex`
 
-```
+```text
 HashMap<ObjectId, BinderObjectVersion>
 ```
 
@@ -112,7 +118,7 @@ where `valid_to.is_none()`.
 
 ### `head_edges: HeadEdgeIndex`
 
-```
+```text
 HashMap<EdgeId, BinderEdgeVersion>
 ```
 
@@ -126,7 +132,7 @@ Same structure for edges.
 
 Adjacency sets:
 
-```
+```text
 HashMap<ObjectId, HashSet<EdgeId>>  ← outgoing edges
 HashMap<ObjectId, HashSet<EdgeId>>  ← incoming edges
 ```
@@ -147,13 +153,13 @@ non-tombstone current edges.
 
 ### `namespace_index: NamespaceObjectIndex`
 
-```
+```text
 HashMap<String, HashSet<ObjectId>>
 ```
 
 The map key is the URI scheme prefix — everything up to and including `"://"`.
 
-```
+```text
 "memory://"  →  { "memory://mem.abc", "memory://mem.xyz", ... }
 "obs://"     →  { "obs://health.sleep_duration_h:withings", ... }
 ```
@@ -185,7 +191,7 @@ the full version history.
 
 ### `vector_index: VectorIndex`
 
-```
+```text
 HashMap<String, Vec<VectorEntry>>
 ```
 
@@ -214,7 +220,7 @@ temporal query reads from the in-memory `object_versions` / `edge_versions` Vecs
 
 ### In-memory index
 
-```
+```text
 object_index: HashMap<ObjectId, Vec<IndexEntry>>
     IndexEntry { valid_from: CommitId, valid_to: Option<CommitId>, offset: u64 }
 ```
@@ -226,7 +232,7 @@ For a store with 5 M historical versions: ~200 MB (index) vs ~1 GB (full structs
 
 Sequence of length-prefixed bincode frames:
 
-```
+```text
 [u64 payload_len LE][bincode VersionRecord]
 ```
 

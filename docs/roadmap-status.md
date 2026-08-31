@@ -1,3 +1,9 @@
+---
+title: bindb — Issue / roadmap status
+description: Current shipped and remaining status for all open bindb engineering issues, including the interim scale ceiling.
+category: vision
+---
+
 # bindb — Issue / roadmap status
 
 Last updated: 2026-07-31 (PRs #32–#79 + in-progress). Prefer this over stale issue bodies.

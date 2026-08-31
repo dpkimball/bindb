@@ -1,3 +1,9 @@
+---
+title: bindb — Benchmark Comparison
+description: Measured performance comparison of bindb against SQLite, DuckDB, MongoDB, PostgreSQL, Neo4j, and ClickHouse.
+category: architecture
+---
+
 # bindb — Benchmark Comparison
 
 This document compares bindb's measured performance against published benchmarks for
@@ -41,7 +47,7 @@ direct numeric comparison is informative but not definitive.  The architectural 
 Before the numbers: the most important performance difference between bindb and daemon-based
 databases is **where the code runs**.
 
-```
+```text
 bindb       →  in-process, zero network overhead
                HashMap lookup = ~100 ns, no serialization
 
@@ -233,7 +239,7 @@ PERF_REPORT_DIR=./out cargo run --example perf_report --release
 
 ### Performance characteristic summary
 
-```
+```text
 Operation            bindb        SQLite      DuckDB       MongoDB     PostgreSQL
 ─────────────────────────────────────────────────────────────────────────────────
 Durable write        ~130/sec     ~120/sec    ~2K/sec      ~10K/sec    ~1K/sec

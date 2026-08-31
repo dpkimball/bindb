@@ -1,3 +1,9 @@
+---
+title: bindb — Storage Internals
+description: WAL format, on-disk layout, checkpoint protocol, and crash recovery internals for bindb.
+category: architecture
+---
+
 # bindb — Storage Internals
 
 This document covers the WAL, on-disk layout, checkpoint protocol, and crash recovery.
@@ -24,7 +30,7 @@ In RAM, `VersionStore` keeps only `(valid_from, valid_to, byte_offset)` per vers
 (~40 bytes), while full structs live in the file.
 
 **Format:** sequence of length-prefixed bincode frames:
-```
+```text
 [u64 payload_len LE][bincode of VersionRecord]
 ```
 
@@ -49,7 +55,7 @@ given store path at a time.
 
 Every commit is serialized as a self-describing frame:
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │  4 bytes │ magic: b"BNDR"                                    │
 │  8 bytes │ entry_id: u64 LE  (monotone counter)             │
@@ -139,7 +145,7 @@ A partial WAL write can never produce a `.dirty`-absent dirty state.
 
 The checkpoint log is a flat append-only file of 20-byte records:
 
-```
+```text
 ┌──────────────────────────────────────────────┐
 │  8 bytes │ wal_offset: u64 LE               │
 │  8 bytes │ commit_count: u64 LE             │
