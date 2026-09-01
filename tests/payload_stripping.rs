@@ -248,6 +248,7 @@ fn provenance_recovered_after_stripping() {
         source: ProvenanceSource::Import("health-kit".to_string()),
         source_ref: "HKQuantityTypeIdentifierHeartRate".to_string(),
         imported_at_ms: 1_700_000_000_000,
+        ..Default::default()
     };
 
     let mut tx = Transaction::new();
@@ -286,6 +287,7 @@ fn provenance_survives_compact_reopen() {
         source: ProvenanceSource::Plugin("binder-health".to_string()),
         source_ref: "steps-2026-01-01".to_string(),
         imported_at_ms: 1_750_000_000_000,
+        ..Default::default()
     };
 
     let c1 = {
