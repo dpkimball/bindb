@@ -179,6 +179,7 @@ fn provenance_stored_and_recovered() {
         source: ProvenanceSource::Plugin("story-binder".into()),
         source_ref: "github://org/repo".into(),
         imported_at_ms: 1_700_000_000_000,
+        ..Default::default()
     };
 
     let commit_id = {
