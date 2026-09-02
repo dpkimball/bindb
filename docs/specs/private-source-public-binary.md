@@ -41,7 +41,7 @@ built: <YYYY-MM-DD or unknown>
 
 No private repository URLs or secrets. Errors go to stderr. Non-zero exit on failure. No telemetry. No embedded credentials.
 
-Phase 1 does **not** expand operational store subcommands; Kellnr remains the Rust-embed path. The binary exists so install/verify/integration can be proven.
+Phase 1 proved install/verify only. Phase 2 adds `info` / `list` (see `phase2-cli-info-list.md` / #101). Kellnr remains the Rust-embed path for writes and rich query.
 
 ### Release automation
 
