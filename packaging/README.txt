@@ -7,6 +7,9 @@ bindb is a code intelligence and repository analysis storage engine.
 This archive contains the public executable only. Source code is privately
 maintained and is not included.
 
+There are no SQL tables. A store is a directory that contains commits.wal.
+Object IDs look like URIs (demo://notes/1); prefixes group related objects.
+
 Installation
 ------------
 
@@ -15,20 +18,22 @@ Installation
 2. Extract this archive (`tar -xJf …` for `.tar.xz`).
 3. Place `bindb` (or `bindb.exe`) on your PATH.
 
+Quick start
+-----------
+
+    bindb init ./mystore
+    bindb put  ./mystore "demo://hello" "world"
+    bindb get  ./mystore "demo://hello"
+    bindb info ./mystore
+    bindb list ./mystore "demo://"
+
+See GETTING_STARTED.md on https://github.com/dpkimball/bindb-releases
+
 Verify
 ------
 
     bindb --version
     bindb --help
-
-Inspect a store
----------------
-
-The store directory is the folder that contains `commits.wal`.
-
-    bindb info /path/to/store
-    bindb list /path/to/store "code://"
-    bindb list /path/to/store ""
 
 License
 -------
