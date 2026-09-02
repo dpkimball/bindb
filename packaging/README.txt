@@ -10,8 +10,9 @@ maintained and is not included.
 Installation
 ------------
 
-1. Verify the archive against SHA256SUMS from the GitHub Release.
-2. Extract this archive.
+1. Verify the archive against the matching `*.tar.xz.sha256` file from the
+   GitHub Release (or use the release’s `sha256.sum`).
+2. Extract this archive (`tar -xJf …` for `.tar.xz`).
 3. Place `bindb` (or `bindb.exe`) on your PATH.
 
 Verify
@@ -19,6 +20,10 @@ Verify
 
     bindb --version
     bindb --help
+
+Phase 1 of the public binary supports only `--version` and `--help`.
+It does not open or query on-disk stores. Database access remains via the
+private Rust BinderStore API until a later release.
 
 License
 -------

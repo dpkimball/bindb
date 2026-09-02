@@ -8,6 +8,7 @@ owner: bindb
 github_issue: https://github.com/dpkimball/bindb/issues/97
 related:
   - https://github.com/dpkimball/bindb/issues/97
+  - https://github.com/dpkimball/bindb/issues/99
 ---
 
 # bindb Phase 1 — private source / public binary distribution
@@ -57,12 +58,21 @@ Platforms: `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`. Expand the `targe
 
 `dpkimball/bindb-releases` contains only documentation, licensing, and release artifacts — never Cargo/Rust sources.
 
+Public install docs must match cargo-dist naming: `bindb-<rust-target-triple>.tar.xz`, per-archive `*.tar.xz.sha256`, and `sha256.sum` (not legacy `darwin-arm64.tar.gz` / `SHA256SUMS`).
+
+### cargo-dist announcement URL drift
+
+`github-releases-repo = "dpkimball/bindb-releases"` uploads assets to the public repo, but cargo-dist still embeds **private** `dpkimball/bindb` download URLs in the release body and `dist-manifest.json` hosting block (upstream: [axodotdev/cargo-dist#2252](https://github.com/axodotdev/cargo-dist/issues/2252)).
+
+Mitigation: `.github/workflows/fix-bindb-releases-announcement.yml` runs after a successful `Release` workflow and rewrites those URLs on `bindb-releases` (requires `GH_RELEASES_TOKEN`).
+
 ## Implementation
 
 - **`dist-workspace.toml`** — dist configuration: two targets, `github-releases-repo`, `include` for proprietary license/README.
 - **`build.rs`** — injects `BINDB_GIT_SHA` (7-char) and `BINDB_BUILD_DATE` (YYYY-MM-DD) at compile time from CI env or local git/date fallbacks.
 - **`src/bin/bindb.rs`** — `--version` / `--help` CLI surface. No operational subcommands in Phase 1.
 - **`.github/workflows/release.yml`** — dist-generated; do not hand-edit. Regenerate with `dist generate`.
+- **`.github/workflows/fix-bindb-releases-announcement.yml`** — post-publish URL rewrite for public consumers.
 
 ## Acceptance criteria
 

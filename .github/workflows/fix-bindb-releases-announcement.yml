@@ -1,0 +1,75 @@
+# cargo-dist publishes assets to github-releases-repo but still embeds the
+# *source* repo in announcement bodies / dist-manifest hosting URLs
+# (axodotdev/cargo-dist#2252). Rewrite public download links after Release.
+name: Fix bindb-releases announcement URLs
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  rewrite:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Rewrite release notes and dist-manifest hosting URLs
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASES_TOKEN }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          RELEASES_REPO: dpkimball/bindb-releases
+          BAD: https://github.com/dpkimball/bindb/releases/download/
+          GOOD: https://github.com/dpkimball/bindb-releases/releases/download/
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "GH_RELEASES_TOKEN is not set; cannot rewrite public release notes"
+            exit 1
+          fi
+
+          body=$(gh release view "$TAG" --repo "$RELEASES_REPO" --json body -q .body)
+          fixed=${body//$BAD/$GOOD}
+          if [ "$body" != "$fixed" ]; then
+            gh release edit "$TAG" --repo "$RELEASES_REPO" --notes "$fixed"
+            echo "Updated release notes for $TAG"
+          else
+            echo "Release notes already use bindb-releases URLs (or had no download links)"
+          fi
+
+          tmp=$(mktemp -d)
+          asset="dist-manifest.json"
+          if ! gh release download "$TAG" --repo "$RELEASES_REPO" -p "$asset" -D "$tmp"; then
+            echo "No dist-manifest.json on $TAG; skipping manifest patch"
+            exit 0
+          fi
+
+          cat >"$tmp/patch.py" <<'EOF'
+          from pathlib import Path
+          import os
+          p = Path(os.environ["TMP_MANIFEST"])
+          text = p.read_text()
+          fixed = text.replace(
+              "/dpkimball/bindb/releases/download/",
+              "/dpkimball/bindb-releases/releases/download/",
+          ).replace('"repo": "bindb"', '"repo": "bindb-releases"')
+          if fixed != text:
+              p.write_text(fixed)
+              print("patched dist-manifest.json")
+          else:
+              print("dist-manifest.json already correct")
+          EOF
+          TMP_MANIFEST="$tmp/$asset" python3 "$tmp/patch.py"
+
+          asset_id=$(gh api "repos/${RELEASES_REPO}/releases/tags/${TAG}" \
+            --jq '.assets[] | select(.name=="dist-manifest.json") | .id')
+          if [ -n "$asset_id" ]; then
+            gh api -X DELETE "repos/${RELEASES_REPO}/releases/assets/${asset_id}"
+          fi
+          gh release upload "$TAG" "$tmp/$asset" --repo "$RELEASES_REPO"
+          echo "Re-uploaded dist-manifest.json for $TAG"
