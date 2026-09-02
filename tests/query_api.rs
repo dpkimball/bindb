@@ -395,4 +395,3 @@ fn list_object_ids_matches_list_without_payloads() {
 
     store.close().unwrap();
 }
-

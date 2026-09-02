@@ -41,7 +41,9 @@ fn run(args: &[String]) -> Result<(), ExitCode> {
             cmd_info(Path::new(store_dir))
         }
         "list" => {
-            let store_dir = args.get(1).ok_or_else(|| usage_exit("list <store-dir> <namespace-prefix>"))?;
+            let store_dir = args
+                .get(1)
+                .ok_or_else(|| usage_exit("list <store-dir> <namespace-prefix>"))?;
             let prefix = args
                 .get(2)
                 .ok_or_else(|| usage_exit("list <store-dir> <namespace-prefix>"))?;
