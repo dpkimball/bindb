@@ -10,6 +10,11 @@ repository = "https://github.com/dpkimball/bindb"
 readme = "README.md"
 # Private Kellnr registry only — never crates.io (binder-sdk's "Private :: Do Not Upload").
 publish = ["dpk"]
+build = "build.rs"
+
+[[bin]]
+name = "bindb"
+path = "src/bin/bindb.rs"
 
 [dependencies]
 ulid = { version = "1", features = ["serde"] }

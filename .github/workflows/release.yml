@@ -1,0 +1,274 @@
+# bindb public binary release (Phase 1)
+#
+# Trigger: push tag v* on the private source repo.
+# Publishes artifacts to the public dpkimball/bindb-releases repository.
+# Source code is never uploaded — packaging uses an allowlist staging dir.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bindb-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate tag / version / gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      build_date: ${{ steps.date.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: tag '$TAG' is not a semver tag like v0.1.0" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$CARGO_VERSION" != "$VERSION" ]]; then
+            echo "error: tag version '$VERSION' != Cargo.toml version '$CARGO_VERSION'" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Validated tag $TAG == Cargo.toml $CARGO_VERSION"
+
+      - name: Build date (UTC)
+        id: date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked --all
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          BINDB_BUILD_DATE: ${{ steps.date.outputs.date }}
+
+  build:
+    name: ${{ matrix.name }}
+    needs: validate
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      # Collect all platform results; publish fails closed if any build fails.
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            runs-on: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+
+          - name: darwin-x64
+            runs-on: macos-13
+            target: x86_64-apple-darwin
+            platform: darwin-x64
+
+          - name: linux-x64
+            runs-on: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+
+          - name: linux-arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+
+          - name: windows-x64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cargo build --release
+        shell: bash
+        run: cargo build --release --locked --bin bindb --target ${{ matrix.target }}
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          BINDB_BUILD_DATE: ${{ needs.validate.outputs.build_date }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package-release.sh
+          VERSION="${{ needs.validate.outputs.version }}"
+          PLATFORM="${{ matrix.platform }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BIN="target/${{ matrix.target }}/release/bindb.exe"
+            EXT="zip"
+          else
+            BIN="target/${{ matrix.target }}/release/bindb"
+            EXT="tar.gz"
+          fi
+          mkdir -p dist
+          ./scripts/package-release.sh "$BIN" "$VERSION" "$PLATFORM" "$PWD/dist"
+          ARCHIVE="bindb-v${VERSION}-${PLATFORM}.${EXT}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$ARCHIVE" > "SHA256SUMS-${PLATFORM}")
+          else
+            (cd dist && shasum -a 256 "$ARCHIVE" > "SHA256SUMS-${PLATFORM}")
+          fi
+
+      - name: Smoke --version / --help
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BIN="target/${{ matrix.target }}/release/bindb.exe"
+          else
+            BIN="target/${{ matrix.target }}/release/bindb"
+          fi
+          "$BIN" --help >/dev/null
+          OUT="$("$BIN" --version)"
+          echo "$OUT"
+          echo "$OUT" | head -1 | grep -F "bindb ${{ needs.validate.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindb-${{ matrix.platform }}
+          path: |
+            dist/bindb-v*-${{ matrix.platform }}.*
+            dist/SHA256SUMS-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: Publish to bindb-releases
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release assets + SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          mkdir -p release
+          expected=(darwin-arm64 darwin-x64 linux-x64 linux-arm64 windows-x64)
+          for p in "${expected[@]}"; do
+            dir="artifacts/bindb-${p}"
+            if [[ ! -d "$dir" ]]; then
+              echo "error: missing artifact directory for $p" >&2
+              exit 1
+            fi
+            mapfile -t archives < <(find "$dir" -maxdepth 1 -type f \( -name "bindb-v${VERSION}-${p}.tar.gz" -o -name "bindb-v${VERSION}-${p}.zip" \))
+            if [[ "${#archives[@]}" -ne 1 ]]; then
+              echo "error: expected exactly one archive for $p, found ${#archives[@]}" >&2
+              ls -la "$dir" >&2 || true
+              exit 1
+            fi
+            cp "${archives[0]}" release/
+            if [[ ! -f "$dir/SHA256SUMS-${p}" ]]; then
+              echo "error: missing SHA256SUMS for $p" >&2
+              exit 1
+            fi
+            cat "$dir/SHA256SUMS-${p}" >> release/SHA256SUMS
+          done
+          sort -o release/SHA256SUMS release/SHA256SUMS
+          echo "Assembled:"
+          ls -la release/
+          cat release/SHA256SUMS
+          count="$(find release -type f ! -name SHA256SUMS | wc -l | tr -d ' ')"
+          if [[ "$count" != "5" ]]; then
+            echo "error: expected 5 archives, found $count" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release on bindb-releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_DISTRIBUTION_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "error: RELEASE_DISTRIBUTION_TOKEN secret is not set" >&2
+            echo "Create a fine-grained PAT with contents:write on dpkimball/bindb-releases and add it as that secret on dpkimball/bindb." >&2
+            exit 1
+          fi
+
+          NOTES_FILE="$(mktemp)"
+          cat > "$NOTES_FILE" <<EOF
+## bindb ${TAG}
+
+Official compiled release of **bindb**. Source code is privately maintained and is **not** included in these artifacts.
+
+### Verify
+
+\`\`\`bash
+shasum -a 256 -c SHA256SUMS
+\`\`\`
+
+### Run
+
+\`\`\`bash
+./bindb --version
+./bindb --help
+\`\`\`
+
+### License
+
+See \`LICENSE.txt\` inside each archive (proprietary binary distribution — not open source).
+
+Private source revision: \`${GITHUB_SHA}\`
+EOF
+
+          if gh release view "$TAG" -R dpkimball/bindb-releases >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets (clobber)"
+            gh release upload "$TAG" release/* -R dpkimball/bindb-releases --clobber
+            gh release edit "$TAG" -R dpkimball/bindb-releases --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" \
+              -R dpkimball/bindb-releases \
+              --title "bindb ${TAG}" \
+              --notes-file "$NOTES_FILE" \
+              release/*
+          fi

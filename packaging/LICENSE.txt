@@ -1,0 +1,99 @@
+BINDB BINARY DISTRIBUTION LICENSE
+=================================
+
+Copyright (c) 2026 DPK / dpkimball. All rights reserved.
+
+IMPORTANT: This license applies to the compiled bindb binaries and related
+release materials distributed through the bindb-releases channel. The bindb
+source code is privately maintained and is not licensed under this document.
+
+This is not an open-source license. Do not treat bindb as open-source software.
+
+
+1. DEFINITIONS
+
+"Software" means the compiled bindb executable binaries, accompanying
+README/LICENSE files in release archives, and checksums published for those
+artifacts.
+
+"You" means the individual or legal entity exercising permissions under this
+license.
+
+
+2. GRANT OF RIGHTS
+
+Subject to the terms below, You may:
+
+  (a) download the Software;
+  (b) install and execute the Software for internal evaluation and production
+      use, including commercial / business use within your organization;
+  (c) make copies of the Software solely as needed for backup, deployment, and
+      execution within your organization.
+
+
+3. REDISTRIBUTION
+
+You may redistribute unmodified release archives and their SHA-256 checksums
+to members of your organization or to systems that execute the Software on
+your behalf (for example CI runners), provided you:
+
+  (a) retain this LICENSE file and copyright notice;
+  (b) do not remove or alter checksums in a way that conceals integrity data;
+  (c) do not present the Software as open-source or as your own product.
+
+You may not sell, sublicense, or publicly re-host the Software as a competing
+distribution channel without prior written permission from the copyright
+holder.
+
+
+4. RESTRICTIONS
+
+Except to the extent that applicable law prohibits these restrictions, You
+may not:
+
+  (a) modify, adapt, translate, or create derivative works of the Software;
+  (b) reverse engineer, decompile, or disassemble the Software;
+  (c) attempt to obtain source code for bindb from the Software;
+  (d) remove proprietary notices from the Software.
+
+
+5. OWNERSHIP
+
+The Software is licensed, not sold. Title, ownership rights, and intellectual
+property rights in the Software remain with the copyright holder. No rights
+are granted to bindb source code under this license.
+
+
+6. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+
+7. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE
+LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE
+DAMAGES, OR ANY LOSS OF PROFITS, DATA, OR GOODWILL, ARISING FROM USE OF THE
+SOFTWARE.
+
+
+8. TERMINATION
+
+This license terminates automatically if You breach its terms. Upon
+termination You must cease use and destroy copies of the Software in your
+possession, except copies retained solely for archival/legal hold obligations.
+
+
+9. LEGAL REVIEW
+
+This document is an initial distribution license for internal validation and
+controlled external pilots. Have counsel review it before broad public or
+commercial redistribution.
+
+
+10. CONTACT
+
+For redistribution permissions beyond this license, contact the copyright
+holder via the bindb-releases GitHub repository.

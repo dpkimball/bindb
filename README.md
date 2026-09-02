@@ -229,7 +229,18 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo bench --bench store_bench
+cargo run --bin bindb -- --version
 ```
+
+## Public binary releases
+
+Compiled `bindb` executables are published to the public
+[`bindb-releases`](https://github.com/dpkimball/bindb-releases) repository
+(documentation, license, checksums, and binaries only — **not** source).
+
+This is proprietary binary distribution, not open source. Rust library
+consumers continue to use the private Kellnr registry below. See
+[docs/specs/private-source-public-binary.md](docs/specs/private-source-public-binary.md).
 
 ## Private Cargo registry (Kellnr)
 
