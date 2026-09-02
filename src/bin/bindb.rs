@@ -225,9 +225,6 @@ fn cmd_get(store_dir: &Path, object_id: &str) -> Result<(), ExitCode> {
                     return Err(ExitCode::from(1));
                 }
             }
-            if !std::io::Write::flush(&mut std::io::stdout()).is_ok() {
-                // ignore flush errors
-            }
             store.close().map_err(|e| {
                 eprintln!("error: close store: {e}");
                 ExitCode::from(1)
