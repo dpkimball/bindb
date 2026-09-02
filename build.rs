@@ -54,18 +54,37 @@ fn short_sha(sha: &str) -> String {
 }
 
 fn utc_date() -> Option<String> {
+    // Unix / macOS
     let output = Command::new("date")
         .args(["-u", "+%Y-%m-%d"])
+        .output()
+        .ok();
+    if let Some(out) = output {
+        if out.status.success() {
+            let s = String::from_utf8(out.stdout).ok()?;
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    // Windows fallback via PowerShell
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-Date -AsUTC).ToString('yyyy-MM-dd')",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let date = String::from_utf8(output.stdout).ok()?;
-    let date = date.trim();
-    if date.is_empty() {
+    let s = String::from_utf8(output.stdout).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
         None
     } else {
-        Some(date.to_string())
+        Some(s.to_string())
     }
 }

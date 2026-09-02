@@ -66,9 +66,10 @@ if [[ "$PLATFORM" == windows-* ]]; then
     if command -v zip >/dev/null 2>&1; then
       zip -q "$ARCHIVE" "$BIN_NAME" README.txt LICENSE.txt
     else
-      # Git Bash / Windows runners without zip: use PowerShell when available.
+      # Git Bash / Windows runners without zip: PowerShell requires a Windows path.
+      WIN_ARCHIVE="$(cygpath -w "$ARCHIVE" 2>/dev/null || echo "$ARCHIVE")"
       powershell.exe -NoProfile -Command \
-        "Compress-Archive -Path '$BIN_NAME','README.txt','LICENSE.txt' -DestinationPath '$ARCHIVE' -Force"
+        "Compress-Archive -Path '$BIN_NAME','README.txt','LICENSE.txt' -DestinationPath '$WIN_ARCHIVE' -Force"
     fi
   )
 else

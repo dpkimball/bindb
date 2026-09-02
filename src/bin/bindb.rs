@@ -6,10 +6,6 @@
 use std::env;
 use std::process::ExitCode;
 
-// Link the same-package library into the public binary (Phase 1 surface is
-// version/help only; operational subcommands are follow-on work).
-use bindb as _;
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_SHA: &str = env!("BINDB_GIT_SHA");
 const BUILD_DATE: &str = env!("BINDB_BUILD_DATE");
@@ -88,9 +84,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_constants_are_non_empty() {
+    fn provenance_constants_are_populated() {
         assert!(!VERSION.is_empty());
-        assert!(!GIT_SHA.is_empty());
-        assert!(!BUILD_DATE.is_empty());
+        assert_ne!(GIT_SHA, "unknown", "build.rs failed to inject git SHA");
+        assert_ne!(BUILD_DATE, "unknown", "build.rs failed to inject build date");
     }
 }

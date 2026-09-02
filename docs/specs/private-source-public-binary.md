@@ -7,7 +7,7 @@ updated: 2026-09-02
 owner: bindb
 github_issue: https://github.com/dpkimball/bindb/issues/97
 related:
-  - ../../../specs/017-private-source-public-binary.md
+  - https://github.com/dpkimball/bindb/issues/97
 ---
 
 # bindb Phase 1 — private source / public binary distribution
