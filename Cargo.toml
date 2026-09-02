@@ -7,6 +7,7 @@ authors = ["DPK Platform Team"]
 license = "MIT"
 description = "Bindb — append-only WAL store for Binder domain objects, edges, and versions"
 repository = "https://github.com/dpkimball/bindb"
+homepage = "https://github.com/dpkimball/bindb-releases"
 readme = "README.md"
 # Private Kellnr registry only — never crates.io (binder-sdk's "Private :: Do Not Upload").
 publish = ["dpk"]
