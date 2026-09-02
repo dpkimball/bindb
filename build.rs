@@ -55,10 +55,7 @@ fn short_sha(sha: &str) -> String {
 
 fn utc_date() -> Option<String> {
     // Unix / macOS
-    let output = Command::new("date")
-        .args(["-u", "+%Y-%m-%d"])
-        .output()
-        .ok();
+    let output = Command::new("date").args(["-u", "+%Y-%m-%d"]).output().ok();
     if let Some(out) = output {
         if out.status.success() {
             let s = String::from_utf8(out.stdout).ok()?;

@@ -87,6 +87,9 @@ mod tests {
     fn provenance_constants_are_populated() {
         assert!(!VERSION.is_empty());
         assert_ne!(GIT_SHA, "unknown", "build.rs failed to inject git SHA");
-        assert_ne!(BUILD_DATE, "unknown", "build.rs failed to inject build date");
+        assert_ne!(
+            BUILD_DATE, "unknown",
+            "build.rs failed to inject build date"
+        );
     }
 }
