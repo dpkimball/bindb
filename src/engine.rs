@@ -661,6 +661,20 @@ impl BinderStore {
         Ok(v)
     }
 
+    /// Live object IDs whose scheme/ID matches `namespace_prefix` (same matching
+    /// rules as [`Self::list`]). Does not load payloads — preferred for CLI and
+    /// counting.
+    pub fn list_object_ids(&self, namespace_prefix: &str) -> Result<Vec<ObjectId>, StoreError> {
+        if *self.closed.lock().unwrap() {
+            return Err(StoreError::Closed);
+        }
+        Ok(self
+            .namespace_index
+            .lock()
+            .unwrap()
+            .matching(namespace_prefix))
+    }
+
     /// All live (non-tombstone) current object versions whose object_id starts
     /// with `namespace_prefix`.
     ///
@@ -671,11 +685,7 @@ impl BinderStore {
         if *self.closed.lock().unwrap() {
             return Err(StoreError::Closed);
         }
-        let object_ids = self
-            .namespace_index
-            .lock()
-            .unwrap()
-            .matching(namespace_prefix);
+        let object_ids = self.list_object_ids(namespace_prefix)?;
         let mut results = Vec::with_capacity(object_ids.len());
         let mut misses: Vec<ObjectId> = Vec::new();
         {

@@ -21,9 +21,14 @@ Verify
     bindb --version
     bindb --help
 
-Phase 1 of the public binary supports only `--version` and `--help`.
-It does not open or query on-disk stores. Database access remains via the
-private Rust BinderStore API until a later release.
+Inspect a store
+---------------
+
+The store directory is the folder that contains `commits.wal`.
+
+    bindb info /path/to/store
+    bindb list /path/to/store "code://"
+    bindb list /path/to/store ""
 
 License
 -------

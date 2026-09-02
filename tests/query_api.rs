@@ -373,3 +373,25 @@ fn text_search_on_empty_index_returns_empty() {
     assert!(results.is_empty());
     store.close().unwrap();
 }
+
+#[test]
+fn list_object_ids_matches_list_without_payloads() {
+    let dir = tmp();
+    let store = BinderStore::open(dir.path()).unwrap();
+    let mut tx = Transaction::new();
+    tx.put_object(obj("ns://one"), b"a".to_vec());
+    tx.put_object(obj("ns://two"), b"b".to_vec());
+    tx.put_object(obj("other://z"), b"c".to_vec());
+    store.commit(tx, "actor", "seed").unwrap();
+
+    let mut ids = store.list_object_ids("ns://").unwrap();
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0].0, "ns://one");
+    assert_eq!(ids[1].0, "ns://two");
+
+    let versions = store.list("ns://").unwrap();
+    assert_eq!(versions.len(), 2);
+
+    store.close().unwrap();
+}
