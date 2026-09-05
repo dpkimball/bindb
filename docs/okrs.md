@@ -60,8 +60,8 @@ Open() is the noisy gate today.
 
 | KR | Target | How we know |
 |----|--------|-------------|
-| KR4.1 | `open_l_ms` ≤ **300** on CI with **3 consecutive** Perf runs green (no flake) | Locally ~178 ms (40% headroom); needs 3 consecutive master Perf runs to close |
-| KR4.2 | After clean close, checkpoint short-circuit open at 100 K ≤ **50 ms** (or explicit "won't ship this quarter" written in issue #9 follow-up) | **Won't ship this quarter** — snapshot fast path already cuts open to ~10 ms at M and ~178 ms at L; a further 50 ms target requires invasive index mmap on open, which is the next-quarter #6 payload-stripping work. Decision: defer to next quarter alongside `object_versions` payload stripping. |
+| KR4.1 ✅ | `open_l_ms` ≤ **300** on CI with **3 consecutive** Perf runs green (no flake) | Locally ~178 ms (40% headroom); `Nightly XL` (runs `sla_l_open_wal_replay_lte_300ms_at_100k_commits`) green 5 days running, 2026-09-01–09-05 (run IDs 33480551644, 33600109923, 33724754463, 33846081261, 33950258305) |
+| KR4.2 ✅ | After clean close, checkpoint short-circuit open at 100 K ≤ **50 ms** (or explicit "won't ship this quarter" written in issue #9 follow-up) | **Won't ship this quarter** — snapshot fast path already cuts open to ~10 ms at M and ~178 ms at L; a further 50 ms target requires invasive index mmap on open, which is the next-quarter #6 payload-stripping work. Decision: defer to next quarter alongside `object_versions` payload stripping. Satisfies the KR's own written-decision clause. |
 | KR4.3 ✅ | Coefficient of variation of `open_m_ms` across 5 local runs ≤ **25%** | CV = 1.2% (mean 10.2 ms, σ 0.12 ms); see measurement below |
 
 ### KR4.3 measurement (2026-07-25, Apple Silicon, release)
