@@ -311,7 +311,8 @@ fn print_help() {
         "\
 bindb {VERSION}
 
-bindb is a code intelligence and repository analysis storage engine CLI.
+bindb is an embedded storage engine for versioned objects, relationships,
+time, and vectors.
 
 There are no SQL tables. A store is a directory containing commits.wal.
 Object IDs are URI-like strings (e.g. demo://notes/1); prefixes group them.
