@@ -1,10 +1,8 @@
 name: Nightly watchdog
 
 # Runs 45 minutes after the nightly XL job (02:45 UTC).  Checks whether the
-# nightly completed successfully.  If it failed or never started (runner
-# offline), opens a GitHub issue so the team knows within the hour.
-#
-# Always self-hosted. Never ubuntu-latest (org billing blocks GitHub-hosted jobs).
+# nightly completed successfully.  If it failed or never started, opens a
+# GitHub issue so the team knows within the hour.
 
 on:
   schedule:
@@ -18,7 +16,7 @@ permissions:
 jobs:
   watchdog:
     name: Check nightly XL health
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check last nightly run status

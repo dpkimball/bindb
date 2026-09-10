@@ -1,12 +1,12 @@
 name: Nightly XL
 
-# Runs XL-scale (1 M objects) SLA tests on the self-hosted runner.
-# Failures are detected by nightly_watchdog.yml (02:45 UTC, self-hosted)
+# Runs XL-scale (1 M objects) SLA tests.
+# Failures are detected by nightly_watchdog.yml (02:45 UTC)
 # which opens a GitHub issue if this job is still queued, failed, or absent.
 
 on:
   schedule:
-    # 02:00 UTC every day — self-hosted runner must be online.
+    # 02:00 UTC every day.
     - cron: "0 2 * * *"
   workflow_dispatch: {}
 
@@ -26,7 +26,7 @@ jobs:
   # store setup takes 5–20 minutes per test; a nightly job is sufficient.
   xl_sla:
     name: XL scale SLA
-    runs-on: product-ci
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4

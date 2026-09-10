@@ -3,14 +3,12 @@ name = "bindb"
 version = "0.1.2"
 edition = "2021"
 rust-version = "1.82"
-authors = ["DPK Platform Team"]
+authors = ["dpkimball"]
 license = "MIT"
-description = "Bindb — append-only WAL store for Binder domain objects, edges, and versions"
+description = "Bindb — embedded WAL-based storage engine for objects, graphs, temporal history, vectors, and observations"
 repository = "https://github.com/dpkimball/bindb"
-homepage = "https://github.com/dpkimball/bindb-releases"
+homepage = "https://github.com/dpkimball/bindb"
 readme = "README.md"
-# Private Kellnr registry only — never crates.io (binder-sdk's "Private :: Do Not Upload").
-publish = ["dpk"]
 
 [[bin]]
 name = "bindb"

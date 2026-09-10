@@ -1,6 +1,1 @@
-# Index: CARGO_REGISTRIES_DPK_INDEX from dpk-build env.sh (localhost + CARGO_PORT).
-# CI: secrets.PRIVATE_CARGO_URL (analog of PRIVATE_PYPI_URL). Do not pin a host here.
-# Do not set [registry] default — crates.io stays the public source.
-
-[registries.dpk]
-credential-provider = ["cargo:token"]
+# Do not set [registry] default — crates.io is the public source.

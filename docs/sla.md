@@ -100,7 +100,7 @@ All read SLAs assume a warm store (indexes in memory, no WAL replay).
 |-------|--------|-----|-----|
 | **M** (10 K objects, hub with 100 edges) | 100 | ≤ 20 µs | ≤ 150 µs |
 
-CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared self-hosted runner adds noise).
+CI gate uses 150 µs p99 (isolated runs are ~20 µs; shared CI runner adds noise).
 
 ---
 
@@ -334,15 +334,15 @@ from adding I/O contention that destabilises M-scale fsync measurements.
 
 **Measurement methodology for fsync-bound tests:**
 The durable `commit()` throughput test and `flush()` wall-time test use median-of-N
-measurements rather than a single wall-clock sample.  fsync latency on a shared
-self-hosted runner can spike transiently due to concurrent I/O from other CI jobs;
-a single slow fsync inflates total wall-clock but leaves the p50 (median) unaffected.
-The gate fails only when the _majority_ of samples are slow — which indicates a genuine
-throughput regression rather than transient runner contention.
+measurements rather than a single wall-clock sample.  fsync latency on a shared CI runner
+can spike transiently due to concurrent I/O from other jobs; a single slow fsync inflates
+total wall-clock but leaves the p50 (median) unaffected.  The gate fails only when the
+_majority_ of samples are slow — which indicates a genuine throughput regression rather
+than transient runner contention.
 
-All SLA thresholds are calibrated for the project's self-hosted CI runner (Apple M-series,
-NVMe SSD).  If the runner changes, re-calibrate by running the suite locally on the new
-hardware and adjusting the constants at the top of `tests/perf_sla.rs`.
+All SLA thresholds were originally calibrated on Apple M-series hardware with NVMe SSD.
+If running on different hardware (including cloud-hosted runners), re-calibrate by running
+the suite locally and adjusting the constants at the top of `tests/perf_sla.rs`.
 
 ### Trend tracking (`bench` job)
 
@@ -369,7 +369,7 @@ profiling data and a remediation plan.
 
 ## Baseline hardware
 
-SLAs are calibrated for the project's self-hosted CI runner (Apple M-series, NVMe SSD).
+SLAs were originally calibrated on Apple M-series hardware with NVMe SSD.
 Absolute numbers will differ on other hardware; the ratios between operations should be
-stable.  Cloud-hosted GitHub runners are significantly slower — do not use them as the
-SLA gate machine.
+stable.  If the nightly SLA tests fail consistently, recalibrate the thresholds in
+`tests/perf_sla.rs` for your CI environment.
