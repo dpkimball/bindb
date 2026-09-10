@@ -24,14 +24,16 @@ jobs:
   # posts (or updates) a PR comment via scripts/compare_perf.py.
   sla:
     name: SLA gate
-    runs-on: product-ci
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write      # fetch / push gh-pages baseline
       pull-requests: write # post delta comment on PRs
     if: >
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'performance')
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' ||
+       contains(github.event.pull_request.labels.*.name, 'performance'))
     steps:
       - uses: actions/checkout@v4
         with:
@@ -158,14 +160,16 @@ jobs:
   # Baseline accumulates from pushes to master; PRs are compared against it.
   benchmark:
     name: Benchmark trends
-    runs-on: product-ci
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: write
       pull-requests: write
     if: >
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'performance')
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' ||
+       contains(github.event.pull_request.labels.*.name, 'performance'))
     steps:
       - uses: actions/checkout@v4
         with:

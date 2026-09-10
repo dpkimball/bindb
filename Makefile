@@ -1,4 +1,11 @@
-# Resolve dpk-build from this Makefile's location (ignore ambient BUILD_ROOT pollution).
-BUILD_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../dpk-build)
+test:
+	cargo test --locked --all
 
-include $(BUILD_ROOT)/Makefile.common
+lint:
+	cargo clippy --all-targets -- -D warnings
+	cargo fmt -- --check
+
+bench:
+	cargo bench --bench store_bench
+
+.PHONY: test lint bench

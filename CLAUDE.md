@@ -39,7 +39,6 @@ src/
 cargo test --locked --all
 cargo clippy --all-targets -- -D warnings
 cargo fmt -- --check
-make b
 ```
 
 ## Key constraints
@@ -47,4 +46,3 @@ make b
 - WAL is authoritative; indexes are projections only — never treat an index as the source of truth
 - `commit_buffered` + `flush()` for bulk ingestion; `commit()` for single durable writes
 - Never log object payloads or edge content — structural metadata only (IDs, timestamps, actor)
-- Published to private Kellnr (`CARGO_REGISTRY=dpk`); `env.sh` sets `PUBLISH_CRATE=true` for `make b`

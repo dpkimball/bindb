@@ -1,9 +1,9 @@
 ---
 id: private-source-public-binary
 title: bindb Phase 1 — private source / public binary distribution
-status: draft
+status: superseded
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-10
 owner: bindb
 github_issue: https://github.com/dpkimball/bindb/issues/97
 related:
