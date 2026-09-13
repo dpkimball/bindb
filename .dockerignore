@@ -1,0 +1,5 @@
+# Named BuildKit context for binder-ai / Foreman / repo-dashboard images.
+# CI checkouts have no target/; local clones do (multi-GB).
+.git
+target
+**/*.rs.bk
