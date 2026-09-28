@@ -20,6 +20,10 @@ pub enum StoreError {
     #[error("store is closed")]
     Closed,
 
+    /// Another process holds the exclusive write flock on `{store}/.bindb.write.lock`.
+    #[error("store is locked by another process")]
+    StoreLocked,
+
     #[error("namespace violation: actor '{actor}' does not own namespace '{namespace}' (owner: '{owner}')")]
     NamespaceViolation {
         namespace: String,

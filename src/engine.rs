@@ -19,14 +19,21 @@ use crate::vector::{
 };
 use crate::version_store::VersionStore;
 use crate::wal::Wal;
+use fs2::FileExt;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Filename for the exclusive write flock (owned by bindb).
+pub const WRITE_LOCK_FILE: &str = ".bindb.write.lock";
+
 pub struct BinderStore {
     store_path: PathBuf,
+    /// Held for process lifetime; unlocks on drop / close.
+    _write_flock: File,
     dirty_marker: PathBuf,
     wal: Mutex<Wal>,
     checkpoint_log: Mutex<CheckpointLog>,
@@ -86,6 +93,22 @@ impl BinderStore {
 
     fn open_inner(store_path: &Path, head_cache_cap: usize) -> Result<Self, StoreError> {
         fs::create_dir_all(store_path)?;
+
+        // Exclusive OS flock before any WAL / dirty-marker work so a second
+        // open never partially initializes the store.
+        let lock_path = store_path.join(WRITE_LOCK_FILE);
+        let write_flock = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        write_flock.try_lock_exclusive().map_err(|e| {
+            if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut {
+                StoreError::StoreLocked
+            } else {
+                StoreError::Io(e)
+            }
+        })?;
 
         let dirty_marker = store_path.join(".dirty");
         let was_clean = !dirty_marker.exists();
@@ -247,6 +270,7 @@ impl BinderStore {
 
         Ok(Self {
             store_path: store_path.to_path_buf(),
+            _write_flock: write_flock,
             dirty_marker,
             wal: Mutex::new(wal),
             checkpoint_log: Mutex::new(checkpoint_log),
