@@ -183,8 +183,12 @@ structural, not bolt-on.
 **Provenance-aware** — every write can carry a source attribution (`Plugin`, `UserEdit`,
 `Import`, `System`).  The full lineage of every data point is recoverable.
 
-**WAL-first durability** — commits are durable before the call returns.  The in-memory
-state is always a consistent projection of the commit log.  See [docs/storage.md](docs/storage.md).
+**WAL-first durability** — `commit()` returns after the WAL fsync. The in-memory state is a
+projection of that log. Opening a store replays the log and rebuilds indexes. Indexes are
+not a second source of truth. The on-disk format is not a compatibility promise between
+releases. Figures in [docs/benchmark-comparison.md](docs/benchmark-comparison.md) are
+measurements from one machine beside published numbers from other systems, not a
+same-hardware ranking. See [docs/storage.md](docs/storage.md).
 
 **Rebuildable indexes** — every index is a non-canonical projection.  Any index can be
 dropped and rebuilt from the commit log without data loss.  See [docs/indexes.md](docs/indexes.md).

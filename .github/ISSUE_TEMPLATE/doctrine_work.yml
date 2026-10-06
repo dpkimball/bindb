@@ -6,8 +6,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        Follow the [Issue Doctrine](https://github.com/dpkimball/dpk-workspace/blob/master/docs/development/02-issue-doctrine.md).
-        Thoroughness, maturity, maintainability, and efficiency — not a race. Agents never merge.
+        Describe the problem and the acceptance criteria. Include constraints and what is out of scope.
+        Thoroughness, maturity, and maintainability — not a race. Agents never merge.
   - type: textarea
     id: problem
     attributes:

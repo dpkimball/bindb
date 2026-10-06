@@ -1,13 +1,15 @@
 ---
 title: bindb — Benchmark Comparison
-description: Measured performance comparison of bindb against SQLite, DuckDB, MongoDB, PostgreSQL, Neo4j, and ClickHouse.
+description: bindb measurements from one development machine, shown beside published figures from other databases. Not a same-hardware ranking.
 category: architecture
 ---
 
 # bindb — Benchmark Comparison
 
-This document compares bindb's measured performance against published benchmarks for
-SQLite, DuckDB, MongoDB, PostgreSQL, Neo4j, and ClickHouse.
+This document records bindb measurements from the development machine and places them
+beside published figures for SQLite, DuckDB, MongoDB, PostgreSQL, Neo4j, and ClickHouse.
+Those other figures come from different hardware, versions, and workloads. The tables
+are not a same-hardware ranking and do not support a universal "N times faster" claim.
 
 ---
 
@@ -27,10 +29,10 @@ Percentiles are computed over ≥ 2,000 iterations after a warm-up pass.
 
 ### Reference numbers for other databases
 
-Numbers for daemon-based databases (MongoDB, PostgreSQL, Neo4j, ClickHouse) are sourced
-from published benchmarks listed below.  They reflect different hardware and workloads —
-direct numeric comparison is informative but not definitive.  The architectural differences
-(network round-trip, daemon overhead, serialization cost) are as significant as raw numbers.
+Numbers for the other databases, including SQLite and DuckDB, are published results listed
+below. They were not collected on the bindb measurement machine. Treat every cross-database
+cell as context for architecture (in-process versus a daemon or a network hop), not as a
+controlled comparison.
 
 **Sources:**
 - SQLite: [sqlite.org/speed.html](https://www.sqlite.org/speed.html), TPC-C community results
@@ -61,9 +63,9 @@ Neo4j       →  separate JVM process, Bolt protocol
                MATCH by id = ~1–5 ms (JVM + Cypher + Lucene)
 ```
 
-bindb's read latency advantage is structural — not tuning.  An in-process HashMap lookup
-will always be orders of magnitude faster than a network call, regardless of how well the
-other system is optimized.
+An in-process HashMap lookup does not pay for a network round-trip or a daemon. That is
+an architectural difference. It is not a measurement that the other systems were slower
+on this machine.
 
 ---
 
@@ -85,9 +87,9 @@ returning.  Latency is dominated by the disk's fsync cost (~7–10 ms on NVMe SS
 | Neo4j durable single write | ~5,000–30,000 writes/sec | Daemon batches fsyncs internally |
 | ClickHouse single INSERT | < 100 writes/sec | Not designed for single-row OLTP |
 
-**Takeaway:** bindb and SQLite are nearly identical in durable write throughput — both are
-bounded by the same fsync cost on the same hardware.  Daemon databases achieve higher
-apparent throughput by batching fsyncs internally across concurrent connections.
+**Takeaway:** bindb's measured durable writes are fsync-bound on the development machine.
+The SQLite range is from sqlite.org, not from that machine. Daemon databases often report
+higher throughput because they batch fsyncs across connections.
 
 ---
 
@@ -129,9 +131,8 @@ Retrieve a single object by its exact identifier.
 | Neo4j MATCH by node id | ~1–5 ms | ~10 ms | Bolt protocol + JVM + Lucene index |
 | ClickHouse SELECT by id | ~5–50 ms | ~100 ms | Columnar scan (not designed for point lookups) |
 
-**Takeaway:** bindb's `get()` is the fastest point lookup in this comparison by 1–4 orders
-of magnitude.  An in-process HashMap lookup at ~100 ns is a structural advantage over any
-database requiring a network call or B-tree traversal.
+**Takeaway:** bindb's measured `get()` is an in-process HashMap lookup. The other latencies
+are published ranges from different setups. Do not read the gap as a controlled ranking.
 
 ---
 
@@ -148,10 +149,8 @@ Retrieve all objects whose ID matches a URI prefix (e.g. `"memory://"` — all m
 | PostgreSQL `WHERE id LIKE 'ns://%'` | ~0.5–5 ms | ~10 ms | 1 K of 10 K | B-tree prefix scan + network |
 | ClickHouse `WHERE startsWith(id, 'ns://')` | ~1–50 ms | ~100 ms | 1 K of 10 K | Columnar scan; better for larger result sets |
 
-**Takeaway:** bindb and SQLite are comparable for prefix scans on in-process stores.
-bindb's namespace index (HashMap scheme → HashSet of live ObjectIds) gives O(k) scan cost
-independent of total store size.  For result sets > 10 K, bindb's advantage over SQLite
-will grow because the index avoids touching any non-matching objects entirely.
+**Takeaway:** bindb's namespace index visits matching objects only. The SQLite range beside
+it is a published figure, not a measurement from the bindb machine.
 
 ---
 
@@ -169,11 +168,9 @@ BFS traversal from a starting node up to a fixed depth.
 | MongoDB `$graphLookup` depth=3 | ~10–100 ms | ~100 ms–1 s | Limited depth; cross-document joins over network |
 | PostgreSQL recursive CTE depth=3 | ~5–50 ms | ~50–500 ms | No native graph primitives |
 
-**Takeaway:** bindb's in-process BFS traversal over an in-memory neighbour map is
-extraordinarily fast for simple path queries — sub-microsecond at depth 3.  Neo4j still
-wins for complex pattern matching (Cypher expressions bindb cannot express today), but for
-straightforward reachability queries bindb is 3–4 orders of magnitude faster due to the
-absence of a network round-trip and JVM overhead.
+**Takeaway:** bindb's measured in-process BFS on this fixture is sub-microsecond at depth 3.
+Neo4j can express pattern matches this store does not. The other latencies are published
+ranges, so the table is not a same-hardware ranking.
 
 ---
 
@@ -213,20 +210,20 @@ This runs automatically on crash recovery.
 
 ## Summary
 
-### Where bindb is fastest
+### What was measured on the bindb machine
 
-| Operation | bindb advantage |
+| Operation | bindb result |
 |-----------|----------------|
-| Point lookup `get()` | **100–10,000× faster** than any database requiring a network call |
-| BFS graph traversal | **1,000–100,000× faster** than SQL recursive CTEs or Neo4j for simple paths |
-| Prefix scan `list()` | **5–50× faster** than daemon databases; comparable to SQLite |
+| Point lookup `get()` | Measured in-process HashMap. Other cells are published ranges. |
+| BFS graph traversal | Measured in-process BFS on a 5 K node chain. Other cells are published ranges. |
+| Prefix scan `list()` | Measured namespace index. Other cells are published ranges. |
 
 ### Where bindb is behind
 
 | Operation | Gap | Root cause | Status |
 |-----------|-----|-----------|--------|
-| Bulk import | 15–500× slower than SQLite/DuckDB | Per-write version history + in-memory index maintenance | Expected — structural cost of full history |
-| Cold startup | Comparable to SQLite (~14 ms at 10 K) | O(n) replay after position-index fix | Fixed |
+| Bulk import | bindb measured about 3–8 K writes/sec on this machine. Published SQLite and DuckDB bulk-load figures are higher and were not collected here. | Per-write version history + in-memory index maintenance | Expected cost of keeping history |
+| Cold startup | ~14–18 ms at 10 K commits on this machine | O(n) WAL replay | Measured |
 | Analytical aggregations | Not supported | No query engine | Roadmap — SQL projection layer |
 | ANN vector search | knn_search() p99 ≤ 5 ms, recall@10 ≥ 90% at 100 K vectors — CI-gated | HNSW (M=16, EF_C=200, EF_S=64); brute-force below 1 K / model | — |
 
@@ -237,7 +234,9 @@ PERF_REPORT_DIR=./out cargo run --example perf_report --release
 # → out/perf-report.md , out/perf-report.json
 ```
 
-### Performance characteristic summary
+### Figures side by side
+
+Only the bindb column was measured for this document. The other columns are rounded published ranges from other machines.
 
 ```text
 Operation            bindb        SQLite      DuckDB       MongoDB     PostgreSQL
@@ -256,11 +255,8 @@ Index rebuild        ~3 ms        N/A         N/A          minutes     minutes
 
 ### Interpretation
 
-bindb is the right performance choice when the dominant query patterns are **point lookups**
-and **graph traversal** — the two operations where in-process memory structures beat every
-networked database by orders of magnitude.
-
-bindb is not the right performance choice today when the dominant pattern is **bulk
-analytical ingestion** or **large-batch import**.  SQLite in-transaction inserts are
-100–300× faster for bulk loads at scale.  This will improve significantly once the O(n)
-version retirement scan is fixed.
+bindb fits workloads whose hot path is an in-process point lookup or a short in-memory
+traversal, and where keeping full version history on each write is worth the bulk-import
+cost. It is a poor fit when the hot path is bulk analytical ingestion. The multipliers in
+older revisions of this page mixed bindb measurements with published figures from other
+machines; do not cite them as a benchmark result.
