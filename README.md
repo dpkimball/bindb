@@ -9,7 +9,7 @@
   <a href="https://github.com/dpkimball/bindb/actions/workflows/bench.yml"><img src="https://github.com/dpkimball/bindb/actions/workflows/bench.yml/badge.svg" alt="Perf" /></a>
 </p>
 
-> **Read-only source.** This repository is published for reference and embedding. Pull requests are not accepted — please open an issue for bugs or suggestions.
+> **Source is public.** Issues and pull requests are welcome. The maintainer reviews and merges them.
 
 **bindb** is a native embedded database designed for semantic, graph, temporal, and AI-native
 applications.
@@ -294,4 +294,4 @@ bindb = { version = "0.1", git = "https://github.com/dpkimball/bindb" }
 
 ## Contributing
 
-Pull requests are not accepted. Open an issue for bugs or suggestions. Report security issues through [GitHub Security Advisories](https://github.com/dpkimball/bindb/security/advisories/new), as described in [SECURITY.md](SECURITY.md).
+Issues and pull requests are welcome. The maintainer reviews pull requests and merges the ones that land. Report security issues through [GitHub Security Advisories](https://github.com/dpkimball/bindb/security/advisories/new), as described in [SECURITY.md](SECURITY.md).
