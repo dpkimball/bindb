@@ -287,3 +287,11 @@ Add to `Cargo.toml`:
 [dependencies]
 bindb = { version = "0.1", git = "https://github.com/dpkimball/bindb" }
 ```
+
+## Stability
+
+0.1.x. The on-disk format is not a compatibility promise between releases. See the durability note above and `docs/storage.md`.
+
+## Contributing
+
+Pull requests are not accepted. Open an issue for bugs or suggestions. Report security issues through [GitHub Security Advisories](https://github.com/dpkimball/bindb/security/advisories/new), as described in [SECURITY.md](SECURITY.md).

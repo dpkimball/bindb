@@ -5,3 +5,7 @@ perf-report*.json
 perf-report.md
 perf-out/
 .claude/
+
+.env
+.env.*
+/store/

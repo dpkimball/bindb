@@ -1,13 +1,8 @@
 name: Security Audit
 
+# Not on pull_request. Public checks are in ci.yml. This job only audits the
+# default branch and does not call private reusable workflows.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - "**/*.md"
-      - "**/*.mdx"
-      - "**/*.rst"
-      - "**/*.txt"
   push:
     branches: [master, main]
   schedule:
@@ -15,7 +10,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: security-audit-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: security-audit-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -25,9 +20,10 @@ jobs:
   security-audit:
     name: cargo audit
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
